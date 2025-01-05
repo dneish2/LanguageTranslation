@@ -62,7 +62,7 @@ http://127.0.0.1:3030
 
 This will load the NiceGUI-based user interface, where you can upload documents, select target languages, and manage translations.
 
-Prerequisites
-	•	Python Version: Ensure Python 3.8 or higher is installed.
-	•	Dependencies: All required packages are listed in requirements.txt.
-	•	Environment Variables: Add your OpenAI API key in the .env file as described above.
+### Prerequisites
+- **Python Version**: Ensure Python 3.8 or higher is installed.
+- **Dependencies**: Install all required packages listed in `requirements.txt`.
+- **Environment Variables**: Add your OpenAI API key in a `.env` file located in the project root:
