@@ -27,3 +27,42 @@ At its core, the design is centered on two fundamental pillars:
      - Tracks translation stages to provide transparency into the process.
      - Supports real-time feedback and correction workflows, allowing users to refine results with minimal friction.
      - Designed for accessibility and scalability across use cases.
+
+Here’s the full Usage section in markdown for you to copy directly into your README.md:
+
+## Usage
+
+Follow these steps to set up and run the application:
+
+1. **Clone the Repository**  
+   Clone the project to your local machine:
+   ```bash
+   git clone https://github.com/dneish2/LanguageTranslation.git
+   cd LanguageTranslation
+
+	2.	Install Dependencies
+Use the requirements.txt file to install the necessary Python modules:
+
+pip install -r requirements.txt
+
+	3.	Set Up Environment Variables
+Ensure you have an .env file in the project root with your OpenAI API key:
+
+OPENAI_API_KEY=your-api-key-here
+
+	4.	Run the Application
+Start the application by running the main script:
+
+python TranslationUI.py
+
+	5.	Access the Interface
+Once the server starts, open your browser and navigate to:
+
+http://127.0.0.1:3030
+
+This will load the NiceGUI-based user interface, where you can upload documents, select target languages, and manage translations.
+
+Prerequisites
+	•	Python Version: Ensure Python 3.8 or higher is installed.
+	•	Dependencies: All required packages are listed in requirements.txt.
+	•	Environment Variables: Add your OpenAI API key in the .env file as described above.
