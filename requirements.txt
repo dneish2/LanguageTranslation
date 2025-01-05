@@ -1,0 +1,7 @@
+nicegui
+python-docx
+python-pptx
+PyMuPDF
+openai
+tiktoken
+python-dotenv
