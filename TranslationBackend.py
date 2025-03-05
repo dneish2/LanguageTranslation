@@ -1,6 +1,6 @@
 import os
 import logging
-import re
+import uuid
 import string
 import fitz  # PyMuPDF
 import time
@@ -14,154 +14,296 @@ import tiktoken
 
 dotenv.load_dotenv()  # Load environment variables
 
-# Define color "white" for PDF overlay
-WHITE = (1, 1, 1)
+logging.basicConfig(level=logging.INFO)
+
+WHITE = (1, 1, 1)  # for PDF overwriting
 
 class TranslationBackend:
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
         if not self.api_key:
-            raise ValueError("The OPENAI_API_KEY environment variable is not set.")
+            raise ValueError("OPENAI_API_KEY not set.")
         self.client = openai.OpenAI(api_key=self.api_key)
+        self.cancel_requested = False
+
+        self.segment_map = {}       # segment_id -> {type, location, original, translated, metadata, object}
+        self.current_file_type = None
+        self.current_document = None
+        self.current_presentation = None
+        self.current_pdf = None
+        self.output_stream = None
+
+    def reset_cancel(self):
+        self.cancel_requested = False
+
+    def request_cancel(self):
+        self.cancel_requested = True
+        logging.info("[Backend] Cancel requested.")
+
+    def generate_segment_id(self):
+        return str(uuid.uuid4())
 
     # ------------------
-    # NEW PDF HELPERS
-    # ------------------
-    def is_meaningful_text(self, text):
-        """
-        Check if the text is worth translating, skipping trivial elements like TM, ©, ®, etc.
-        """
-        normalized_text = text.strip().lower().replace(' ', '')
-        skip_texts = {'tm', '™', '©', '®'}
-        tm_pattern = re.compile(r'^(tm|™|©|®)$', re.IGNORECASE)
-
-        if normalized_text in skip_texts or tm_pattern.match(normalized_text):
-            return False
-
-        # Remove punctuation & special symbols for the check
-        stripped_text = text.translate(str.maketrans('', '', string.punctuation + "™©®")).strip()
-        return any(char.isalnum() for char in stripped_text)
-
-    def int_to_rgb(self, color):
-        """Convert integer color to an (r, g, b) tuple (0-1 range)."""
-        r = ((color >> 16) & 0xFF) / 255.0
-        g = ((color >> 8) & 0xFF) / 255.0
-        b = (color & 0xFF) / 255.0
-        return (r, g, b)
-
-    def should_retain_original(self, text):
-        """
-        If the translated text is some sort of incomplete/error message from the model,
-        revert to original text.
-        """
-        assistant_msgs = [
-            "The text provided is incomplete and cannot be accurately translated",
-            "I'm sorry, but the text you provided seems incomplete",
-            "It seems that the text you provided is incomplete",
-            "The text appears to be incomplete",
-            "The text is incomplete",
-        ]
-        return any(msg in text for msg in assistant_msgs)
-
-    def create_css(self, font_size, rgb_color):
-        """Create CSS styling to match original font size and color for PDF."""
-        hex_color = '#%02x%02x%02x' % (
-            int(rgb_color[0] * 255),
-            int(rgb_color[1] * 255),
-            int(rgb_color[2] * 255)
-        )
-        return f"* {{ font-size: {font_size}pt; color: {hex_color}; }}"
-
-    # ------------------
-    # GENERIC TRANSLATION LOGIC
+    # GPT CORE
     # ------------------
     def translate_text(self, text, target_language):
-        if not text.strip():
-            return text  # Skip empty strings
-
+        text = text.replace('\t', ' ').strip()
+        if not text:
+            return text
         prompt = (
-            f"Translate the following text to {target_language}, preserving the meaning and context. "
-            f"Do not translate personal names, internationally recognized technical terms, or trademarked terms. "
-            f"**If the text is an email address or a URL, do not translate or alter it**; just return the exact original text. "
-            f"**Do not add any extra commentary or remarks.** "
-            f"Translate everything else as best as possible, even if it is incomplete or fragmented.\n\n"
-            f"Text:\n{text.strip()}"
+            f"Translate the following text to {target_language}, preserving meaning and context. "
+            f"Do not translate personal names or trademarked terms. If it's an email or URL, keep it unchanged.\n\n"
+            f"Text:\n{text}"
         )
-
         messages = [
-            {"role": "system", "content": f"You are a helpful assistant that translates text to {target_language}."},
+            {"role": "system", "content": f"You are a helpful assistant translating to {target_language}."},
             {"role": "user", "content": prompt},
         ]
-
         try:
             completion = self.client.chat.completions.create(
-                model="gpt-4o", 
-                messages=messages, 
-                max_tokens=4000
+                model="gpt-4o", messages=messages, max_tokens=4000
             )
-            return completion.choices[0].message.content.strip()
+            result = completion.choices[0].message.content.strip()
+            if not result:
+                result = text
+            logging.info(f"[Backend] Translated text from len={len(text)} to len={len(result)}")
+            return result
         except Exception as e:
-            logging.error(f"Translation error: {e}")
-            return text  # Return original text in case of error
+            logging.error(f"[Backend] translate_text error: {e}", exc_info=True)
+            return text
+
+    def translate_text_with_instructions(self, original_text, target_language, instructions):
+        original_text = original_text.replace('\t', ' ').strip()
+        if not original_text:
+            return original_text
+        prompt = (
+            f"Please refine the following translation according to these instructions. "
+            f"Ensure that any requested changes – including changing the language – are fully applied.\n\n"
+            f"Instructions: {instructions}\n\n"
+            f"Original text: {original_text}\n\n"
+            f"Final translation:"
+        )
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant refining translations."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            completion = self.client.chat.completions.create(
+                model="gpt-4o", messages=messages, max_tokens=4000
+            )
+            result = completion.choices[0].message.content.strip()
+            if not result:
+                result = original_text
+            logging.info(f"[Backend] Refined translation with instructions; result length: {len(result)}")
+            return result
+        except Exception as e:
+            logging.error(f"[Backend] refine translation error: {e}", exc_info=True)
+            return original_text
 
     def calculate_tokens(self, total_text):
-        """Calculate the number of tokens used."""
         encoding = tiktoken.encoding_for_model("gpt-4o")
         return len(encoding.encode(total_text))
 
     # ------------------
-    # DOCX + PPTX LOGIC
+    # PDF UTILS
     # ------------------
-    def process_pptx(self, input_stream, target_language, progress_ui, label_ui):
-        """Process and translate a PowerPoint file."""
-        prs = Presentation(input_stream)
-        total_shapes = sum(len(slide.shapes) for slide in prs.slides)
-        shape_count = 0
-        translated_text = ""
-        original_segments = []
-        translated_segments = []
+    def is_meaningful_text(self, text):
+        normalized = text.strip().lower().replace(' ', '')
+        skip = {'tm', '™', '©', '®'}
+        if normalized in skip:
+            return False
+        stripped = text.translate(str.maketrans('', '', string.punctuation + "™©®")).strip()
+        return any(ch.isalnum() for ch in stripped)
 
+    # ------------------
+    # REGENERATE OUTPUT
+    # ------------------
+    def regenerate_output_stream(self):
+        if self.current_file_type == 'docx' and self.current_document:
+            out_stream = BytesIO()
+            self.current_document.save(out_stream)
+            out_stream.seek(0)
+            self.output_stream = out_stream
+        elif self.current_file_type == 'pptx' and self.current_presentation:
+            out_stream = BytesIO()
+            self.current_presentation.save(out_stream)
+            out_stream.seek(0)
+            self.output_stream = out_stream
+        elif self.current_file_type == 'pdf' and self.current_pdf:
+            out_stream = BytesIO()
+            self.current_pdf.save(out_stream, garbage=4)
+            out_stream.seek(0)
+            self.output_stream = out_stream
+        return self.output_stream
+
+    # ------------------
+    # SEGMENT DELETION
+    # ------------------
+    def delete_segment(self, segment_id):
+        if segment_id not in self.segment_map:
+            raise ValueError(f"Segment ID {segment_id} not found.")
+        seg = self.segment_map[segment_id]
+        seg_type = seg["type"]
+        # Clear the text in the underlying doc object if docx/pptx
+        if seg_type in ["paragraph", "table_cell"]:
+            if "object" in seg:
+                seg["object"].text = ""
+        elif seg_type == "pptx_shape":
+            if "object" in seg and hasattr(seg["object"], "text_frame"):
+                seg["object"].text_frame.text = ""
+        del self.segment_map[segment_id]
+        logging.info(f"[Backend] Deleted segment {segment_id}")
+        self.regenerate_output_stream()
+
+    # ------------------
+    # PROCESSING DOCX
+    # ------------------
+    def process_docx(self, input_stream, target_language, progress_ui, label_ui, do_translate=True):
+        from docx import Document
+        self.reset_cancel()
+        doc = Document(input_stream)
+        self.current_file_type = 'docx'
+        self.current_document = doc
+
+        total_elements = len(doc.paragraphs) + sum(len(t.rows)*len(t.columns) for t in doc.tables)
+        processed = 0
+        text_accum = ""
         start_time = time.time()
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                original_text = self._get_shape_text(shape)
-                if original_text.strip():
-                    new_text = self._translate_shape(shape, target_language)
-                    translated_text += new_text + "\n"
-                    original_segments.append(original_text)
-                    translated_segments.append(new_text)
-                shape_count += 1
-                self.update_progress(shape_count, total_shapes, start_time, progress_ui, label_ui)
 
-        output_stream = BytesIO()
-        prs.save(output_stream)
-        output_stream.seek(0)
-        tokens = self.calculate_tokens(translated_text)
-        return output_stream, shape_count, tokens, translated_text, original_segments, translated_segments
+        # Paragraphs
+        for idx, para in enumerate(doc.paragraphs):
+            original = para.text.strip()
+            if not original:
+                continue
+            if self.cancel_requested:
+                break
+            new_text = self.translate_text(original, target_language) if do_translate else original
+            para.text = new_text
+            text_accum += new_text + "\n"
+            seg_id = self.generate_segment_id()
+            self.segment_map[seg_id] = {
+                "type": "paragraph",
+                "location": f"docx:paragraph:{idx}",
+                "original": original,
+                "translated": new_text,
+                "metadata": {"format": "docx", "index": idx},
+                "object": para
+            }
+            processed += 1
+            self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
+
+        # Table cells
+        for t_idx, table in enumerate(doc.tables):
+            for r_idx, row in enumerate(table.rows):
+                for c_idx, cell in enumerate(row.cells):
+                    for p_idx, para in enumerate(cell.paragraphs):
+                        original = para.text.strip()
+                        if not original:
+                            continue
+                        if self.cancel_requested:
+                            break
+                        new_text = self.translate_text(original, target_language) if do_translate else original
+                        para.text = new_text
+                        text_accum += new_text + "\n"
+                        seg_id = self.generate_segment_id()
+                        self.segment_map[seg_id] = {
+                            "type": "table_cell",
+                            "location": f"docx:table:{t_idx}:row:{r_idx}:col:{c_idx}:para:{p_idx}",
+                            "original": original,
+                            "translated": new_text,
+                            "metadata": {"format": "docx", "table_index": t_idx, "row": r_idx, "col": c_idx},
+                            "object": para
+                        }
+                        processed += 1
+                        self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
+
+        out_stream = BytesIO()
+        doc.save(out_stream)
+        out_stream.seek(0)
+        self.output_stream = out_stream
+        tokens = self.calculate_tokens(text_accum)
+        return out_stream, processed, tokens, text_accum, self.segment_map
+
+    # ------------------
+    # PROCESSING PPTX
+    # ------------------
+    def process_pptx(self, input_stream, target_language, progress_ui, label_ui, do_translate=True):
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        self.reset_cancel()
+        prs = Presentation(input_stream)
+        self.current_file_type = 'pptx'
+        self.current_presentation = prs
+
+        total_elements = sum(len(slide.shapes) for slide in prs.slides)
+        processed = 0
+        text_accum = ""
+        start_time = time.time()
+
+        for s_idx, slide in enumerate(prs.slides):
+            for sh_idx, shape in enumerate(slide.shapes):
+                # Gather original text
+                original_text = self._get_shape_text(shape).strip()
+                if not original_text:
+                    continue
+                if self.cancel_requested:
+                    break
+
+                if do_translate:
+                    # We do a shape-level translation function
+                    new_text = self._translate_shape(shape, target_language)
+                else:
+                    # No re-translation: just keep original
+                    new_text = original_text
+                text_accum += new_text + "\n"
+
+                seg_id = self.generate_segment_id()
+                self.segment_map[seg_id] = {
+                    "type": "pptx_shape",
+                    "location": f"pptx:slide:{s_idx}:shape:{sh_idx}",
+                    "original": original_text,
+                    "translated": new_text,
+                    "metadata": {"format": "pptx", "slide": s_idx, "shape": sh_idx},
+                    "object": shape
+                }
+                processed += 1
+                self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
+
+        out_stream = BytesIO()
+        prs.save(out_stream)
+        out_stream.seek(0)
+        self.output_stream = out_stream
+        tokens = self.calculate_tokens(text_accum)
+        return out_stream, processed, tokens, text_accum, self.segment_map
 
     def _translate_shape(self, shape, target_language):
-        """Translate the text within a shape."""
-        translated_text = ""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        result = ""
         if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
             for row in shape.table.rows:
                 for cell in row.cells:
                     if cell.text_frame:
-                        cell_text = cell.text_frame.text
-                        new_text = self.translate_text(cell_text, target_language)
-                        cell.text_frame.text = new_text
-                        translated_text += new_text + "\n"
+                        text = cell.text_frame.text.strip()
+                        if text:
+                            new_text = self.translate_text(text, target_language)
+                            cell.text_frame.text = new_text
+                            result += new_text + "\n"
         elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            for sub_shape in shape.shapes:
-                translated_text += self._translate_shape(sub_shape, target_language) + "\n"
+            for sub in shape.shapes:
+                result += self._translate_shape(sub, target_language) + "\n"
         elif hasattr(shape, "text_frame") and shape.text_frame:
-            shape_text = shape.text_frame.text
-            new_text = self.translate_text(shape_text, target_language)
-            shape.text_frame.text = new_text
-            translated_text += new_text + "\n"
-        return translated_text.strip()
+            text = shape.text_frame.text.strip()
+            if text:
+                new_text = self.translate_text(text, target_language)
+                shape.text_frame.text = new_text
+                result += new_text + "\n"
+        return result.strip()
 
     def _get_shape_text(self, shape):
-        """Extract original text from a shape."""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
         text = ""
         if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
             for row in shape.table.rows:
@@ -169,172 +311,129 @@ class TranslationBackend:
                     if cell.text_frame:
                         text += cell.text_frame.text + "\n"
         elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            for sub_shape in shape.shapes:
-                text += self._get_shape_text(sub_shape) + "\n"
+            for sub in shape.shapes:
+                text += self._get_shape_text(sub) + "\n"
         elif hasattr(shape, "text_frame") and shape.text_frame:
             text += shape.text_frame.text + "\n"
         return text.strip()
 
-    def process_docx(self, input_stream, target_language, progress_ui, label_ui):
-        """Process and translate a Word document."""
-        doc = Document(input_stream)
-        total_paragraphs = len(doc.paragraphs) + sum(len(table.rows)*len(table.columns) for table in doc.tables)
-        paragraph_count = 0
-        translated_text = ""
-        original_segments = []
-        translated_segments = []
-
-        start_time = time.time()
-        # Process paragraphs
-        for paragraph in doc.paragraphs:
-            original = paragraph.text
-            new_text = self.translate_text(original, target_language)
-            paragraph.text = new_text
-            translated_text += new_text + "\n"
-            original_segments.append(original)
-            translated_segments.append(new_text)
-
-            paragraph_count += 1
-            self.update_progress(paragraph_count, total_paragraphs, start_time, progress_ui, label_ui)
-
-        # Process tables
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        original = paragraph.text
-                        new_text = self.translate_text(original, target_language)
-                        paragraph.text = new_text
-                        translated_text += new_text + "\n"
-                        original_segments.append(original)
-                        translated_segments.append(new_text)
-
-                        paragraph_count += 1
-                        self.update_progress(paragraph_count, total_paragraphs, start_time, progress_ui, label_ui)
-
-        output_stream = BytesIO()
-        doc.save(output_stream)
-        output_stream.seek(0)
-        tokens = self.calculate_tokens(translated_text)
-        return output_stream, paragraph_count, tokens, translated_text, original_segments, translated_segments
-
     # ------------------
-    # NEW PDF LOGIC
+    # PROCESSING PDF
     # ------------------
-    def process_pdf(self, input_stream, target_language, progress_ui, label_ui):
-        """
-        Process and translate a PDF file using PyMuPDF.
-        Overwrites text spans with their translations.
-        """
-        translated_text = ""
-        original_segments = []
-        translated_segments = []
+    def process_pdf(self, input_stream, target_language, progress_ui, label_ui, do_translate=True):
+        import fitz
+        self.reset_cancel()
 
         try:
             doc = fitz.open(stream=input_stream, filetype="pdf")
         except Exception as e:
-            logging.error(f"Failed to open input PDF: {e}")
+            logging.error(f"[Backend] Failed to open PDF: {e}")
             raise e
 
-        ocg_xref = doc.add_ocg(target_language, on=True)
-
+        self.current_file_type = 'pdf'
+        self.current_pdf = doc
         total_pages = len(doc)
-        page_count = 0
+        processed_pages = 0
+        text_accum = ""
         start_time = time.time()
 
-        for page_index in range(total_pages):
-            page = doc.load_page(page_index)
+        for p_idx in range(total_pages):
+            if self.cancel_requested:
+                break
+            page = doc.load_page(p_idx)
             text_dict = page.get_text("dict")
 
             for block in text_dict["blocks"]:
-                # Only text blocks
                 if block["type"] != 0:
                     continue
-
                 for line in block["lines"]:
+                    line_text = ""
                     for span in line["spans"]:
-                        bbox = fitz.Rect(span["bbox"])
-                        text = span["text"]
+                        txt = span["text"]
+                        if txt.strip() and self.is_meaningful_text(txt):
+                            line_text += txt + " "
+                    line_text = line_text.strip()
+                    if line_text:
+                        if do_translate:
+                            new_line = self.translate_text(line_text, target_language)
+                        else:
+                            new_line = line_text
+                        text_accum += new_line + "\n"
+                        seg_id = self.generate_segment_id()
+                        self.segment_map[seg_id] = {
+                            "type": "pdf_line",
+                            "location": f"pdf:page:{p_idx}",
+                            "original": line_text,
+                            "translated": new_line,
+                            "metadata": {"format": "pdf", "page": p_idx}
+                        }
+                        page.insert_text((50, 50), new_line, overlay=True)
 
-                        if not text.strip():
-                            continue
+            processed_pages += 1
+            self.update_progress(processed_pages, total_pages, start_time, progress_ui, label_ui)
 
-                        if not self.is_meaningful_text(text):
-                            continue
-
-                        # Original text
-                        processed_text = ' '.join(text.splitlines()).strip()
-
-                        # Reuse the same GPT-based translator
-                        new_text = self.translate_text(processed_text, target_language)
-                        if self.should_retain_original(new_text):
-                            new_text = text  # revert if the model gave an incomplete message
-
-                        # Keep track for output
-                        original_segments.append(text)
-                        translated_segments.append(new_text)
-                        translated_text += new_text + "\n"
-
-                        color = span.get("color", 0)
-                        rgb_color = self.int_to_rgb(color)
-                        css = self.create_css(span['size'], rgb_color)
-
-                        # Overwrite the existing text with a white rectangle
-                        page.draw_rect(bbox, color=None, fill=WHITE, oc=ocg_xref, overlay=True)
-
-                        # Insert the new translated text
-                        page.insert_htmlbox(bbox, new_text, css=css, oc=ocg_xref, overlay=True)
-
-            page_count += 1
-            self.update_progress(page_count, total_pages, start_time, progress_ui, label_ui)
-
-        output_stream = BytesIO()
-
+        out_stream = BytesIO()
         try:
-            doc.save(output_stream, garbage=4)
-            output_stream.seek(0)
+            doc.save(out_stream, garbage=4)
+            out_stream.seek(0)
         except Exception as e:
-            logging.error(f"Failed to save output PDF: {e}")
+            logging.error(f"[Backend] Failed to save PDF: {e}")
             raise e
-        finally:
-            doc.close()
 
-        tokens = self.calculate_tokens(translated_text)
-        # We'll approximate count as the total number of meaningful text segments
-        count = len(original_segments)
-        return output_stream, count, tokens, translated_text, original_segments, translated_segments
+        self.output_stream = out_stream
+        tokens = self.calculate_tokens(text_accum)
+        return out_stream, processed_pages, tokens, text_accum, self.segment_map
 
     # ------------------
-    # PROGRESS UPDATES
+    # PROGRESS
     # ------------------
     def update_progress(self, current, total, start_time, progress_ui, label_ui):
-        """Update progress UI with the current progress."""
-        elapsed_time = time.time() - start_time
-        avg_time_per_element = elapsed_time / current if current else 0
-        remaining_elements = total - current
-        remaining_time = avg_time_per_element * remaining_elements
-
-        progress_ui.set_value((current / total) * 100)
-        label_ui.text = (
-            f"Processing element {current}/{total}\n"
-            f"Estimated time remaining: {int(remaining_time)} seconds"
-        )
+        elapsed = time.time() - start_time
+        avg = elapsed / current if current else 0
+        remaining = total - current
+        progress_value = (current / total) * 100 if total else 0
+        progress_ui.set_value(progress_value)
+        label_ui.text = f"Processing {current}/{total} (≈ {int(avg * remaining)}s remaining)"
 
     # ------------------
-    # KEY CHANGE: SUPPORT PDF
+    # UPDATE SEGMENT
     # ------------------
-    def translate_file(self, input_stream, file_extension, target_language, progress_ui, label_ui):
-        """
-        Translate a file based on its extension, returning:
-          (output_stream, count, tokens, translated_text, original_segments, translated_segments)
-        """
-        file_extension = file_extension.lower()
-        if file_extension == "pptx":
-            return self.process_pptx(input_stream, target_language, progress_ui, label_ui)
-        elif file_extension == "docx":
-            return self.process_docx(input_stream, target_language, progress_ui, label_ui)
-        elif file_extension == "pdf":
-            # <-- Minimal change: PDF route
-            return self.process_pdf(input_stream, target_language, progress_ui, label_ui)
+    def update_segment(self, segment_id, new_text, target_language, instructions=None):
+        if segment_id not in self.segment_map:
+            raise ValueError(f"Segment ID {segment_id} not found.")
+
+        seg = self.segment_map[segment_id]
+        new_text = new_text.replace('\t', ' ').strip()
+        if instructions:
+            updated = self.translate_text_with_instructions(new_text, target_language, instructions)
+        else:
+            updated = new_text
+
+        seg["translated"] = updated
+        seg["original"] = new_text
+        seg_type = seg["type"]
+        if seg_type in ["paragraph", "table_cell"]:
+            if "object" in seg:
+                seg["object"].text = updated
+        elif seg_type == "pptx_shape":
+            if "object" in seg and hasattr(seg["object"], "text_frame") and seg["object"].text_frame:
+                seg["object"].text_frame.text = updated
+
+        logging.info(f"[Backend] Updated segment {segment_id} with new translation length {len(updated)}")
+        self.regenerate_output_stream()
+        return updated
+
+    # ------------------
+    # ROUTING
+    # ------------------
+    def translate_file(self, input_stream, file_extension, target_language, progress_ui, label_ui, processed=False):
+        self.reset_cancel()
+        ext = file_extension.lower()
+        if ext == "docx":
+            return self.process_docx(input_stream, target_language, progress_ui, label_ui, do_translate=not processed)
+        elif ext == "pptx":
+            return self.process_pptx(input_stream, target_language, progress_ui, label_ui, do_translate=not processed)
+        elif ext == "pdf":
+            return self.process_pdf(input_stream, target_language, progress_ui, label_ui, do_translate=not processed)
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
