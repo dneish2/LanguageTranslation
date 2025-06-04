@@ -4,9 +4,9 @@
 
 ## Overview
 
-This project offers a structured approach to automating the translation of text across multiple document formats, including **DOCX**, **PPTX**, and **PDF**. It leverages modern language models to integrate rule-based and context-aware mechanisms, allowing for high-precision, consistent translations that adapt to the unique needs of the user.
+This tool makes it easy to translate full documents like DOCX, PDF, and PPTX while keeping the original formatting and structure intact. It uses a flexible logic layer to understand what should be translated and how, working alongside language models to produce clean, editable outputs ready for use or refinement.
 
-By automating repetitive tasks, this tool shifts the role of a manual translator to that of a **quality assurance specialist**, enabling users to focus on refining outputs rather than starting from scratch. This approach significantly enhances both productivity and accuracy, making it possible to handle larger volumes of work with greater confidence.
+By automating repetitive tasks, this tool shifts the role of a manual translator to that of a **quality assurance specialist**, enabling **power users** to focus on refining outputs rather than starting from scratch. This approach significantly enhances both productivity and accuracy, making it possible to handle larger volumes of work with greater confidence.
 
 At its core, the design is centered on two principles:
 1. **Customizable Translation Logic**: A customizable system prompt governs how the tool handles names, technical terms, and domain-specific phrases. This flexibility ensures accurate and context-aware output to match nuanced need. 
