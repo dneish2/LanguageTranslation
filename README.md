@@ -8,9 +8,9 @@ This project offers a structured approach to automating the translation of text 
 
 By automating repetitive tasks, this tool shifts the role of a manual translator to that of a **quality assurance specialist**, enabling users to focus on refining outputs rather than starting from scratch. This approach significantly enhances both productivity and accuracy, making it possible to handle larger volumes of work with greater confidence.
 
-At its core, the design is centered on two fundamental pillars:
-1. **Customizable Translation Logic**: A system prompt defines rules such as “Do not translate personal names, internationally recognized technical terms, or trademarked terms,” ensuring that domain-specific or technical requirements are respected without manual intervention.
-2. **Context-Aware Adaptation**: By considering the nuances of language, tone, and even dialects, the system creates translations that are more than direct mappings, reflecting the intent and meaning behind the original text.
+At its core, the design is centered on two principles:
+1. **Customizable Translation Logic**: A customizable system prompt governs how the tool handles names, technical terms, and domain-specific phrases. This flexibility ensures accurate and context-aware output to match nuanced need. 
+2. **Human-Centered Document Interaction**: Instead of managing files through code or digging through folders, documents are surfaced directly in the interface. You can preview, translate, and export with just a few clicks.
 
 ### Key Components
 
