@@ -1,6 +1,6 @@
 # Language Translation Tool
 
-![Cover](cover.png)
+![Cover](Multilingual.png)
 
 ## Overview
 
