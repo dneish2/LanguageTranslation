@@ -28,8 +28,10 @@ class TranslationUI:
         self.original_segments_map = {}
         self.translated_segments_map = {}
 
-        # Drawer reference
+        # Drawer and advanced mode
         self.drawer = None
+        self.advanced_mode = False
+        self.advanced_button = None
 
     def start_ui(self):
         ui.page("/")(self.main_page)
@@ -47,8 +49,10 @@ class TranslationUI:
         with ui.header().classes("items-center justify-between bg-gray-100 p-2"):
             with ui.row().classes("w-full flex justify-between items-center"):
                 ui.label("Translation App").classes("text-lg font-bold text-black")
-                ui.button("Advanced Mode", on_click=self.activate_advanced_mode)\
-                    .classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
+                self.advanced_button = ui.button(
+                    "Enable Advanced Mode",
+                    on_click=self.toggle_advanced_mode
+                ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
             
         # Drawer as a top-level layout element (sibling to the header)
         self.drawer = ui.drawer(side='left').classes("bg-gray-50")
@@ -64,9 +68,15 @@ class TranslationUI:
             self.stats_container = ui.column().classes("w-full max-w-3xl items-center")
             self.refresh_upload_ui()
 
-    def activate_advanced_mode(self):
-        # Placeholder method for your future advanced LLM review logic
-        ui.notify("Advanced Mode activated! (Please speak to your account manager to enable this feature.)")
+    def toggle_advanced_mode(self):
+        """Toggle visibility of advanced editing features."""
+        self.advanced_mode = not self.advanced_mode
+        if self.advanced_mode:
+            self.advanced_button.text = "Advanced Mode Enabled"
+            ui.notify("Advanced Mode activated! Segment editing features are now available.")
+        else:
+            self.advanced_button.text = "Enable Advanced Mode"
+            ui.notify("Advanced Mode disabled. Segment editing hidden.")
 
     def show_document_list(self):
         """Populate the drawer with recent files that start with 'translated_'. """
@@ -289,55 +299,57 @@ class TranslationUI:
                 # Title
                 ui.label(f"'{file_name}' translated to {target_language}.")\
                     .classes("text-2xl font-semibold text-gray-800")
-                ui.label("Each segment shows the original & an editable translation.")\
-                    .classes("text-sm text-gray-600 mb-4")
 
-                # Per-segment cards
-                for seg_id in list(self.original_segments_map.keys()):
-                    orig = self.original_segments_map[seg_id]
-                    trans = self.translated_segments_map[seg_id]
-                    logging.debug(f"[UI] Showing card for segment {seg_id[:8]}")
+                if self.advanced_mode:
+                    ui.label("Each segment shows the original & an editable translation.")\
+                        .classes("text-sm text-gray-600 mb-4")
 
-                    with ui.card().classes("shadow-md p-4"):
+                    # Per-segment cards
+                    for seg_id in list(self.original_segments_map.keys()):
+                        orig = self.original_segments_map[seg_id]
+                        trans = self.translated_segments_map[seg_id]
+                        logging.debug(f"[UI] Showing card for segment {seg_id[:8]}")
 
-                        # ─── HEADER ROW: ID + Approve/Decline/Delete ───
-                        with ui.row().classes("justify-between items-center mb-3"):
-                            ui.label(f"Segment ID: {seg_id[:8]}...")\
-                                .classes("font-bold text-lg text-gray-700")
-                            with ui.row().classes("space-x-2"):
+                        with ui.card().classes("shadow-md p-4"):
+
+                            # ─── HEADER ROW: ID + Approve/Decline/Delete ───
+                            with ui.row().classes("justify-between items-center mb-3"):
+                                ui.label(f"Segment ID: {seg_id[:8]}...")\
+                                    .classes("font-bold text-lg text-gray-700")
+                                with ui.row().classes("space-x-2"):
+                                    ui.button(
+                                        "Approve",
+                                        on_click=lambda _, s=seg_id: self.approve_segment_callback(s)
+                                    ).props("size=small color=positive")
+                                    ui.button(
+                                        "Decline",
+                                        on_click=lambda _, s=seg_id: self.decline_segment_callback(s)
+                                    ).props("size=small color=warning")
+                                    ui.button(
+                                        "Delete",
+                                        on_click=lambda _, s=seg_id: self.delete_segment_callback(s)
+                                    ).props("size=small color=negative")
+
+                            # ─── ORIGINAL TEXT ───
+                            with ui.column().classes("bg-gray-50 rounded p-3 mb-3"):
+                                ui.label("Original").classes("font-semibold text-gray-700 mb-1")
+                                ui.html(f"<div class='text-base text-gray-800'>{orig}</div>")
+
+                            # ─── TRANSLATION + UPDATE ───
+                            ui.label("Current Translation").classes("font-semibold text-gray-700 mb-1")
+                            text_area = ui.textarea(value=trans)\
+                                .props("autogrow")\
+                                .classes("w-full mb-3")
+                            refine_input = ui.input(label="Refinement Instructions (optional)")\
+                                .props("clearable")\
+                                .classes("mb-3")
+
+                            with ui.row().classes("justify-start"):
                                 ui.button(
-                                    "Approve",
-                                    on_click=lambda _, s=seg_id: self.approve_segment_callback(s)
-                                ).props("size=small color=positive")
-                                ui.button(
-                                    "Decline",
-                                    on_click=lambda _, s=seg_id: self.decline_segment_callback(s)
-                                ).props("size=small color=warning")
-                                ui.button(
-                                    "Delete",
-                                    on_click=lambda _, s=seg_id: self.delete_segment_callback(s)
-                                ).props("size=small color=negative")
-
-                        # ─── ORIGINAL TEXT ───
-                        with ui.column().classes("bg-gray-50 rounded p-3 mb-3"):
-                            ui.label("Original").classes("font-semibold text-gray-700 mb-1")
-                            ui.html(f"<div class='text-base text-gray-800'>{orig}</div>")
-
-                        # ─── TRANSLATION + UPDATE ───
-                        ui.label("Current Translation").classes("font-semibold text-gray-700 mb-1")
-                        text_area = ui.textarea(value=trans)\
-                            .props("autogrow")\
-                            .classes("w-full mb-3")
-                        refine_input = ui.input(label="Refinement Instructions (optional)")\
-                            .props("clearable")\
-                            .classes("mb-3")
-
-                        with ui.row().classes("justify-start"):
-                            ui.button(
-                                "Update",
-                                on_click=lambda _, s=seg_id, ta=text_area, rin=refine_input:
-                                    self.update_segment_callback(s, ta, rin)
-                            ).props("size=small color=primary")
+                                    "Update",
+                                    on_click=lambda _, s=seg_id, ta=text_area, rin=refine_input:
+                                        self.update_segment_callback(s, ta, rin)
+                                ).props("size=small color=primary")
 
                 # ─── DOWNLOAD / UPLOAD ANOTHER ───
                 with ui.row().classes("justify-start space-x-4 mt-6"):
@@ -354,8 +366,6 @@ class TranslationUI:
         with self.stats_container:
             ui.label(f"Elements translated: {count}")\
                 .classes("text-base text-gray-700 mt-4")
-            ui.label(f"Estimated cost: ${cost:.4f}")\
-                .classes("text-base text-gray-700 mb-4")
 
     def update_segment_callback(self, seg_id, text_area, refine_input):
         try:
