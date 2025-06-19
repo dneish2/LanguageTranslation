@@ -474,8 +474,9 @@ class TranslationBackend:
         else:
             updated = new_text
 
+        # Preserve the source text in "original" and only update the
+        # translated version.
         seg["translated"] = updated
-        seg["original"] = new_text
         seg_type = seg["type"]
         if seg_type in ["paragraph", "table_cell"]:
             if "object" in seg:
