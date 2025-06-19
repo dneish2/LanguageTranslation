@@ -66,7 +66,7 @@ class TranslationUI:
 
     def activate_advanced_mode(self):
         # Placeholder method for your future advanced LLM review logic
-        ui.notify("Advanced Mode activated! (No logic implemented yet.)")
+        ui.notify("Advanced Mode activated! (Please speak to your account manager to enable this feature.)")
 
     def show_document_list(self):
         """Populate the drawer with recent files that start with 'translated_'. """
@@ -114,34 +114,55 @@ class TranslationUI:
         self.uploaded_file_extension = self.uploaded_file_name.split(".")[-1].lower()
         self.uploaded_file = BytesIO(event.content.read())
         logging.info(f"[UI] File '{self.uploaded_file_name}' uploaded. Extension={self.uploaded_file_extension}")
-
+                
         self.upload_container.clear()
         with self.upload_container:
             ui.label(f"File '{self.uploaded_file_name}' uploaded successfully!")\
                 .style("font-size: 18px; color: #333; margin-bottom: 6px; text-align: center;")
             ui.label("Select a target language for translation:")\
                 .style("font-size: 16px; color: #555; margin-bottom: 8px; text-align: center;")
-            lang_input = ui.input(label="Target Language", placeholder="e.g., Spanish")
-            ui.button("Translate", on_click=lambda: self.handle_translation(lang_input.value))\
-                .classes("bg-blue-600 text-white px-4 py-2 rounded shadow mt-2")
 
-    def handle_translation(self, target_language):
+            lang_input = ui.input(label="Target Language", placeholder="e.g., Spanish")
+
+            # PPTX-only controls
+            font_size_input = None
+            autofit_checkbox = None
+        
+            if self.uploaded_file_extension == 'pptx':
+                font_size_input = ui.number(
+                    label="Max font size (pt)",
+                    value=18,
+                    min=1
+                ).classes("mb-2")
+                autofit_checkbox = ui.checkbox("Enable auto-fit").classes("mb-4")
+
+            ui.button(
+                "Translate",
+                on_click=lambda: self.handle_translation(
+                    lang_input.value,
+                    # PPTX: pass fonts, otherwise None/False
+                    int(font_size_input.value) if font_size_input else None,
+                    autofit_checkbox.value if autofit_checkbox else False
+                )
+            ).classes("bg-blue-600 text-white px-4 py-2 rounded shadow mt-2")
+
+    def handle_translation(self, target_language, font_size=None, autofit=False):
         if not target_language:
             self.show_error("Please enter a valid target language.")
             return
         self.current_target_language = target_language
-        logging.info(f"[UI] Starting translation for '{self.uploaded_file_name}' to '{target_language}'")
+        logging.info(f"[UI] Starting translation for '{self.uploaded_file_name}' → '{target_language}', "
+                    f"PPTX font_size={font_size}, autofit={autofit}")
 
+        # clear old UI
         self.progress_container.clear()
         self.result_container.clear()
         self.stats_container.clear()
 
         progress_ui = ui.circular_progress(value=0.0, max=100, show_value=True)\
-            .classes("mx-auto mt-4")\
-            .style("color: #ff9800;")
+            .classes("mx-auto mt-4").style("color: #ff9800;")
         label_ui = ui.label("Preparing translation...")\
             .classes("text-center text-gray-700 mt-2")
-
         self.cancel_button = ui.button("Cancel Translation", on_click=self.cancel_translation)\
             .classes("bg-red-500 text-white px-4 py-2 rounded shadow mt-2")
 
@@ -152,13 +173,15 @@ class TranslationUI:
 
         def translation_task():
             try:
-                (out_stream, count, tokens, translated_text, seg_map) = self.backend.translate_file(
+                out_stream, count, tokens, translated_text, seg_map = self.backend.translate_file(
                     self.uploaded_file,
                     self.uploaded_file_extension,
                     target_language,
                     progress_ui,
                     label_ui,
-                    processed=False
+                    processed=False,
+                    font_size=font_size,
+                    autofit=autofit
                 )
                 if self.backend.cancel_requested:
                     logging.info("[UI] Translation canceled mid-way.")
@@ -168,6 +191,7 @@ class TranslationUI:
                 label_ui.text = "Translation complete."
                 self.backend.regenerate_output_stream()
 
+                # rebuild segment maps
                 self.original_segments_map.clear()
                 self.translated_segments_map.clear()
                 for seg_id, seg_info in seg_map.items():
@@ -189,6 +213,7 @@ class TranslationUI:
                 self.show_error(e)
 
         Thread(target=translation_task).start()
+# ──────────────────────────────────────────────────
 
     def handle_translation_processed(self):
         """Load a file in processed mode (no re-translation)."""
@@ -250,61 +275,87 @@ class TranslationUI:
         self.show_error("Translation was canceled. Please upload or try again.")
 
     def show_result(self, file_name, target_language, out_stream, count, cost, translated_text, seg_map):
+        logging.info(f"[UI] Rendering {len(self.original_segments_map)} segment cards")
+
+        # Clear old UI
         self.result_container.clear()
         self.stats_container.clear()
-
         if self.cancel_button:
             self.cancel_button.visible = False
 
         with self.result_container:
-            with ui.column().classes("max-w-3xl mx-auto w-full space-y-6 relative mt-4"):
+            with ui.column().classes("max-w-3xl mx-auto w-full space-y-6 mt-4"):
+
+                # Title
                 ui.label(f"'{file_name}' translated to {target_language}.")\
                     .classes("text-2xl font-semibold text-gray-800")
-                ui.label("Each segment shows the original (read-only) and the current translation (editable).")\
+                ui.label("Each segment shows the original & an editable translation.")\
                     .classes("text-sm text-gray-600 mb-4")
 
+                # Per-segment cards
                 for seg_id in list(self.original_segments_map.keys()):
                     orig = self.original_segments_map[seg_id]
                     trans = self.translated_segments_map[seg_id]
-                    with ui.card().classes("border-l-4 border-blue-500 shadow-md p-4 relative"):
-                        # Delete button top-right
-                        ui.button("Delete", on_click=lambda _, s=seg_id: self.delete_segment_callback(s))\
-                            .props("size=small color=danger")\
-                            .style("position: absolute; top: 8px; right: 8px;")
+                    logging.debug(f"[UI] Showing card for segment {seg_id[:8]}")
 
-                        ui.label(f"Segment ID: {seg_id[:8]}...").classes("font-bold text-lg text-gray-700 mb-3")
+                    with ui.card().classes("shadow-md p-4"):
 
+                        # ─── HEADER ROW: ID + Approve/Decline/Delete ───
+                        with ui.row().classes("justify-between items-center mb-3"):
+                            ui.label(f"Segment ID: {seg_id[:8]}...")\
+                                .classes("font-bold text-lg text-gray-700")
+                            with ui.row().classes("space-x-2"):
+                                ui.button(
+                                    "Approve",
+                                    on_click=lambda _, s=seg_id: self.approve_segment_callback(s)
+                                ).props("size=small color=positive")
+                                ui.button(
+                                    "Decline",
+                                    on_click=lambda _, s=seg_id: self.decline_segment_callback(s)
+                                ).props("size=small color=warning")
+                                ui.button(
+                                    "Delete",
+                                    on_click=lambda _, s=seg_id: self.delete_segment_callback(s)
+                                ).props("size=small color=negative")
+
+                        # ─── ORIGINAL TEXT ───
                         with ui.column().classes("bg-gray-50 rounded p-3 mb-3"):
                             ui.label("Original").classes("font-semibold text-gray-700 mb-1")
-                            ui.html(f"<div class='text-base text-gray-800 leading-relaxed'>{orig}</div>")
+                            ui.html(f"<div class='text-base text-gray-800'>{orig}</div>")
 
+                        # ─── TRANSLATION + UPDATE ───
                         ui.label("Current Translation").classes("font-semibold text-gray-700 mb-1")
                         text_area = ui.textarea(value=trans)\
                             .props("autogrow")\
-                            .classes("text-base text-gray-800 leading-relaxed w-full mb-3")
-
+                            .classes("w-full mb-3")
                         refine_input = ui.input(label="Refinement Instructions (optional)")\
                             .props("clearable")\
                             .classes("mb-3")
 
-                        with ui.row().classes("justify-between"):
-                            ui.button("Update", on_click=lambda _, s=seg_id, ta=text_area, rin=refine_input: self.update_segment_callback(s, ta, rin))\
-                                .props("size=small color=primary")
+                        with ui.row().classes("justify-start"):
+                            ui.button(
+                                "Update",
+                                on_click=lambda _, s=seg_id, ta=text_area, rin=refine_input:
+                                    self.update_segment_callback(s, ta, rin)
+                            ).props("size=small color=primary")
 
+                # ─── DOWNLOAD / UPLOAD ANOTHER ───
                 with ui.row().classes("justify-start space-x-4 mt-6"):
                     ui.button(
                         "Download Translated File",
                         on_click=lambda: ui.download(self.backend.output_stream.read(), f"translated_{file_name}")
                     ).classes("bg-blue-600 text-white px-4 py-2 rounded shadow")
-
                     ui.button(
                         "Upload Another File",
                         on_click=self.refresh_upload_ui
                     ).classes("bg-gray-200 text-gray-800 px-4 py-2 rounded shadow")
 
+        # Stats footer
         with self.stats_container:
-            ui.label(f"Elements translated: {count}").classes("text-base text-gray-700 mt-4")
-            ui.label(f"Estimated cost: ${cost:.4f}").classes("text-base text-gray-700 mb-4")
+            ui.label(f"Elements translated: {count}")\
+                .classes("text-base text-gray-700 mt-4")
+            ui.label(f"Estimated cost: ${cost:.4f}")\
+                .classes("text-base text-gray-700 mb-4")
 
     def update_segment_callback(self, seg_id, text_area, refine_input):
         try:
@@ -335,6 +386,20 @@ class TranslationUI:
             )
         except Exception as ex:
             ui.notify(f"Error deleting segment {seg_id[:8]}: {ex}")
+
+    def approve_segment_callback(self, seg_id):
+        """Mark segment as approved and log it."""
+        seg = self.original_segments_map.get(seg_id), self.translated_segments_map.get(seg_id)
+        self.backend.record_feedback(seg_id, approved=True, 
+                                     original=seg[0], translated=seg[1])
+        ui.notify(f"Segment {seg_id[:8]} approved.")
+
+    def decline_segment_callback(self, seg_id):
+        """Mark segment as declined and log it."""
+        seg = self.original_segments_map.get(seg_id), self.translated_segments_map.get(seg_id)
+        self.backend.record_feedback(seg_id, approved=False, 
+                                     original=seg[0], translated=seg[1])
+        ui.notify(f"Segment {seg_id[:8]} declined.")
 
     def show_error(self, error):
         self.result_container.clear()
