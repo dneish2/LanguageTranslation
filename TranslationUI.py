@@ -288,6 +288,7 @@ class TranslationUI:
         logging.info(f"[UI] Rendering {len(self.original_segments_map)} segment cards")
 
         # Clear old UI
+        self.progress_container.clear()
         self.result_container.clear()
         self.stats_container.clear()
         if self.cancel_button:
