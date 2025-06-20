@@ -1,18 +1,18 @@
-# Use an official Python runtime as a parent image
-FROM python:3.10
+# Use a slim official Python image
+FROM python:3.11-slim
 
-# Set the working directory in the container
+# Set the working directory
 WORKDIR /app
 
-# Copy the requirements file and install dependencies
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Copy app files
 COPY . .
 
-# Expose port 8080 for Cloud Run
+# Expose port for Cloud Run
 EXPOSE 8080
 
-# Command to run the app
-CMD ["python", "main.py"]
+# Run the app
+CMD ["python", "TranslationUI.py"]
