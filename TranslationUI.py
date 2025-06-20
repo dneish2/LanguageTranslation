@@ -35,7 +35,7 @@ class TranslationUI:
 
     def start_ui(self):
         ui.page("/")(self.main_page)
-        ui.run(port=3030)
+        ui.run(host="0.0.0.0", port=8080)
 
     def main_page(self):
         """
