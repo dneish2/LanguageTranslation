@@ -90,6 +90,7 @@ class TranslationUI:
                     .classes("w-full text-left mb-1")
 
     def load_processed_document(self, filename):
+        self.progress_container.clear()
         if not os.path.exists(filename):
             ui.notify(f"File {filename} not found.")
             return
