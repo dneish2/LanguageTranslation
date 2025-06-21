@@ -58,7 +58,7 @@ python TranslationUI.py
 	5.	Access the Interface
 Once the server starts, open your browser and navigate to:
 
-http://127.0.0.1:3030
+http://127.0.0.1:8080
 
 This will load the NiceGUI-based user interface, where you can upload documents, select target languages, and manage translations.
 
