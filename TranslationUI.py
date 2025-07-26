@@ -477,5 +477,5 @@ class TranslationUI:
             ui.label(f"An error occurred: {error}").style("font-size: 18px; color: #e53935;")
 
 if __name__ in {"__main__", "__mp_main__"}:
-    app = TranslationUI()
-    app.start_ui()
+    ui_app = TranslationUI()
+    ui_app.start_ui()
