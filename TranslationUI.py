@@ -1,4 +1,5 @@
-from nicegui import ui
+from nicegui import ui, app
+from fastapi import Request, UploadFile, File, Form, Response
 from io import BytesIO
 from threading import Thread
 from TranslationBackend import TranslationBackend
@@ -35,6 +36,8 @@ class TranslationUI:
 
     def start_ui(self):
         ui.page("/")(self.main_page)
+        ui.page("/voice")(self.voice_translation_page)
+        app.add_api_route("/api/voice_translate", self.api_voice_translate, methods=["POST"])
         ui.run(host="0.0.0.0", port=8080)
 
     def main_page(self):
@@ -49,10 +52,15 @@ class TranslationUI:
         with ui.header().classes("items-center justify-between bg-gray-100 p-2"):
             with ui.row().classes("w-full flex justify-between items-center"):
                 ui.label("Translation App").classes("text-lg font-bold text-black")
-                self.advanced_button = ui.button(
-                    "Enable Advanced Mode",
-                    on_click=self.toggle_advanced_mode
-                ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
+                with ui.row().classes("items-center space-x-2"):
+                    self.advanced_button = ui.button(
+                        "Enable Advanced Mode",
+                        on_click=self.toggle_advanced_mode
+                    ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
+                    ui.button(
+                        "Voice Translation (Exp)",
+                        on_click=lambda: ui.open('/voice')
+                    ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
             
         # Drawer as a top-level layout element (sibling to the header)
         self.drawer = ui.drawer(side='left').classes("bg-gray-50")
@@ -409,9 +417,58 @@ class TranslationUI:
     def decline_segment_callback(self, seg_id):
         """Mark segment as declined and log it."""
         seg = self.original_segments_map.get(seg_id), self.translated_segments_map.get(seg_id)
-        self.backend.record_feedback(seg_id, approved=False, 
+        self.backend.record_feedback(seg_id, approved=False,
                                      original=seg[0], translated=seg[1])
         ui.notify(f"Segment {seg_id[:8]} declined.")
+
+    # ------------------------------------------------------------------
+    # Experimental voice translation page
+    # ------------------------------------------------------------------
+    def voice_translation_page(self):
+        ui.label("Experimental Voice Translation").classes("text-2xl font-semibold")
+        lang_select = ui.select(
+            ["fr", "es", "tl", "en", "zh"],
+            value="fr",
+            label="Target Language",
+        ).props("id=lang_select")
+        with ui.row().classes("space-x-4 mt-4"):
+            ui.button("Start Recording", on_click=lambda: ui.run_javascript("startRecording()"))
+            ui.button("Stop Recording", on_click=lambda: ui.run_javascript("stopRecording()"))
+            ui.button("Back", on_click=lambda: ui.open('/'))
+        ui.audio().props("id=out_audio class=mt-4")
+        ui.add_head_html(
+            """
+            <script>
+            let stream; let rec; let chunks = [];
+            async function startRecording(){
+                stream = await navigator.mediaDevices.getUserMedia({audio:true});
+                rec = new MediaRecorder(stream);
+                rec.ondataavailable = e => chunks.push(e.data);
+                rec.onstop = async e => {
+                    const blob = new Blob(chunks, {type:'audio/webm'}); chunks=[];
+                    const fd = new FormData();
+                    fd.append('file', blob, 'speech.webm');
+                    fd.append('language', document.getElementById('lang_select').value);
+                    const resp = await fetch('/api/voice_translate', {method:'POST', body: fd});
+                    const ab = await resp.blob();
+                    const url = URL.createObjectURL(ab);
+                    const a = document.getElementById('out_audio');
+                    a.src = url; a.play();
+                };
+                rec.start();
+            }
+            function stopRecording(){
+                if(rec){rec.stop();}
+                if(stream){stream.getTracks().forEach(t=>t.stop());}
+            }
+            </script>
+            """
+        )
+
+    async def api_voice_translate(self, file: UploadFile = File(...), language: str = Form(...)):
+        data = await file.read()
+        text, audio_content = self.backend.translate_audio(data, language)
+        return Response(content=audio_content, media_type="audio/mpeg")
 
     def show_error(self, error):
         self.result_container.clear()

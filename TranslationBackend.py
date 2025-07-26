@@ -106,6 +106,25 @@ class TranslationBackend:
         encoding = tiktoken.encoding_for_model("gpt-4o")
         return len(encoding.encode(total_text))
 
+    def translate_audio(self, audio_bytes: bytes, target_language: str):
+        """Translate spoken audio to the target language and return speech bytes."""
+        try:
+            audio_file = BytesIO(audio_bytes)
+            transcription = self.client.audio.transcriptions.create(
+                model="whisper-1", file=audio_file
+            )
+            source_text = transcription.text
+            translated_text = self.translate_text(source_text, target_language)
+            speech_response = self.client.audio.speech.create(
+                model="tts-1", voice="nova", input=translated_text
+            )
+            audio_content = speech_response.content if hasattr(speech_response, "content") else speech_response
+            logging.info(f"[Backend] Voice translated to {target_language}")
+            return translated_text, audio_content
+        except Exception as e:
+            logging.error(f"[Backend] translate_audio error: {e}", exc_info=True)
+            raise
+
     # ------------------
     # PDF UTILS
     # ------------------
