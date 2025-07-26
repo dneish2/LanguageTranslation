@@ -106,22 +106,26 @@ class TranslationBackend:
         encoding = tiktoken.encoding_for_model("gpt-4o")
         return len(encoding.encode(total_text))
 
-    def translate_audio(self, text: str, language: str) -> bytes:
-        """Convert text to spoken audio using OpenAI TTS."""
+    def translate_audio(self, audio_bytes: bytes, target_language: str):
+        """Translate spoken audio to the target language and return speech bytes."""
         logging.info(
             f"[Backend] TTS request lang={language} len(text)={len(text.encode('utf-8'))}"
-        )
         try:
-            response = self.client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=text,
-                response_format="mp3",
+            audio_file = BytesIO(audio_bytes)
+            transcription = self.client.audio.transcriptions.create(
+                model="whisper-1", file=audio_file
             )
-            return response.content
-        except Exception as exc:
-            logging.error(f"[Backend] translate_audio error: {exc}", exc_info=True)
-            return b""
+            source_text = transcription.text
+            translated_text = self.translate_text(source_text, target_language)
+            speech_response = self.client.audio.speech.create(
+                model="tts-1", voice="nova", input=translated_text
+            )
+            audio_content = speech_response.content if hasattr(speech_response, "content") else speech_response
+            logging.info(f"[Backend] Voice translated to {target_language}")
+            return translated_text, audio_content
+        except Exception as e:
+            logging.error(f"[Backend] translate_audio error: {e}", exc_info=True)
+            raise
 
     # ------------------
     # PDF UTILS

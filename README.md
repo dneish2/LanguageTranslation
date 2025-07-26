@@ -62,6 +62,10 @@ http://127.0.0.1:8080
 
 This will load the NiceGUI-based user interface, where you can upload documents, select target languages, and manage translations.
 
+### Experimental Voice Translation
+An additional page provides one-way voice translation using OpenAI's realtime API.
+Click **Voice Translation (Exp)** in the top bar to access it. Record speech in any language and hear the translated output in your selected language.
+
 ### Prerequisites
 - **Python Version**: Ensure Python 3.8 or higher is installed.
 - **Dependencies**: Install all required packages listed in `requirements.txt`.
