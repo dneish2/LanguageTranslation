@@ -2,7 +2,9 @@ from nicegui import ui, app
 from fastapi import Request, UploadFile, File, Form, Response
 from io import BytesIO
 from threading import Thread
+from fastapi import Request, Response
 from TranslationBackend import TranslationBackend
+import asyncio
 import logging
 import os
 
@@ -33,6 +35,13 @@ class TranslationUI:
         self.drawer = None
         self.advanced_mode = False
         self.advanced_button = None
+
+        # API routes
+        app.add_api_route(
+            "/api/voice_translate",
+            self.api_voice_translate,
+            methods=["POST"],
+        )
 
     def start_ui(self):
         ui.page("/")(self.main_page)
@@ -475,6 +484,17 @@ class TranslationUI:
         self.stats_container.clear()
         with self.result_container:
             ui.label(f"An error occurred: {error}").style("font-size: 18px; color: #e53935;")
+
+    async def api_voice_translate(self, request: Request) -> Response:
+        """Return TTS audio for the provided text and language."""
+        data = await request.json()
+        language = data.get("language", "en")
+        text = data.get("text", "")
+        byte_size = len(text.encode("utf-8"))
+        logging.info(f"[UI] voice translate start lang={language} bytes={byte_size}")
+        audio_bytes = await asyncio.to_thread(self.backend.translate_audio, text, language)
+        logging.info("[UI] voice translate complete")
+        return Response(content=audio_bytes, media_type="audio/mpeg")
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui_app = TranslationUI()

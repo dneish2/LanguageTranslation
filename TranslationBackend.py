@@ -108,6 +108,8 @@ class TranslationBackend:
 
     def translate_audio(self, audio_bytes: bytes, target_language: str):
         """Translate spoken audio to the target language and return speech bytes."""
+        logging.info(
+            f"[Backend] TTS request lang={language} len(text)={len(text.encode('utf-8'))}"
         try:
             audio_file = BytesIO(audio_bytes)
             transcription = self.client.audio.transcriptions.create(
