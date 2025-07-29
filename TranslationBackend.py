@@ -1,60 +1,67 @@
-import os
 import logging
-import uuid
+import os
 import string
-import fitz  # PyMuPDF
 import time
+import uuid
+import json
 from io import BytesIO
+from typing import Tuple
+from typing import Optional
+
+import dotenv
+import fitz  # PyMuPDF
+import openai
+import tiktoken
+from docx import Document
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from docx import Document
 from pptx.util import Pt
-import openai
-import dotenv
-import tiktoken
-import json, os, logging
 
-dotenv.load_dotenv()  # Load environment variables
-
+dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-WHITE = (1, 1, 1)  # for PDF overwriting
+WHITE = (1, 1, 1)  # RGB white for PDF overwrite
+
 
 class TranslationBackend:
-    def __init__(self):
+    """Handles GPT-based text/document translation and experimental voice I/O."""
+
+    # ─────────────────────────── INITIALISATION ────────────────────────── #
+    def __init__(self) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY not set.")
         self.client = openai.OpenAI(api_key=self.api_key)
-        self.cancel_requested = False
 
-        self.segment_map = {}       # segment_id -> {type, location, original, translated, metadata, object}
+        self.cancel_requested = False
+        self.segment_map: dict[str, dict] = {}
         self.current_file_type = None
         self.current_document = None
         self.current_presentation = None
         self.current_pdf = None
-        self.output_stream = None
+        self.output_stream: BytesIO | None = None
 
-    def reset_cancel(self):
+    def reset_cancel(self) -> None:
         self.cancel_requested = False
 
-    def request_cancel(self):
+    def request_cancel(self) -> None:
         self.cancel_requested = True
         logging.info("[Backend] Cancel requested.")
 
-    def generate_segment_id(self):
+    def generate_segment_id(self) -> str:
         return str(uuid.uuid4())
 
-    # ------------------
-    # GPT CORE
-    # ------------------
-    def translate_text(self, text, target_language):
-        text = text.replace('\t', ' ').strip()
+    # ───────────────────────────── GPT CORE ────────────────────────────── #
+    def translate_text(self, text: str, target_language: str) -> str:
+        """Translate free-form text via GPT."""
+        text = text.replace("\t", " ").strip()
         if not text:
             return text
+
         prompt = (
             f"Translate the following text to {target_language}, preserving meaning and context. "
-            f"Do not translate personal names or trademarked terms. If it's an email or URL, keep it unchanged.\n\n"
+            f"Do not translate personal names or trademarked terms. "
+            "If it's an email address or URL, leave it unchanged.\n\n"
             f"Text:\n{text}"
         )
         messages = [
@@ -62,106 +69,94 @@ class TranslationBackend:
             {"role": "user", "content": prompt},
         ]
         try:
-            completion = self.client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=4000
-            )
-            result = completion.choices[0].message.content.strip()
-            if not result:
-                result = text
-            logging.info(f"[Backend] Translated text from len={len(text)} to len={len(result)}")
+            completion = self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+            result = completion.choices[0].message.content.strip() or text
+            logging.info("[Backend] Translated len=%d → len=%d", len(text), len(result))
             return result
         except Exception as e:
-            logging.error(f"[Backend] translate_text error: {e}", exc_info=True)
+            logging.error("[Backend] translate_text error: %s", e, exc_info=True)
             return text
 
-    def translate_text_with_instructions(self, original_text, target_language, instructions):
-        original_text = original_text.replace('\t', ' ').strip()
+    def translate_text_with_instructions(
+        self, original_text: str, target_language: str, instructions: str
+    ) -> str:
+        """Refine an existing translation with user instructions."""
+        original_text = original_text.replace("\t", " ").strip()
         if not original_text:
             return original_text
+
         prompt = (
-            f"Please refine the following translation according to these instructions. "
-            f"Ensure that any requested changes – including changing the language – are fully applied.\n\n"
+            "Please refine the following translation according to these instructions. "
+            "Ensure that any requested changes—including changing the language—are applied.\n\n"
             f"Instructions: {instructions}\n\n"
             f"Original text: {original_text}\n\n"
-            f"Final translation:"
+            "Final translation:"
         )
         messages = [
             {"role": "system", "content": "You are a helpful assistant refining translations."},
             {"role": "user", "content": prompt},
         ]
         try:
-            completion = self.client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=4000
-            )
-            result = completion.choices[0].message.content.strip()
-            if not result:
-                result = original_text
-            logging.info(f"[Backend] Refined translation with instructions; result length: {len(result)}")
+            completion = self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+            result = completion.choices[0].message.content.strip() or original_text
+            logging.info("[Backend] Refined translation len=%d", len(result))
             return result
         except Exception as e:
-            logging.error(f"[Backend] refine translation error: {e}", exc_info=True)
+            logging.error("[Backend] refine translation error: %s", e, exc_info=True)
             return original_text
 
-    def calculate_tokens(self, total_text):
-        encoding = tiktoken.encoding_for_model("gpt-4o")
-        return len(encoding.encode(total_text))
-
-    def translate_audio(self, audio_bytes: bytes, target_language: str):
-        """Translate spoken audio to the target language and return speech bytes."""
-        logging.info(
-            f"[Backend] TTS request lang={language} len(text)={len(text.encode('utf-8'))}"
+    # ──────────────────────── VOICE (WHISPER + TTS) ────────────────────── #
+    def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, bytes]:
+        """
+        1. Transcribe `audio_bytes` with Whisper.  
+        2. Translate resulting text.  
+        3. Return TTS MP3 bytes of the translation.
+        """
         try:
+            logging.info("[Backend] Voice pipeline start → %s (%d bytes)", target_language, len(audio_bytes))
             audio_file = BytesIO(audio_bytes)
-            transcription = self.client.audio.transcriptions.create(
-                model="whisper-1", file=audio_file
-            )
-            source_text = transcription.text
+            audio_file.name = "speech.webm"  # Whisper needs a filename
+
+            transcription = self.client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+            source_text: str = transcription.text
+            logging.info("[Backend] Whisper transcription: %s", source_text[:60] + "…")
+
             translated_text = self.translate_text(source_text, target_language)
-            speech_response = self.client.audio.speech.create(
-                model="tts-1", voice="nova", input=translated_text
+
+            tts_resp = self.client.audio.speech.create(
+                model="tts-1", voice="nova", input=translated_text, response_format="mp3"
             )
-            audio_content = speech_response.content if hasattr(speech_response, "content") else speech_response
-            logging.info(f"[Backend] Voice translated to {target_language}")
-            return translated_text, audio_content
+            audio_mp3: bytes = tts_resp.content if hasattr(tts_resp, "content") else tts_resp
+            logging.info("[Backend] TTS done (%d bytes)", len(audio_mp3))
+            return translated_text, audio_mp3
         except Exception as e:
-            logging.error(f"[Backend] translate_audio error: {e}", exc_info=True)
+            logging.error("[Backend] translate_audio error: %s", e, exc_info=True)
             raise
 
-    # ------------------
-    # PDF UTILS
-    # ------------------
-    def is_meaningful_text(self, text):
-        normalized = text.strip().lower().replace(' ', '')
-        skip = {'tm', '™', '©', '®'}
-        if normalized in skip:
+    # ─────────────────────────── TOKEN COUNTS ─────────────────────────── #
+    def calculate_tokens(self, total_text: str) -> int:
+        encoding = tiktoken.encoding_for_model("gpt-4o-mini")
+        return len(encoding.encode(total_text))
+
+    # ──────────────────────── SMALL PDF HELPER ────────────────────────── #
+    def is_meaningful_text(self, text: str) -> bool:
+        norm = text.strip().lower().replace(" ", "")
+        if norm in {"tm", "™", "©", "®"}:
             return False
-        stripped = text.translate(str.maketrans('', '', string.punctuation + "™©®")).strip()
+        stripped = text.translate(str.maketrans("", "", string.punctuation + "™©®")).strip()
         return any(ch.isalnum() for ch in stripped)
 
-    # ------------------
-    # REGENERATE OUTPUT
-    # ------------------
-    def regenerate_output_stream(self):
-        if self.current_file_type == 'docx' and self.current_document:
-            out_stream = BytesIO()
-            self.current_document.save(out_stream)
-            out_stream.seek(0)
-            self.output_stream = out_stream
-        elif self.current_file_type == 'pptx' and self.current_presentation:
-            out_stream = BytesIO()
-            self.current_presentation.save(out_stream)
-            out_stream.seek(0)
-            self.output_stream = out_stream
-        elif self.current_file_type == 'pdf' and self.current_pdf:
-            out_stream = BytesIO()
-            self.current_pdf.save(out_stream, garbage=4)
-            out_stream.seek(0)
-            self.output_stream = out_stream
+    # ───────────────────── OUTPUT REGENERATION ────────────────────────── #
+    def regenerate_output_stream(self) -> Optional[BytesIO]:
+        if self.current_file_type == "docx" and self.current_document:
+            out = BytesIO(); self.current_document.save(out); out.seek(0); self.output_stream = out
+        elif self.current_file_type == "pptx" and self.current_presentation:
+            out = BytesIO(); self.current_presentation.save(out); out.seek(0); self.output_stream = out
+        elif self.current_file_type == "pdf" and self.current_pdf:
+            out = BytesIO(); self.current_pdf.save(out, garbage=4); out.seek(0); self.output_stream = out
         return self.output_stream
 
-    # ------------------
-    # SEGMENT DELETION
-    # ------------------
+
     def delete_segment(self, segment_id):
         if segment_id not in self.segment_map:
             raise ValueError(f"Segment ID {segment_id} not found.")
@@ -524,6 +519,7 @@ class TranslationBackend:
         autofit=False
     ):
         self.reset_cancel()
+        self.current_target_language = target_language
         ext = file_extension.lower()
         if ext == "docx":
             return self.process_docx(input_stream, target_language, progress_ui, label_ui, do_translate=not processed)
@@ -541,23 +537,27 @@ class TranslationBackend:
             return self.process_pdf(input_stream, target_language, progress_ui, label_ui, do_translate=not processed)
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
-        
-    def record_feedback(self, segment_id: str, approved: bool, original: str, translated: str):
+
+    def record_feedback(self, approved: bool, original: str, translated: str):
         """
-        Append a feedback record to feedback.jsonl, for fine-tuning or audit.
+        Append a JSONL record for approved segments,
+        using the language the user originally picked.
         """
+        if not approved:
+            return
+
+        # Grab the language the user requested at the start of translate_file
+        lang = getattr(self, "current_target_language", "unknown")
+
         record = {
-            "segment_id": segment_id,
-            "approved": approved,
-            "original": original,
-            "translated": translated,
-            "timestamp": time.time()
+            "language":   lang,
+            "prompt":     f"Translate to {lang}:\n\n{original}",
+            "completion": f" {translated}"
         }
-        # ensure directory exists
+
         out_dir = os.getenv("FEEDBACK_DIR", ".")
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, "feedback.jsonl")
+        path = os.path.join(out_dir, "trl_finetune_data.jsonl")
 
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        logging.info(f"[Backend:feedback] Recorded feedback for {segment_id[:8]} → {approved} to {path}")
