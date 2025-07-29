@@ -58,7 +58,7 @@ class TranslationUI:
         ui.page("/")(self.main_page)
         ui.page("/voice")(self.voice_translation_page)
         # run on single port
-        ui.run(host="0.0.0.0", port=3030)
+        ui.run(host="0.0.0.0", port=8080)
 
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
