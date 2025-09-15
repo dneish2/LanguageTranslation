@@ -15,7 +15,7 @@ At its core, the design is centered on two principles:
 ### Key Components
 
 ## Docs Translation Workflow
-Consier this basic workflow for a document tralsator in which you loop through pargraphs of text, extract text, send it to inference to an LLM and replace the original text with the translated text.
+Consier this basic workflow for a document translator in which you loop through pargraphs of text, extract text, send it to inference to an LLM and replace the original text with the translated text.
 
 ![Workflow](workflow.png)
 
