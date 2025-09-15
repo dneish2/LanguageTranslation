@@ -14,6 +14,56 @@ At its core, the design is centered on two principles:
 
 ### Key Components
 
+## Docs Translation Workflow
+Consier this basic workflow for a document tralsator in which you loop through pargraphs of text, extract text, send it to inference to an LLM and replace the original text with the translated text.
+
+![Workflow](workflow.png)
+
+**What it does:**  
+Runner → File Loader → Translation Backend → DOCX Parser → `translate_text()` (OpenAI) → Segment Map → Output Stream → Translated `.docx` (with Progress/Logs along the way).
+
+**Formatting vs. styles:**
+- ✅ Preserves **paragraph formatting**: headings, alignment, list structure (set on the paragraph).
+- ⚠️ Drops **inline/run styles**: bold/italic/links, mixed fonts inside a sentence (runs are replaced).
+- If you need inline styles preserved:
+  1) *Quick but lossy:* translate each **run** separately (keeps styles; may hurt translation quality).
+  2) *Best practice:* translate the **whole paragraph once**, then **diff/map** the result back to the original runs, copying their styles.
+ 
+### Voice Translation Service (Backend Module Summary)
+
+**Purpose:**  
+Demonstrate live voice translation by taking a short mic recording, turning it into text, translating it, then having a text to speech model speak the translation back as an MP3.
+
+**Entry Point:**  
+`POST /api/voice_translate` (multipart/form-data)  
+- `file`: recorded audio blob (e.g., `audio/webm;codecs=opus`)  
+- `language`: target language code (e.g., `es`, `fr`, `de`, `zh`, …)
+
+**Core Components:**  
+- `TranslationBackend.translate_audio(bytes, target_language) -> (translated_text: str, mp3_bytes: bytes)`  
+  1) **ASR (Whisper):** `whisper-1` transcribes the uploaded audio → `source_text`  
+  2) **MT (GPT):** `translate_text()` → translates `source_text` to `target_language`  
+  3) **TTS:** `tts-1` (voice=`nova`) synthesizes translated text → MP3 bytes  
+- **HTTP layer (NiceGUI/FastAPI):** wraps the pipeline, returns MP3 with helpful headers.
+
+**Response:**  
+- **Body:** MP3 audio (translated speech)  
+- **Headers:**  
+  - `X-Original-Text`: short preview/safe snippet of transcription  
+  - `X-Translated-Text`: label like “Translated to Spanish”  
+  - `X-Target-Language`: target language code  
+  - `Content-Length`: MP3 size in bytes
+
+**Happy Path Flow:**  
+1. Browser **MediaRecorder** captures audio → sends blob to `/api/voice_translate` with `language`.  
+2. Backend calls `translate_audio()` → Whisper (ASR) → GPT translate → TTS MP3.  
+3. Returns MP3; frontend sets `<audio src>` and displays original/translated text labels.
+
+**Error Handling (high level):**  
+- Empty upload → `400` with `X-Error`.  
+- Any pipeline failure → `500` with `X-Error` message.  
+- Backend logs at each stage (`[Backend]`, `[API]`) for diagnosis.
+
 1. **TranslationBackend**
    - **Role**: Processes and translates text from the input documents.
    - **Features**:
