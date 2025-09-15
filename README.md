@@ -29,7 +29,7 @@ Runner → File Loader → Translation Backend → DOCX Parser → `translate_te
   1) *Quick but lossy:* translate each **run** separately (keeps styles; may hurt translation quality).
   2) *Best practice:* translate the **whole paragraph once**, then **diff/map** the result back to the original runs, copying their styles.
  
-### Voice Translation Service (Backend Module Summary)
+### Voice Translation Service
 
 **Purpose:**  
 Demonstrate live voice translation by taking a short mic recording, turning it into text, translating it, then having a text to speech model speak the translation back as an MP3.
