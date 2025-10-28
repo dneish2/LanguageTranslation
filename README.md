@@ -84,32 +84,34 @@ Here’s the full Usage section in markdown for you to copy directly into your R
 
 Follow these steps to set up and run the application:
 
-1. **Clone the Repository**  
+1. **Clone the Repository**
    Clone the project to your local machine:
    ```bash
    git clone https://github.com/dneish2/LanguageTranslation.git
    cd LanguageTranslation
+   ```
 
-	2.	Install Dependencies
-Use the requirements.txt file to install the necessary Python modules:
+2. **Install Dependencies**
+   Use the requirements.txt file to install the necessary Python modules:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-pip install -r requirements.txt
+3. **Set Up Environment Variables**
+   Ensure you have an .env file in the project root with your OpenAI API key:
+   ```bash
+   OPENAI_API_KEY=your-api-key-here
+   ```
 
-	3.	Set Up Environment Variables
-Ensure you have an .env file in the project root with your OpenAI API key:
+4. **Run the Application**
+   Start the application by running the main script:
+   ```bash
+   python TranslationUI.py
+   ```
 
-OPENAI_API_KEY=your-api-key-here
-
-	4.	Run the Application
-Start the application by running the main script:
-
-python TranslationUI.py
-
-	5.	Access the Interface
-Once the server starts, open your browser and navigate to:
-
-http://127.0.0.1:8080
-
+5. **Access the Interface**
+   Once the server starts, open your browser and navigate to:
+   http://127.0.0.1:8080
 This will load the NiceGUI-based user interface, where you can upload documents, select target languages, and manage translations.
 
 ### Experimental Voice Translation
