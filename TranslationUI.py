@@ -4,6 +4,7 @@ import os
 import glob
 from io import BytesIO
 from threading import Thread
+from typing import Any
 
 from nicegui import ui, app
 from fastapi import UploadFile, File, Form
@@ -40,6 +41,9 @@ class TranslationUI:
         self.drawer = None
         self.advanced_mode = False
         self.advanced_button = None
+        self.document_editor_dialog = None
+        self.document_editor_container = None
+        self.document_editor_inputs: dict[str, Any] = {}
 
         # ── USAGE STATS ─────────────────────────────────────────────────
         self.current_count = 0
@@ -90,6 +94,8 @@ class TranslationUI:
             self.stats_container = ui.column().classes("w-full max-w-3xl items-center")
             self.refresh_upload_ui()
 
+        self.build_document_editor_dialog()
+
     def toggle_advanced_mode(self):
         self.advanced_mode = not self.advanced_mode
         if self.advanced_mode:
@@ -98,6 +104,130 @@ class TranslationUI:
         else:
             self.advanced_button.text = "Enable Advanced Mode"
             ui.notify("Advanced Mode disabled. Segment editing hidden.")
+        if self.original_segments_map:
+            self.show_result()
+
+    def build_document_editor_dialog(self):
+        if self.document_editor_dialog is not None:
+            return
+
+        with ui.dialog() as dialog:
+            self.document_editor_dialog = dialog
+            with ui.card().classes("w-[900px] max-w-full max-h-[80vh] flex flex-col"):
+                ui.label("Editable Document View")\
+                    .classes("text-xl font-semibold text-gray-800")
+                ui.label("Review every translated segment in a continuous document layout.")\
+                    .classes("text-sm text-gray-600 mb-2")
+
+                with ui.scroll_area().classes("w-full flex-1 border rounded p-3 bg-white"):
+                    self.document_editor_container = ui.column().classes("space-y-4")
+
+                with ui.row().classes("justify-end space-x-2 mt-4"):
+                    ui.button("Cancel", on_click=self.close_document_editor)\
+                        .classes("bg-gray-200 text-gray-700 px-3 py-1 rounded")
+                    ui.button("Save Changes", on_click=self.save_document_editor)\
+                        .classes("bg-blue-600 text-white px-3 py-1 rounded")
+
+    def _describe_segment_for_editor(self, index: int, seg_info: dict) -> str:
+        location = seg_info.get("location")
+        if location:
+            return f"{index}. {location}"
+
+        seg_type = seg_info.get("type", "segment").replace("_", " ")
+        if seg_type == "pdf block":
+            page_idx = seg_info.get("page_idx")
+            if page_idx is not None:
+                return f"{index}. PDF page {page_idx + 1}"
+        return f"{index}. {seg_type.title()}"
+
+    def populate_document_editor(self):
+        if not self.document_editor_container:
+            return
+
+        self.document_editor_container.clear()
+        self.document_editor_inputs.clear()
+
+        segments = list(self.backend.segment_map.items())
+        if not segments:
+            with self.document_editor_container:
+                ui.label("No segments available yet. Translate a document first.")\
+                    .classes("text-sm text-gray-600")
+            return
+
+        current_page = None
+        with self.document_editor_container:
+            for index, (seg_id, seg_info) in enumerate(segments, start=1):
+                seg_type = seg_info.get("type")
+                if seg_type == "pdf_block":
+                    page_idx = seg_info.get("page_idx")
+                    if page_idx is not None and current_page != page_idx:
+                        current_page = page_idx
+                        ui.label(f"Page {page_idx + 1}")\
+                            .classes("text-sm font-semibold text-gray-700 mt-2")
+
+                header = self._describe_segment_for_editor(index, seg_info)
+                translated_value = self.translated_segments_map.get(
+                    seg_id,
+                    seg_info.get("translated", "")
+                )
+
+                with ui.column().classes("space-y-1"):
+                    ui.label(header).classes("text-sm font-semibold text-gray-700")
+                    textarea = ui.textarea(value=translated_value or "")\
+                        .props("autogrow")\
+                        .classes("w-full text-base border rounded p-2 bg-gray-50")
+                    textarea.segment_id = seg_id
+                    self.document_editor_inputs[seg_id] = textarea
+
+    def open_document_editor(self):
+        if not self.document_editor_dialog:
+            ui.notify("Document editor not initialised yet.", type="warning")
+            return
+        self.populate_document_editor()
+        if not self.document_editor_inputs:
+            ui.notify("No segments available to edit yet.", type="warning")
+            return
+        self.document_editor_dialog.open()
+
+    def close_document_editor(self):
+        if self.document_editor_dialog:
+            self.document_editor_dialog.close()
+        self.document_editor_inputs.clear()
+
+    def save_document_editor(self):
+        if not self.document_editor_inputs:
+            self.close_document_editor()
+            return
+
+        try:
+            changed = 0
+            for seg_id, textarea in self.document_editor_inputs.items():
+                new_text = textarea.value or ""
+                if new_text != self.translated_segments_map.get(seg_id, ""):
+                    self.backend.update_segment(
+                        seg_id,
+                        new_text,
+                        self.current_target_language or "",
+                        regenerate=False
+                    )
+                    self.translated_segments_map[seg_id] = new_text
+                    changed += 1
+
+            if changed:
+                self.backend.regenerate_output_stream()
+                ui.notify(
+                    f"Saved {changed} segment{'s' if changed != 1 else ''} from the document editor.",
+                    type="positive"
+                )
+            else:
+                ui.notify("No changes detected in the document editor.", type="warning")
+        except Exception as ex:
+            logging.error(f"[UI] Error saving document editor changes: {ex}", exc_info=True)
+            ui.notify(f"Failed to save document edits: {ex}", type="negative")
+        finally:
+            self.close_document_editor()
+            if self.advanced_mode and self.original_segments_map:
+                self.show_result()
 
     def show_document_list(self):
         # clear and list up to 20 translated_* files
@@ -319,6 +449,12 @@ class TranslationUI:
                         .classes("text-xl font-bold mb-2")
                     ui.label(f"Review and edit {len(self.original_segments_map)} segments below:")\
                         .classes("text-sm text-gray-600 mb-4")
+
+                    with ui.row().classes("space-x-2 mb-2"):
+                        ui.button("Open Document Editor", on_click=self.open_document_editor)\
+                          .classes("bg-purple-600 text-white px-3 py-1")
+                        ui.label("Launch a single-page editor with every segment ready to edit.")\
+                          .classes("text-xs text-gray-600")
 
                     # bulk actions
                     with ui.row().classes("space-x-2 mb-4"):

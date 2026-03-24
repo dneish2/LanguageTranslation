@@ -4,6 +4,7 @@ import string
 import time
 import uuid
 import json
+from html import escape
 from io import BytesIO
 from typing import Tuple
 from typing import Optional
@@ -40,6 +41,7 @@ class TranslationBackend:
         self.current_presentation = None
         self.current_pdf = None
         self.output_stream: BytesIO | None = None
+        self.pdf_overlay_ocg = None
 
     def reset_cancel(self) -> None:
         self.cancel_requested = False
@@ -153,8 +155,36 @@ class TranslationBackend:
         elif self.current_file_type == "pptx" and self.current_presentation:
             out = BytesIO(); self.current_presentation.save(out); out.seek(0); self.output_stream = out
         elif self.current_file_type == "pdf" and self.current_pdf:
-            out = BytesIO(); self.current_pdf.save(out, garbage=4); out.seek(0); self.output_stream = out
+            out = BytesIO(); self.current_pdf.ez_save(out); out.seek(0); self.output_stream = out
         return self.output_stream
+
+    def _compute_pdf_block_css(self, text: str, bbox: fitz.Rect) -> str:
+        """Estimate a legible font size for the block based on its bounding box."""
+        line_count = max(1, text.count("\n") + 1)
+        usable_height = max(1.0, bbox.height)
+        size_from_height = (usable_height / line_count) * 0.8
+        font_size = max(8.0, min(size_from_height, 36.0))
+        return (
+            "body {margin:0;} "
+            "div {font-family: sans-serif; line-height:1.1; "
+            f"font-size:{font_size:.1f}pt;"
+            "}"
+        )
+
+    def _render_pdf_block(self, page: fitz.Page, bbox: fitz.Rect, text: str) -> str:
+        """Overwrite an existing PDF block and insert updated HTML content."""
+        oc = getattr(self, "pdf_overlay_ocg", None)
+        safe_html = escape(text).replace("\n", "<br />") or "&nbsp;"
+        css = self._compute_pdf_block_css(text, bbox)
+        page.draw_rect(bbox, color=None, fill=WHITE, oc=oc)
+        page.insert_htmlbox(
+            bbox,
+            f"<div>{safe_html}</div>",
+            css=css,
+            overlay=True,
+            oc=oc,
+        )
+        return css
 
 
     def delete_segment(self, segment_id):
@@ -176,8 +206,9 @@ class TranslationBackend:
             # seg["page_idx"] is the zero-based page index
             # seg["bbox"] is a fitz.Rect
             if hasattr(self, "current_pdf") and self.current_pdf:
-                page = self.current_pdf[ seg["page_idx"] ]
-                page.draw_rect(seg["bbox"], color=None, fill=WHITE)
+                oc = getattr(self, "pdf_overlay_ocg", None)
+                page = self.current_pdf[seg["page_idx"]]
+                page.draw_rect(seg["bbox"], color=None, fill=WHITE, oc=oc)
             else:
                 logging.warning(f"[Backend] No current_pdf to delete PDF block {segment_id}")
 
@@ -198,6 +229,7 @@ class TranslationBackend:
         doc = Document(input_stream)
         self.current_file_type = 'docx'
         self.current_document = doc
+        self.pdf_overlay_ocg = None
 
         total_elements = len(doc.paragraphs) + sum(len(t.rows)*len(t.columns) for t in doc.tables)
         processed = 0
@@ -276,6 +308,7 @@ class TranslationBackend:
         prs = Presentation(input_stream)
         self.current_file_type = 'pptx'
         self.current_presentation = prs
+        self.pdf_overlay_ocg = None
 
         total_elements = sum(len(slide.shapes) for slide in prs.slides)
         processed = 0
@@ -388,6 +421,7 @@ class TranslationBackend:
         doc = fitz.open(stream=input_stream, filetype="pdf")
         self.current_file_type = 'pdf'
         self.current_pdf = doc
+        self.pdf_overlay_ocg = None
 
         # 1) Build page_blocks with proper text extraction
         total_blocks = 0
@@ -421,7 +455,7 @@ class TranslationBackend:
         # 2) Prepare for translation overlays
         processed = 0
         start_time = time.time()
-        ocg = doc.add_ocg("Translated", on=True)
+        self.pdf_overlay_ocg = doc.add_ocg("Translated", on=True)
 
         # 3) Translate & redraw each block
         for p_idx, (page, blocks) in enumerate(zip(doc, page_blocks), start=1):
@@ -442,12 +476,8 @@ class TranslationBackend:
                 new_text = original if not do_translate else self.translate_text(original, target_language)
                 self.segment_map[seg_id]["translated"] = new_text
 
-                page.draw_rect(bbox, color=None, fill=WHITE, oc=ocg)
-                page.insert_htmlbox(
-                    bbox, new_text,
-                    css=f"* {{font-size:{min(len(new_text)/50,24):.0f}pt;}}",
-                    overlay=True, oc=ocg
-                )
+                last_css = self._render_pdf_block(page, bbox, new_text)
+                self.segment_map[seg_id]["last_css"] = last_css
                 logging.debug(f"[PDF] Translated segment {seg_id[:8]}")
 
                 processed += 1
@@ -479,7 +509,7 @@ class TranslationBackend:
     # ------------------
     # UPDATE SEGMENT
     # ------------------
-    def update_segment(self, segment_id, new_text, target_language, instructions=None):
+    def update_segment(self, segment_id, new_text, target_language, instructions=None, regenerate=True):
         if segment_id not in self.segment_map:
             raise ValueError(f"Segment ID {segment_id} not found.")
 
@@ -499,9 +529,16 @@ class TranslationBackend:
         elif seg_type == "pptx_shape":
             if "object" in seg and hasattr(seg["object"], "text_frame") and seg["object"].text_frame:
                 seg["object"].text_frame.text = updated
+        elif seg_type == "pdf_block":
+            if not self.current_pdf:
+                raise ValueError("No active PDF document for update.")
+            page = self.current_pdf[seg["page_idx"]]
+            last_css = self._render_pdf_block(page, seg["bbox"], updated)
+            seg["last_css"] = last_css
 
         logging.info(f"[Backend] Updated segment {segment_id} with new translation length {len(updated)}")
-        self.regenerate_output_stream()
+        if regenerate:
+            self.regenerate_output_stream()
         return updated
 
     # ------------------
