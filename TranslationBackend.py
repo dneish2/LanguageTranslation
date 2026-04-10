@@ -4,6 +4,7 @@ import string
 import time
 import uuid
 import json
+import random
 from html import escape
 from io import BytesIO
 from typing import Tuple
@@ -42,6 +43,10 @@ class TranslationBackend:
         self.current_pdf = None
         self.output_stream: BytesIO | None = None
         self.pdf_overlay_ocg = None
+        self.translation_cache: dict[tuple[str, str, str], str] = {}
+        self.max_openai_attempts = 4
+        self.retry_base_delay = 0.5
+        self.retry_max_delay = 8.0
 
     def reset_cancel(self) -> None:
         self.cancel_requested = False
@@ -53,12 +58,64 @@ class TranslationBackend:
     def generate_segment_id(self) -> str:
         return str(uuid.uuid4())
 
+    def _normalize_cache_key(self, text: str, target_language: str, mode: str) -> tuple[str, str, str]:
+        normalized_text = " ".join(text.replace("\t", " ").split())
+        normalized_target = " ".join(target_language.lower().split())
+        normalized_mode = " ".join(mode.lower().split())
+        return normalized_text, normalized_target, normalized_mode
+
+    def _is_transient_openai_error(self, error: Exception) -> bool:
+        transient_types = tuple(
+            err
+            for err in (
+                getattr(openai, "APIConnectionError", None),
+                getattr(openai, "APITimeoutError", None),
+                getattr(openai, "RateLimitError", None),
+                getattr(openai, "InternalServerError", None),
+            )
+            if err is not None
+        )
+
+        if transient_types and isinstance(error, transient_types):
+            return True
+
+        status_code = getattr(error, "status_code", None)
+        return status_code in {408, 409, 429, 500, 502, 503, 504}
+
+    def _create_chat_completion_with_retry(self, messages):
+        attempts = self.max_openai_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+            except Exception as error:
+                is_transient = self._is_transient_openai_error(error)
+                if attempt >= attempts or not is_transient:
+                    raise
+
+                delay = min(self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay)
+                jitter = random.uniform(0, delay * 0.25)
+                sleep_seconds = delay + jitter
+                logging.warning(
+                    "[Backend] transient OpenAI error (%s) on attempt %d/%d, retrying in %.2fs",
+                    type(error).__name__,
+                    attempt,
+                    attempts,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+
     # ───────────────────────────── GPT CORE ────────────────────────────── #
     def translate_text(self, text: str, target_language: str) -> str:
         """Translate free-form text via GPT."""
         text = text.replace("\t", " ").strip()
         if not text:
             return text
+
+        cache_key = self._normalize_cache_key(text, target_language, mode="translate")
+        cached = self.translation_cache.get(cache_key)
+        if cached is not None:
+            logging.info("[Backend] translate_text cache hit for target=%s", target_language)
+            return cached
 
         prompt = (
             f"Translate the following text to {target_language}, preserving meaning and context. "
@@ -71,8 +128,9 @@ class TranslationBackend:
             {"role": "user", "content": prompt},
         ]
         try:
-            completion = self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+            completion = self._create_chat_completion_with_retry(messages)
             result = completion.choices[0].message.content.strip() or text
+            self.translation_cache[cache_key] = result
             logging.info("[Backend] Translated len=%d → len=%d", len(text), len(result))
             return result
         except Exception as e:
@@ -87,6 +145,14 @@ class TranslationBackend:
         if not original_text:
             return original_text
 
+        normalized_instructions = " ".join(instructions.replace("\t", " ").strip().split())
+        mode = f"instructions:{normalized_instructions}" if normalized_instructions else "instructions"
+        cache_key = self._normalize_cache_key(original_text, target_language, mode=mode)
+        cached = self.translation_cache.get(cache_key)
+        if cached is not None:
+            logging.info("[Backend] instruction translation cache hit for target=%s", target_language)
+            return cached
+
         prompt = (
             "Please refine the following translation according to these instructions. "
             "Ensure that any requested changes—including changing the language—are applied.\n\n"
@@ -99,8 +165,9 @@ class TranslationBackend:
             {"role": "user", "content": prompt},
         ]
         try:
-            completion = self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+            completion = self._create_chat_completion_with_retry(messages)
             result = completion.choices[0].message.content.strip() or original_text
+            self.translation_cache[cache_key] = result
             logging.info("[Backend] Refined translation len=%d", len(result))
             return result
         except Exception as e:
