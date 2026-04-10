@@ -642,13 +642,26 @@ class TranslationBackend:
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
 
-    def record_feedback(self, approved: bool, original: str, translated: str):
+    def record_feedback(self, *, approved: bool, original: str, translated: str) -> bool:
         """
         Append a JSONL record for approved segments,
         using the language the user originally picked.
         """
+        if not isinstance(approved, bool):
+            raise TypeError("approved must be a bool.")
+        if not isinstance(original, str):
+            raise TypeError("original must be a string.")
+        if not isinstance(translated, str):
+            raise TypeError("translated must be a string.")
+
+        original = original.strip()
+        translated = translated.strip()
+
+        if approved and (not original or not translated):
+            raise ValueError("original and translated must be non-empty when approved is True.")
+
         if not approved:
-            return
+            return False
 
         # Grab the language the user requested at the start of translate_file
         lang = getattr(self, "current_target_language", "unknown")
@@ -665,3 +678,4 @@ class TranslationBackend:
 
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
