@@ -4,6 +4,7 @@ import string
 import time
 import uuid
 import json
+import random
 from html import escape
 from io import BytesIO
 from typing import Any, Optional, Tuple
@@ -52,8 +53,10 @@ class TranslationBackend:
         self.current_pdf = None
         self.output_stream: BytesIO | None = None
         self.pdf_overlay_ocg = None
-        self.translation_cache: dict[tuple[str, str], str] = {}
-        self.metrics: TranslationMetrics = MetricsCollector()
+        self.translation_cache: dict[tuple[str, str, str], str] = {}
+        self.max_openai_attempts = 4
+        self.retry_base_delay = 0.5
+        self.retry_max_delay = 8.0
 
     def reset_cancel(self) -> None:
         self.cancel_requested = False
@@ -64,6 +67,52 @@ class TranslationBackend:
 
     def generate_segment_id(self) -> str:
         return str(uuid.uuid4())
+
+    def _normalize_cache_key(self, text: str, target_language: str, mode: str) -> tuple[str, str, str]:
+        normalized_text = " ".join(text.replace("\t", " ").split())
+        normalized_target = " ".join(target_language.lower().split())
+        normalized_mode = " ".join(mode.lower().split())
+        return normalized_text, normalized_target, normalized_mode
+
+    def _is_transient_openai_error(self, error: Exception) -> bool:
+        transient_types = tuple(
+            err
+            for err in (
+                getattr(openai, "APIConnectionError", None),
+                getattr(openai, "APITimeoutError", None),
+                getattr(openai, "RateLimitError", None),
+                getattr(openai, "InternalServerError", None),
+            )
+            if err is not None
+        )
+
+        if transient_types and isinstance(error, transient_types):
+            return True
+
+        status_code = getattr(error, "status_code", None)
+        return status_code in {408, 409, 429, 500, 502, 503, 504}
+
+    def _create_chat_completion_with_retry(self, messages):
+        attempts = self.max_openai_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+            except Exception as error:
+                is_transient = self._is_transient_openai_error(error)
+                if attempt >= attempts or not is_transient:
+                    raise
+
+                delay = min(self.retry_base_delay * (2 ** (attempt - 1)), self.retry_max_delay)
+                jitter = random.uniform(0, delay * 0.25)
+                sleep_seconds = delay + jitter
+                logging.warning(
+                    "[Backend] transient OpenAI error (%s) on attempt %d/%d, retrying in %.2fs",
+                    type(error).__name__,
+                    attempt,
+                    attempts,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
 
     # ───────────────────────────── GPT CORE ────────────────────────────── #
     def translate_text(
@@ -91,6 +140,12 @@ class TranslationBackend:
             return cached
         metrics.record_cache_miss()
 
+        cache_key = self._normalize_cache_key(text, target_language, mode="translate")
+        cached = self.translation_cache.get(cache_key)
+        if cached is not None:
+            logging.info("[Backend] translate_text cache hit for target=%s", target_language)
+            return cached
+
         prompt = (
             f"Translate the following text to {target_language}, preserving meaning and context. "
             f"Do not translate personal names or trademarked terms. "
@@ -101,46 +156,15 @@ class TranslationBackend:
             {"role": "system", "content": f"You are a helpful assistant translating to {target_language}."},
             {"role": "user", "content": prompt},
         ]
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                completion = self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
-                result = completion.choices[0].message.content.strip() or text
-                self.translation_cache[cache_key] = result
-                token_total = self.calculate_tokens(text + "\n" + result)
-                metrics.record_segment(
-                    duration_seconds=0.0,
-                    token_count=token_total,
-                    estimated_cost=(token_total * MODEL_COST_PER_1K_TOKENS) / 1000,
-                )
-                _log_event(
-                    "translation.segment_done",
-                    correlation_id=correlation_id,
-                    source_length=len(text),
-                    translated_length=len(result),
-                    tokens=token_total,
-                    retry_count=attempt - 1,
-                )
-                return result
-            except Exception as e:
-                if attempt < max_attempts:
-                    metrics.record_retry()
-                    _log_event(
-                        "translation.segment_retry",
-                        correlation_id=correlation_id,
-                        attempt=attempt,
-                        error=str(e),
-                    )
-                    time.sleep(0.3 * attempt)
-                    continue
-                logging.error("[Backend] translate_text error: %s", e, exc_info=True)
-                _log_event(
-                    "translation.segment_failed",
-                    correlation_id=correlation_id,
-                    error=str(e),
-                    attempts=max_attempts,
-                )
-                return text
+        try:
+            completion = self._create_chat_completion_with_retry(messages)
+            result = completion.choices[0].message.content.strip() or text
+            self.translation_cache[cache_key] = result
+            logging.info("[Backend] Translated len=%d → len=%d", len(text), len(result))
+            return result
+        except Exception as e:
+            logging.error("[Backend] translate_text error: %s", e, exc_info=True)
+            return text
 
     def translate_text_with_instructions(
         self, original_text: str, target_language: str, instructions: str
@@ -149,6 +173,14 @@ class TranslationBackend:
         original_text = original_text.replace("\t", " ").strip()
         if not original_text:
             return original_text
+
+        normalized_instructions = " ".join(instructions.replace("\t", " ").strip().split())
+        mode = f"instructions:{normalized_instructions}" if normalized_instructions else "instructions"
+        cache_key = self._normalize_cache_key(original_text, target_language, mode=mode)
+        cached = self.translation_cache.get(cache_key)
+        if cached is not None:
+            logging.info("[Backend] instruction translation cache hit for target=%s", target_language)
+            return cached
 
         prompt = (
             "Please refine the following translation according to these instructions. "
@@ -162,8 +194,9 @@ class TranslationBackend:
             {"role": "user", "content": prompt},
         ]
         try:
-            completion = self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+            completion = self._create_chat_completion_with_retry(messages)
             result = completion.choices[0].message.content.strip() or original_text
+            self.translation_cache[cache_key] = result
             logging.info("[Backend] Refined translation len=%d", len(result))
             return result
         except Exception as e:
@@ -765,13 +798,26 @@ class TranslationBackend:
         )
         return result
 
-    def record_feedback(self, approved: bool, original: str, translated: str):
+    def record_feedback(self, *, approved: bool, original: str, translated: str) -> bool:
         """
         Append a JSONL record for approved segments,
         using the language the user originally picked.
         """
+        if not isinstance(approved, bool):
+            raise TypeError("approved must be a bool.")
+        if not isinstance(original, str):
+            raise TypeError("original must be a string.")
+        if not isinstance(translated, str):
+            raise TypeError("translated must be a string.")
+
+        original = original.strip()
+        translated = translated.strip()
+
+        if approved and (not original or not translated):
+            raise ValueError("original and translated must be non-empty when approved is True.")
+
         if not approved:
-            return
+            return False
 
         # Grab the language the user requested at the start of translate_file
         lang = getattr(self, "current_target_language", "unknown")
@@ -788,3 +834,4 @@ class TranslationBackend:
 
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
