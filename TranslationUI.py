@@ -589,7 +589,11 @@ class TranslationUI:
         try:
             orig = self.original_segments_map.get(seg_id, "")
             trans = self.translated_segments_map.get(seg_id, "")
-            self.backend.record_feedback(original=orig, translated=trans)
+            self.backend.record_feedback(
+                approved=True,
+                original=orig,
+                translated=trans,
+            )
             ui.notify("Segment approved ✓", type="positive")
         except Exception as ex:
             logging.error(f"[UI] Error approving segment {seg_id}: {ex}", exc_info=True)
@@ -599,7 +603,11 @@ class TranslationUI:
         try:
             orig = self.original_segments_map.get(seg_id, "")
             trans = self.translated_segments_map.get(seg_id, "")
-            self.backend.record_feedback(seg_id, approved=False, original=orig, translated=trans)
+            self.backend.record_feedback(
+                approved=False,
+                original=orig,
+                translated=trans,
+            )
             ui.notify("Segment declined ✗", type="warning")
         except Exception as ex:
             logging.error(f"[UI] Error declining segment {seg_id}: {ex}", exc_info=True)
