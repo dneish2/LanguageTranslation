@@ -57,6 +57,7 @@ class TranslationUI:
         self.document_editor_dialog = None
         self.document_editor_container = None
         self.document_editor_inputs: dict[str, Any] = {}
+        self.document_editor_original_values: dict[str, str] = {}
 
         # ── MOBILE FLOW ────────────────────────────────────────────────
         self.mobile_mode = False
@@ -144,11 +145,11 @@ class TranslationUI:
                 ui.label("Review every translated segment in a continuous document layout.")\
                     .classes("text-sm text-gray-600 mb-2")
 
-                with ui.scroll_area().classes("w-full flex-1 border rounded p-3 bg-white"):
+                with ui.scroll_area().classes("w-full flex-1 border rounded p-3 pb-28 md:pb-6 bg-white"):
                     self.document_editor_container = ui.column().classes("space-y-4")
 
                 with ui.row().classes("justify-end space-x-2 mt-4"):
-                    ui.button("Cancel", on_click=self.close_document_editor)\
+                    ui.button("Cancel", on_click=self.request_close_document_editor)\
                         .classes("bg-gray-200 text-gray-700 px-3 py-1 rounded")
                     ui.button("Save Changes", on_click=self.save_document_editor)\
                         .classes("bg-blue-600 text-white px-3 py-1 rounded")
@@ -171,6 +172,7 @@ class TranslationUI:
 
         self.document_editor_container.clear()
         self.document_editor_inputs.clear()
+        self.document_editor_original_values.clear()
 
         segments = list(self.backend.segment_map.items())
         if not segments:
@@ -181,6 +183,7 @@ class TranslationUI:
 
         current_page = None
         with self.document_editor_container:
+            segment_count = len(segments)
             for index, (seg_id, seg_info) in enumerate(segments, start=1):
                 seg_type = seg_info.get("type")
                 if seg_type == "pdf_block":
@@ -195,14 +198,18 @@ class TranslationUI:
                     seg_id,
                     seg_info.get("translated", "")
                 )
+                self.document_editor_original_values[seg_id] = translated_value or ""
 
-                with ui.column().classes("space-y-1"):
-                    ui.label(header).classes("text-sm font-semibold text-gray-700")
-                    textarea = ui.textarea(value=translated_value or "")\
-                        .props("autogrow")\
-                        .classes("w-full text-base border rounded p-2 bg-gray-50")
-                    textarea.segment_id = seg_id
-                    self.document_editor_inputs[seg_id] = textarea
+                with ui.expansion(f"Step {index}/{segment_count} — {header}", value=index == 1)\
+                        .classes("w-full bg-gray-50 border rounded-lg"):
+                    with ui.column().classes("space-y-2 p-2 pb-16 md:pb-4"):
+                        ui.label("Edit translation below (mobile-safe layout).")\
+                            .classes("text-xs text-gray-500")
+                        textarea = ui.textarea(value=translated_value or "")\
+                            .props("autogrow rows=3")\
+                            .classes("w-full text-base border rounded p-2 bg-white")
+                        textarea.segment_id = seg_id
+                        self.document_editor_inputs[seg_id] = textarea
 
     def open_document_editor(self):
         if not self.document_editor_dialog:
@@ -218,6 +225,48 @@ class TranslationUI:
         if self.document_editor_dialog:
             self.document_editor_dialog.close()
         self.document_editor_inputs.clear()
+        self.document_editor_original_values.clear()
+
+    def _request_confirmation(self, title, message, on_confirm, confirm_label="Confirm"):
+        with ui.dialog() as dialog:
+            with ui.card().classes("w-[420px] max-w-full"):
+                ui.label(title).classes("text-lg font-semibold text-gray-800")
+                ui.label(message).classes("text-sm text-gray-600")
+                with ui.row().classes("justify-end space-x-2 mt-4"):
+                    ui.button("Cancel", on_click=dialog.close)\
+                        .classes("bg-gray-200 text-gray-700 px-3 py-1 rounded")
+
+                    def confirm_and_close():
+                        dialog.close()
+                        on_confirm()
+
+                    ui.button(confirm_label, on_click=confirm_and_close)\
+                        .classes("bg-red-500 text-white px-3 py-1 rounded")
+        dialog.open()
+
+    def _document_editor_has_unsaved_changes(self):
+        for seg_id, textarea in self.document_editor_inputs.items():
+            current = textarea.value or ""
+            original = self.document_editor_original_values.get(seg_id, "")
+            if current != original:
+                return True
+        return False
+
+    def request_close_document_editor(self):
+        if not self.document_editor_inputs:
+            self.close_document_editor()
+            return
+
+        if not self._document_editor_has_unsaved_changes():
+            self.close_document_editor()
+            return
+
+        self._request_confirmation(
+            "Discard unsaved edits?",
+            "You have unsaved document editor changes. Close anyway and discard them?",
+            self.close_document_editor,
+            confirm_label="Discard Changes"
+        )
 
     def save_document_editor(self):
         if not self.document_editor_inputs:
@@ -685,58 +734,56 @@ function startMobileDictation() {
                         seg_info = self.backend.segment_map.get(seg_id, {})
                         location = seg_info.get("location", f"segment_{i+1}")
 
-                        with ui.card().classes("w-full mb-3 p-4 border"):
-                            # header
-                            with ui.row().classes("justify-between items-center mb-3"):
-                                ui.label(f"#{i+1}: {location}")\
-                                  .classes("text-sm font-medium text-gray-700")
-                                with ui.row().classes("space-x-1"):
-                                    ui.button("✓", on_click=lambda _, s=seg_id: self.approve_segment_callback(s))\
-                                      .props("size=sm color=positive")
-                                    ui.button("✗", on_click=lambda _, s=seg_id: self.decline_segment_callback(s))\
-                                      .props("size=sm color=negative")
-                                    ui.button("🗑️", on_click=lambda _, s=seg_id: self.delete_segment_callback(s))\
-                                      .props("size=sm color=grey")
+                        with ui.expansion(f"Step {i+1}: {location}", value=i == 0)\
+                                .classes("w-full mb-2 border rounded-lg bg-white"):
+                            with ui.column().classes("p-3 pb-16 md:pb-4 gap-3"):
+                                with ui.row().classes("justify-between items-center"):
+                                    ui.label(f"#{i+1}: {location}")\
+                                      .classes("text-sm font-medium text-gray-700")
+                                    with ui.row().classes("space-x-1"):
+                                        ui.button("✓", on_click=lambda _, s=seg_id: self.approve_segment_callback(s))\
+                                          .props("size=sm color=positive")
+                                        ui.button("✗", on_click=lambda _, s=seg_id: self.decline_segment_callback(s))\
+                                          .props("size=sm color=negative")
+                                        ui.button("🗑️", on_click=lambda _, s=seg_id: self.delete_segment_callback(s))\
+                                          .props("size=sm color=grey")
 
-                            # original text
-                            with ui.column().classes("w-full mb-2"):
-                                ui.label("Original:")\
-                                  .classes("text-xs font-semibold text-gray-600")
-                                ui.html(
-                                    f'<div class="text-sm p-2 bg-gray-50 border rounded '
-                                    f'max-h-20 overflow-y-auto">{orig[:300]}'
-                                    f'{"..." if len(orig)>300 else ""}</div>'
-                                )
+                                with ui.column().classes("w-full"):
+                                    ui.label("Original:")\
+                                      .classes("text-xs font-semibold text-gray-600")
+                                    ui.html(
+                                        f'<div class="text-sm p-2 bg-gray-50 border rounded '
+                                        f'max-h-20 overflow-y-auto">{orig[:300]}'
+                                        f'{"..." if len(orig)>300 else ""}</div>'
+                                    )
 
-                            # translation (editable)
-                            with ui.column().classes("w-full mb-2"):
-                                ui.label("Translation:")\
-                                  .classes("text-xs font-semibold text-gray-600")
-                                textarea = ui.textarea(value=trans)\
-                                  .props("autogrow rows=2")\
-                                  .classes("w-full text-sm")
-                                textarea.segment_id = seg_id
+                                with ui.column().classes("w-full"):
+                                    ui.label("Translation:")\
+                                      .classes("text-xs font-semibold text-gray-600")
+                                    textarea = ui.textarea(value=trans)\
+                                      .props("autogrow rows=3")\
+                                      .classes("w-full text-sm bg-white")
+                                    textarea.segment_id = seg_id
 
-                            # update controls
-                            with ui.row().classes("space-x-2"):
-                                refine = ui.input(placeholder="Refinement instructions (optional)")\
-                                  .classes("flex-grow text-sm")
-                                ui.button("Update",
-                                          on_click=lambda _, s=seg_id, ta=textarea, ri=refine:
-                                            self.update_segment_callback(s, ta, ri)
-                                         ).props("size=sm color=primary")
-                                ui.button("Re-translate",
-                                          on_click=lambda _, s=seg_id, ta=textarea:
-                                            self.retranslate_segment_callback(s, ta)
-                                         ).props("size=sm color=secondary")
+                                with ui.row().classes("w-full items-center gap-2"):
+                                    refine = ui.input(placeholder="Refinement instructions (optional)")\
+                                      .classes("flex-grow text-sm")
+                                    ui.button("Update",
+                                              on_click=lambda _, s=seg_id, ta=textarea, ri=refine:
+                                                self.update_segment_callback(s, ta, ri)
+                                             ).props("size=sm color=primary")
+                                    ui.button("Re-translate",
+                                              on_click=lambda _, s=seg_id, ta=textarea:
+                                                self.retranslate_segment_callback(s, ta)
+                                             ).props("size=sm color=secondary")
 
                 # ── DOWNLOAD & NAV ───────────────────────────────
                 ui.separator().classes("my-4")
                 with ui.row().classes("justify-center space-x-4 mt-6 flex-wrap"):
                     ui.button("Download Translated File", on_click=self.download_file)\
-                      .classes("bg-blue-600 text-white px-6 py-2 rounded shadow min-h-[52px] text-base")
-                    ui.button("Upload Another File", on_click=self.refresh_upload_ui)\
-                      .classes("bg-gray-500 text-white px-6 py-2 rounded shadow min-h-[52px] text-base")
+                      .classes("bg-blue-600 text-white px-6 py-2 rounded shadow")
+                    ui.button("Upload Another File", on_click=self.request_refresh_upload_ui)\
+                      .classes("bg-gray-500 text-white px-6 py-2 rounded shadow")
 
         # stats footer
         with self.stats_container:
@@ -789,6 +836,14 @@ function startMobileDictation() {
             ui.notify(f"Re-translation failed: {ex}", type="negative")
 
     def delete_segment_callback(self, seg_id):
+        self._request_confirmation(
+            "Delete this segment?",
+            "This removes the segment from the generated output and cannot be undone.",
+            lambda: self._delete_segment(seg_id),
+            confirm_label="Delete Segment"
+        )
+
+    def _delete_segment(self, seg_id):
         try:
             self.backend.delete_segment(seg_id)
             self.original_segments_map.pop(seg_id, None)
@@ -799,6 +854,17 @@ function startMobileDictation() {
         except Exception as ex:
             logging.error(f"[UI] Error deleting segment {seg_id}: {ex}", exc_info=True)
             ui.notify(f"Delete failed: {ex}", type="negative")
+
+    def request_refresh_upload_ui(self):
+        if not self.original_segments_map and not self.translated_segments_map:
+            self.refresh_upload_ui()
+            return
+        self._request_confirmation(
+            "Start over with a new file?",
+            "Current translated segments and unsaved in-page edits will be lost.",
+            self.refresh_upload_ui,
+            confirm_label="Start Over"
+        )
 
     def approve_segment_callback(self, seg_id):
         try:
