@@ -2,6 +2,9 @@ import asyncio
 import logging
 import os
 import glob
+import json
+import time
+import uuid
 from io import BytesIO
 from threading import Thread
 from typing import Any
@@ -11,8 +14,17 @@ from fastapi import UploadFile, File, Form
 from starlette.responses import Response
 
 from TranslationBackend import TranslationBackend
+from translation_metrics import MetricsCollector
 
 logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger("translation.ui")
+
+
+def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
+    payload: dict[str, Any] = {"event": event, **fields}
+    if correlation_id:
+        payload["correlation_id"] = correlation_id
+    LOGGER.info(json.dumps(payload, default=str))
 
 
 class TranslationUI:
@@ -31,6 +43,7 @@ class TranslationUI:
         self.uploaded_file_name: str | None = None
         self.uploaded_file_extension: str | None = None
         self.current_target_language: str | None = None
+        self.current_correlation_id: str | None = None
         self.cancel_button = None
 
         # ── SEGMENT EDITING ─────────────────────────────────────────────
@@ -312,6 +325,15 @@ class TranslationUI:
             self.show_error("Please enter a valid target language.")
             return
         self.current_target_language = target_language
+        correlation_id = str(uuid.uuid4())
+        self.current_correlation_id = correlation_id
+        _log_event(
+            "ui.translation_requested",
+            correlation_id=correlation_id,
+            file_name=self.uploaded_file_name,
+            file_extension=self.uploaded_file_extension,
+            target_language=target_language,
+        )
         logging.info(f"[UI] Translating '{self.uploaded_file_name}' → {target_language}")
 
         # clear old UI
@@ -332,6 +354,8 @@ class TranslationUI:
             self.cancel_button
 
         def translation_task():
+            file_metrics = MetricsCollector()
+            started = time.time()
             try:
                 out_stream, count, tokens, _, seg_map = self.backend.translate_file(
                     self.uploaded_file,
@@ -341,10 +365,13 @@ class TranslationUI:
                     label_ui,
                     processed=False,
                     font_size=font_size,
-                    autofit=autofit
+                    autofit=autofit,
+                    correlation_id=correlation_id,
+                    file_metrics=file_metrics,
                 )
                 if self.backend.cancel_requested:
                     logging.info("[UI] Translation canceled mid-way.")
+                    _log_event("ui.translation_cancelled", correlation_id=correlation_id)
                     return
 
                 progress_ui.set_value(100)
@@ -361,9 +388,16 @@ class TranslationUI:
                     self.original_segments_map[seg_id] = seg_info["original"]
                     self.translated_segments_map[seg_id] = seg_info["translated"]
 
+                _log_event(
+                    "ui.translation_complete",
+                    correlation_id=correlation_id,
+                    elapsed_seconds=round(time.time() - started, 3),
+                    metrics=file_metrics.snapshot(),
+                )
                 self.show_result()
             except Exception as e:
                 logging.error(f"[UI] Translation error: {e}", exc_info=True)
+                _log_event("ui.translation_failed", correlation_id=correlation_id, error=str(e))
                 self.show_error(e)
 
         Thread(target=translation_task).start()
@@ -374,6 +408,14 @@ class TranslationUI:
         self.result_container.clear()
         self.stats_container.clear()
 
+        correlation_id = str(uuid.uuid4())
+        self.current_correlation_id = correlation_id
+        _log_event(
+            "ui.processed_file_open_requested",
+            correlation_id=correlation_id,
+            file_name=self.uploaded_file_name,
+            file_extension=self.uploaded_file_extension,
+        )
         progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
             .classes("mx-auto mt-4").style("color: #ff9800;")
         label_ui = ui.label("Loading processed document...")\
@@ -387,6 +429,7 @@ class TranslationUI:
             self.cancel_button
 
         def processed_task():
+            file_metrics = MetricsCollector()
             try:
                 out_stream, count, _, _, seg_map = self.backend.translate_file(
                     self.uploaded_file,
@@ -394,7 +437,9 @@ class TranslationUI:
                     "",
                     progress_ui,
                     label_ui,
-                    processed=True
+                    processed=True,
+                    correlation_id=correlation_id,
+                    file_metrics=file_metrics,
                 )
                 progress_ui.set_value(100)
                 label_ui.text = "File loaded."
@@ -409,9 +454,15 @@ class TranslationUI:
                     self.original_segments_map[seg_id] = seg_info["original"]
                     self.translated_segments_map[seg_id] = seg_info["translated"]
 
+                _log_event(
+                    "ui.processed_file_open_complete",
+                    correlation_id=correlation_id,
+                    metrics=file_metrics.snapshot(),
+                )
                 self.show_result()
             except Exception as e:
                 logging.error(f"[UI] Error loading processed doc: {e}", exc_info=True)
+                _log_event("ui.processed_file_open_failed", correlation_id=correlation_id, error=str(e))
                 self.show_error(e)
 
         Thread(target=processed_task).start()
@@ -781,10 +832,12 @@ class TranslationUI:
         file: UploadFile = File(...),
         language: str = Form(...)
     ) -> Response:
+        correlation_id = str(uuid.uuid4())
         try:
             if not language or language.lower() in ('undefined','null',''):
                 language = 'es'
                 logging.warning("[API] Empty language → default to Spanish")
+            _log_event("ui.voice_translate_requested", correlation_id=correlation_id, language=language)
             data = await file.read()
             if not data:
                 return Response(content=b"", status_code=400, headers={"X-Error":"Empty audio data"})
@@ -814,11 +867,13 @@ class TranslationUI:
                     "X-Original-Text": header_orig,
                     "X-Translated-Text": translation_text,
                     "X-Target-Language": language,
+                    "X-Correlation-Id": correlation_id,
                     "Content-Length": str(len(mp3_bytes))
                 }
             )
         except Exception as e:
             logging.error(f"[API] Voice error: {e}", exc_info=True)
+            _log_event("ui.voice_translate_failed", correlation_id=correlation_id, error=str(e))
             msg = f"Translation error: {e}"
             return Response(content=msg.encode(), status_code=500,
                             media_type="text/plain", headers={"X-Error":msg})

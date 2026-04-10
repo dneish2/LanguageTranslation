@@ -7,8 +7,7 @@ import json
 import random
 from html import escape
 from io import BytesIO
-from typing import Tuple
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 import dotenv
 import fitz  # PyMuPDF
@@ -19,10 +18,21 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
 
+from translation_metrics import MetricsCollector, TranslationMetrics
+
 dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger("translation.backend")
 
 WHITE = (1, 1, 1)  # RGB white for PDF overwrite
+MODEL_COST_PER_1K_TOKENS = 0.002
+
+
+def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
+    payload: dict[str, Any] = {"event": event, **fields}
+    if correlation_id:
+        payload["correlation_id"] = correlation_id
+    LOGGER.info(json.dumps(payload, default=str))
 
 
 class TranslationBackend:
@@ -105,11 +115,30 @@ class TranslationBackend:
                 time.sleep(sleep_seconds)
 
     # ───────────────────────────── GPT CORE ────────────────────────────── #
-    def translate_text(self, text: str, target_language: str) -> str:
+    def translate_text(
+        self,
+        text: str,
+        target_language: str,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ) -> str:
         """Translate free-form text via GPT."""
         text = text.replace("\t", " ").strip()
         if not text:
             return text
+        metrics = file_metrics or self.metrics
+        cache_key = (target_language, text)
+        if cache_key in self.translation_cache:
+            cached = self.translation_cache[cache_key]
+            metrics.record_cache_hit()
+            _log_event(
+                "translation.cache_hit",
+                correlation_id=correlation_id,
+                source_length=len(text),
+                translated_length=len(cached),
+            )
+            return cached
+        metrics.record_cache_miss()
 
         cache_key = self._normalize_cache_key(text, target_language, mode="translate")
         cached = self.translation_cache.get(cache_key)
@@ -291,8 +320,19 @@ class TranslationBackend:
     # ------------------
     # PROCESSING DOCX
     # ------------------
-    def process_docx(self, input_stream, target_language, progress_ui, label_ui, do_translate=True):
+    def process_docx(
+        self,
+        input_stream,
+        target_language,
+        progress_ui,
+        label_ui,
+        do_translate=True,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ):
         self.reset_cancel()
+        metrics = file_metrics or self.metrics
+        metrics.start_file(file_type="docx", correlation_id=correlation_id)
         doc = Document(input_stream)
         self.current_file_type = 'docx'
         self.current_document = doc
@@ -310,7 +350,11 @@ class TranslationBackend:
                 continue
             if self.cancel_requested:
                 break
-            new_text = self.translate_text(original, target_language) if do_translate else original
+            seg_start = time.time()
+            new_text = (
+                self.translate_text(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
+                if do_translate else original
+            )
             para.text = new_text
             text_accum += new_text + "\n"
             seg_id = self.generate_segment_id()
@@ -323,6 +367,7 @@ class TranslationBackend:
                 "object": para
             }
             processed += 1
+            metrics.add_segment_duration(time.time() - seg_start)
             self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
 
         # Table cells
@@ -335,7 +380,16 @@ class TranslationBackend:
                             continue
                         if self.cancel_requested:
                             break
-                        new_text = self.translate_text(original, target_language) if do_translate else original
+                        seg_start = time.time()
+                        new_text = (
+                            self.translate_text(
+                                original,
+                                target_language,
+                                correlation_id=correlation_id,
+                                file_metrics=metrics,
+                            )
+                            if do_translate else original
+                        )
                         para.text = new_text
                         text_accum += new_text + "\n"
                         seg_id = self.generate_segment_id()
@@ -348,6 +402,7 @@ class TranslationBackend:
                             "object": para
                         }
                         processed += 1
+                        metrics.add_segment_duration(time.time() - seg_start)
                         self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
 
         out_stream = BytesIO()
@@ -355,6 +410,11 @@ class TranslationBackend:
         out_stream.seek(0)
         self.output_stream = out_stream
         tokens = self.calculate_tokens(text_accum)
+        metrics.finish_file(
+            file_type="docx",
+            segment_count=processed,
+            duration_seconds=time.time() - start_time,
+        )
         return out_stream, processed, tokens, text_accum, self.segment_map
 
     # ------------------
@@ -368,10 +428,13 @@ class TranslationBackend:
         label_ui,
         do_translate=True,
         font_size=None,
-        autofit=False
+        autofit=False,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
     ):
-    
+        metrics = file_metrics or self.metrics
         self.reset_cancel()
+        metrics.start_file(file_type="pptx", correlation_id=correlation_id)
         prs = Presentation(input_stream)
         self.current_file_type = 'pptx'
         self.current_presentation = prs
@@ -389,7 +452,9 @@ class TranslationBackend:
                     continue
 
                 if do_translate:
-                    new_text = self._translate_shape(shape, target_language, font_size, autofit)
+                    seg_start = time.time()
+                    new_text = self._translate_shape(shape, target_language, font_size, autofit, correlation_id, metrics)
+                    metrics.add_segment_duration(time.time() - seg_start)
                 else:
                     new_text = original_text
 
@@ -414,9 +479,22 @@ class TranslationBackend:
         out_stream.seek(0)
         self.output_stream = out_stream
         tokens = self.calculate_tokens(text_accum)
+        metrics.finish_file(
+            file_type="pptx",
+            segment_count=processed,
+            duration_seconds=time.time() - start_time,
+        )
         return out_stream, processed, tokens, text_accum, self.segment_map
 
-    def _translate_shape(self, shape, target_language, font_size=None, autofit=False):
+    def _translate_shape(
+        self,
+        shape,
+        target_language,
+        font_size=None,
+        autofit=False,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ):
         def apply_formatting(tf):
             # 1) Set every paragraph & run to the user’s max size
             if font_size:
@@ -438,19 +516,36 @@ class TranslationBackend:
                     tf = cell.text_frame
                     if not tf: continue
                     text = tf.text.strip()
-                    new_text = self.translate_text(text, target_language)
+                    new_text = self.translate_text(
+                        text,
+                        target_language,
+                        correlation_id=correlation_id,
+                        file_metrics=file_metrics,
+                    )
                     tf.text = new_text
                     apply_formatting(tf)
                     result += new_text + "\n"
 
         elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
             for sub in shape.shapes:
-                result += self._translate_shape(sub, target_language, font_size, autofit) + "\n"
+                result += self._translate_shape(
+                    sub,
+                    target_language,
+                    font_size,
+                    autofit,
+                    correlation_id=correlation_id,
+                    file_metrics=file_metrics,
+                ) + "\n"
 
         elif hasattr(shape, "text_frame") and shape.text_frame:
             tf = shape.text_frame
             original = tf.text.strip()
-            new_text = self.translate_text(original, target_language)
+            new_text = self.translate_text(
+                original,
+                target_language,
+                correlation_id=correlation_id,
+                file_metrics=file_metrics,
+            )
             tf.text = new_text
             apply_formatting(tf)
             result += new_text + "\n"
@@ -483,7 +578,18 @@ class TranslationBackend:
     # ------------------
     # PROCESSING PDF
     # ------------------
-    def process_pdf(self, input_stream, target_language, progress_ui, label_ui, do_translate=True):
+    def process_pdf(
+        self,
+        input_stream,
+        target_language,
+        progress_ui,
+        label_ui,
+        do_translate=True,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ):
+        metrics = file_metrics or self.metrics
+        metrics.start_file(file_type="pdf", correlation_id=correlation_id)
         logging.info("[PDF] Opening document for translation")
         doc = fitz.open(stream=input_stream, filetype="pdf")
         self.current_file_type = 'pdf'
@@ -540,7 +646,17 @@ class TranslationBackend:
                 }
                 logging.debug(f"[PDF] Registered segment {seg_id[:8]} at {bbox}")
 
-                new_text = original if not do_translate else self.translate_text(original, target_language)
+                seg_start = time.time()
+                new_text = (
+                    original
+                    if not do_translate
+                    else self.translate_text(
+                        original,
+                        target_language,
+                        correlation_id=correlation_id,
+                        file_metrics=metrics,
+                    )
+                )
                 self.segment_map[seg_id]["translated"] = new_text
 
                 last_css = self._render_pdf_block(page, bbox, new_text)
@@ -548,6 +664,7 @@ class TranslationBackend:
                 logging.debug(f"[PDF] Translated segment {seg_id[:8]}")
 
                 processed += 1
+                metrics.add_segment_duration(time.time() - seg_start)
                 self.update_progress(processed, total_blocks, start_time, progress_ui, label_ui)
 
         # 4) Finalize, subset fonts & save
@@ -560,6 +677,11 @@ class TranslationBackend:
 
         tokens = self.calculate_tokens("")  # or track actual text if desired
         logging.info(f"[PDF] Done – {processed}/{total_blocks} blocks processed, tokens={tokens}")
+        metrics.finish_file(
+            file_type="pdf",
+            segment_count=processed,
+            duration_seconds=time.time() - start_time,
+        )
         return out_stream, processed, tokens, "", self.segment_map
 
     # ------------------
@@ -620,27 +742,61 @@ class TranslationBackend:
         label_ui,
         processed=False,
         font_size=None,
-        autofit=False
+        autofit=False,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
     ):
         self.reset_cancel()
         self.current_target_language = target_language
+        metrics = file_metrics or self.metrics
+        _log_event(
+            "translation.file_started",
+            correlation_id=correlation_id,
+            file_extension=file_extension,
+            processed=processed,
+            target_language=target_language,
+        )
         ext = file_extension.lower()
         if ext == "docx":
-            return self.process_docx(input_stream, target_language, progress_ui, label_ui, do_translate=not processed)
+            result = self.process_docx(
+                input_stream,
+                target_language,
+                progress_ui,
+                label_ui,
+                do_translate=not processed,
+                correlation_id=correlation_id,
+                file_metrics=metrics,
+            )
         elif ext == "pptx":
-            return self.process_pptx(
+            result = self.process_pptx(
                 input_stream,
                 target_language,
                 progress_ui,
                 label_ui,
                 do_translate=not processed,
                 font_size=font_size,
-                autofit=autofit
+                autofit=autofit,
+                correlation_id=correlation_id,
+                file_metrics=metrics,
             )
         elif ext == "pdf":
-            return self.process_pdf(input_stream, target_language, progress_ui, label_ui, do_translate=not processed)
+            result = self.process_pdf(
+                input_stream,
+                target_language,
+                progress_ui,
+                label_ui,
+                do_translate=not processed,
+                correlation_id=correlation_id,
+                file_metrics=metrics,
+            )
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
+        _log_event(
+            "translation.file_finished",
+            correlation_id=correlation_id,
+            metrics=metrics.snapshot(),
+        )
+        return result
 
     def record_feedback(self, *, approved: bool, original: str, translated: str) -> bool:
         """
