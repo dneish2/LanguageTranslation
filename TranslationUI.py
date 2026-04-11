@@ -14,7 +14,6 @@ from fastapi import UploadFile, File, Form
 from starlette.responses import Response
 
 from TranslationBackend import TranslationBackend
-from translation_metrics import MetricsCollector
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("translation.ui")
@@ -45,6 +44,8 @@ class TranslationUI:
         self.current_target_language: str | None = None
         self.current_correlation_id: str | None = None
         self.cancel_button = None
+        self.active_job_id: str | None = None
+        self.job_poll_timer = None
 
         # ── SEGMENT EDITING ─────────────────────────────────────────────
         self.original_segments_map: dict[str, str] = {}
@@ -566,54 +567,18 @@ function startMobileDictation() {
             label_ui
             self.cancel_button
 
-        def translation_task():
-            file_metrics = MetricsCollector()
-            started = time.time()
-            try:
-                out_stream, count, tokens, _, seg_map = self.backend.translate_file(
-                    self.uploaded_file,
-                    self.uploaded_file_extension,
-                    target_language,
-                    progress_ui,
-                    label_ui,
-                    processed=False,
-                    font_size=font_size,
-                    autofit=autofit,
-                    correlation_id=correlation_id,
-                    file_metrics=file_metrics,
-                )
-                if self.backend.cancel_requested:
-                    logging.info("[UI] Translation canceled mid-way.")
-                    _log_event("ui.translation_cancelled", correlation_id=correlation_id)
-                    return
-
-                progress_ui.set_value(100)
-                label_ui.text = "Translation complete."
-
-                # save stats
-                self.current_count = count
-                self.current_cost = tokens * 0.002 / 1000
-
-                # rebuild segment maps
-                self.original_segments_map.clear()
-                self.translated_segments_map.clear()
-                for seg_id, seg_info in seg_map.items():
-                    self.original_segments_map[seg_id] = seg_info["original"]
-                    self.translated_segments_map[seg_id] = seg_info["translated"]
-
-                _log_event(
-                    "ui.translation_complete",
-                    correlation_id=correlation_id,
-                    elapsed_seconds=round(time.time() - started, 3),
-                    metrics=file_metrics.snapshot(),
-                )
-                self.show_result()
-            except Exception as e:
-                logging.error(f"[UI] Translation error: {e}", exc_info=True)
-                _log_event("ui.translation_failed", correlation_id=correlation_id, error=str(e))
-                self.show_error(e)
-
-        Thread(target=translation_task).start()
+        self._start_job_and_poll(
+            progress_ui=progress_ui,
+            label_ui=label_ui,
+            correlation_id=correlation_id,
+            processed=False,
+            font_size=font_size,
+            autofit=autofit,
+            target_language=target_language,
+            complete_event="ui.translation_complete",
+            failed_event="ui.translation_failed",
+            cancelled_event="ui.translation_cancelled",
+        )
 
     def handle_translation_processed(self):
         # display a pre-translated file without re-calling openai
@@ -641,48 +606,111 @@ function startMobileDictation() {
             label_ui
             self.cancel_button
 
-        def processed_task():
-            file_metrics = MetricsCollector()
-            try:
-                out_stream, count, _, _, seg_map = self.backend.translate_file(
-                    self.uploaded_file,
-                    self.uploaded_file_extension,
-                    "",
-                    progress_ui,
-                    label_ui,
-                    processed=True,
-                    correlation_id=correlation_id,
-                    file_metrics=file_metrics,
-                )
-                progress_ui.set_value(100)
-                label_ui.text = "File loaded."
-
-                self.current_count = count
-                self.current_cost = 0.0
-                self.current_target_language = "Processed"
-
-                self.original_segments_map.clear()
-                self.translated_segments_map.clear()
-                for seg_id, seg_info in seg_map.items():
-                    self.original_segments_map[seg_id] = seg_info["original"]
-                    self.translated_segments_map[seg_id] = seg_info["translated"]
-
-                _log_event(
-                    "ui.processed_file_open_complete",
-                    correlation_id=correlation_id,
-                    metrics=file_metrics.snapshot(),
-                )
-                self.show_result()
-            except Exception as e:
-                logging.error(f"[UI] Error loading processed doc: {e}", exc_info=True)
-                _log_event("ui.processed_file_open_failed", correlation_id=correlation_id, error=str(e))
-                self.show_error(e)
-
-        Thread(target=processed_task).start()
+        self._start_job_and_poll(
+            progress_ui=progress_ui,
+            label_ui=label_ui,
+            correlation_id=correlation_id,
+            processed=True,
+            font_size=None,
+            autofit=False,
+            target_language="",
+            complete_event="ui.processed_file_open_complete",
+            failed_event="ui.processed_file_open_failed",
+            cancelled_event="ui.translation_cancelled",
+        )
 
     def cancel_translation(self):
-        self.backend.request_cancel()
+        if self.active_job_id:
+            self.backend.cancel_job(self.active_job_id)
+        else:
+            self.backend.request_cancel()
         self.show_error("Translation was canceled. Please upload or try again.")
+
+    def _start_job_and_poll(
+        self,
+        *,
+        progress_ui,
+        label_ui,
+        correlation_id: str,
+        processed: bool,
+        font_size: int | None,
+        autofit: bool,
+        target_language: str,
+        complete_event: str,
+        failed_event: str,
+        cancelled_event: str,
+    ) -> None:
+        started = time.time()
+        if self.job_poll_timer:
+            self.job_poll_timer.active = False
+            self.job_poll_timer = None
+
+        self.active_job_id = self.backend.start_translation_job(
+            input_stream=self.uploaded_file,
+            file_extension=self.uploaded_file_extension,
+            target_language=target_language,
+            processed=processed,
+            font_size=font_size,
+            autofit=autofit,
+            correlation_id=correlation_id,
+        )
+
+        def poll_job():
+            if not self.active_job_id:
+                return
+            job = self.backend.get_job(self.active_job_id)
+            if not job:
+                return
+            progress_ui.set_value(job.progress)
+            label_ui.text = job.status_message
+
+            if job.state in {"queued", "running"}:
+                return
+
+            if self.job_poll_timer:
+                self.job_poll_timer.active = False
+                self.job_poll_timer = None
+
+            if job.state == "canceled":
+                _log_event(cancelled_event, correlation_id=correlation_id)
+                return
+
+            if job.state == "failed":
+                _log_event(failed_event, correlation_id=correlation_id, error=job.error or "unknown")
+                self.show_error(job.error or "Translation failed")
+                return
+
+            result = self.backend.get_job_result(job.result_handle) if job.result_handle else None
+            if not result:
+                _log_event(failed_event, correlation_id=correlation_id, error="missing_result_handle")
+                self.show_error("Translation failed: missing result payload.")
+                return
+
+            count = result["count"]
+            tokens = result["tokens"]
+            seg_map = result["segment_map"]
+
+            self.current_count = count
+            self.current_cost = 0.0 if processed else tokens * 0.002 / 1000
+            if processed:
+                self.current_target_language = "Processed"
+
+            self.original_segments_map.clear()
+            self.translated_segments_map.clear()
+            for seg_id, seg_info in seg_map.items():
+                self.original_segments_map[seg_id] = seg_info["original"]
+                self.translated_segments_map[seg_id] = seg_info["translated"]
+
+            _log_event(
+                complete_event,
+                correlation_id=correlation_id,
+                elapsed_seconds=round(time.time() - started, 3),
+                metrics=result.get("metrics", {}),
+            )
+            self.show_result()
+            self.active_job_id = None
+
+        self.job_poll_timer = ui.timer(0.2, poll_job)
 
     def get_fresh_download_stream(self):
         # re-generate with edits and return a fresh BytesIO

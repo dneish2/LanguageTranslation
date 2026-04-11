@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def test_cancel_halts_processing_progression(monkeypatch):
 
     calls = {"count": 0}
 
-    def translate_and_cancel(text, target_language):
+    def translate_and_cancel(text, target_language, **_kwargs):
         calls["count"] += 1
         backend.request_cancel()
         return f"translated:{text}"
@@ -126,3 +127,73 @@ def test_translate_fallback_returns_original_on_openai_exception(monkeypatch):
     translated = backend.translate_text(original, target_language="German")
 
     assert translated == "Keep me as-is"
+
+
+def test_translation_job_reaches_succeeded_with_result_handle(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = TranslationBackend()
+
+    def fake_translate_file(**kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback:
+            progress_callback(25, "Queued for processing")
+            progress_callback(90, "Almost done")
+        return BytesIO(b"done"), 3, 1200, "translated text", {"seg-1": {"original": "A", "translated": "B"}}
+
+    monkeypatch.setattr(backend, "translate_file", fake_translate_file)
+
+    job_id = backend.start_translation_job(
+        input_stream=BytesIO(b"input"),
+        file_extension="docx",
+        target_language="Spanish",
+        processed=False,
+    )
+
+    deadline = time.time() + 2
+    job = backend.get_job(job_id)
+    while job and job.state in {"queued", "running"} and time.time() < deadline:
+        time.sleep(0.01)
+        job = backend.get_job(job_id)
+
+    assert job is not None
+    assert job.state == "succeeded"
+    assert job.result_handle is not None
+    result = backend.get_job_result(job.result_handle)
+    assert result is not None
+    assert result["count"] == 3
+    assert result["segment_map"]["seg-1"]["translated"] == "B"
+
+
+def test_translation_job_cancel_transitions_to_canceled(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = TranslationBackend()
+
+    def slow_translate_file(**kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        for idx in range(1, 20):
+            if backend.cancel_requested:
+                break
+            if progress_callback:
+                progress_callback(idx * 5, f"Step {idx}")
+            time.sleep(0.01)
+        return BytesIO(b"done"), 1, 0, "", {}
+
+    monkeypatch.setattr(backend, "translate_file", slow_translate_file)
+
+    job_id = backend.start_translation_job(
+        input_stream=BytesIO(b"input"),
+        file_extension="docx",
+        target_language="Spanish",
+    )
+    time.sleep(0.03)
+    canceled = backend.cancel_job(job_id)
+    assert canceled is True
+
+    deadline = time.time() + 2
+    job = backend.get_job(job_id)
+    while job and job.state in {"queued", "running"} and time.time() < deadline:
+        time.sleep(0.01)
+        job = backend.get_job(job_id)
+
+    assert job is not None
+    assert job.state == "canceled"
