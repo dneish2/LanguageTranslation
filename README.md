@@ -78,6 +78,13 @@ Demonstrate live voice translation by taking a short mic recording, turning it i
      - Supports real-time feedback and correction workflows, allowing users to refine results with minimal friction.
      - Designed for accessibility and scalability across use cases.
 
+### Job Queue, Recovery, and Ops Metrics
+
+- **Bounded concurrency:** translation jobs run through a worker pool with a configurable max worker count.
+- **Queue execution policy:** queueing supports FIFO/LIFO plus overload policies such as `reject_new` and `drop_oldest`.
+- **Durable metadata storage:** each job's lifecycle metadata and result reference are persisted in SQLite for reconnect/restart recovery.
+- **Dashboard-ready alerts:** the metrics dashboard exposes alert signals for error rate, p95 duration, retry spikes, and queue depth thresholds.
+
 Here’s the full Usage section in markdown for you to copy directly into your README.md:
 
 ## Usage

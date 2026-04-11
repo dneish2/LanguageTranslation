@@ -76,6 +76,7 @@ class TranslationBackend:
         self.output_stream: BytesIO | None = None
         self.pdf_overlay_ocg = None
         self.translation_cache: dict[tuple[str, str, str], str] = {}
+        self.metrics = MetricsCollector()
         self.max_openai_attempts = 4
         self.retry_base_delay = 0.5
         self.retry_max_delay = 8.0
@@ -288,6 +289,25 @@ class TranslationBackend:
                     sleep_seconds,
                 )
                 time.sleep(sleep_seconds)
+
+    def _translate_segment_text(
+        self,
+        text: str,
+        target_language: str,
+        correlation_id: str | None = None,
+        metrics: TranslationMetrics | None = None,
+    ) -> str:
+        try:
+            return self.translate_text(
+                text,
+                target_language,
+                correlation_id=correlation_id,
+                file_metrics=metrics,
+            )
+        except TypeError as error:
+            if "unexpected keyword argument" not in str(error):
+                raise
+            return self.translate_text(text, target_language)
 
     # ───────────────────────────── GPT CORE ────────────────────────────── #
     def translate_text(
@@ -589,7 +609,7 @@ class TranslationBackend:
                                 original,
                                 target_language,
                                 correlation_id=correlation_id,
-                                file_metrics=metrics,
+                                metrics=metrics,
                             )
                             if do_translate else original
                         )
@@ -738,7 +758,7 @@ class TranslationBackend:
                         text,
                         target_language,
                         correlation_id=correlation_id,
-                        file_metrics=file_metrics,
+                        metrics=file_metrics,
                     )
                     tf.text = new_text
                     apply_formatting(tf)
@@ -762,7 +782,7 @@ class TranslationBackend:
                 original,
                 target_language,
                 correlation_id=correlation_id,
-                file_metrics=file_metrics,
+                metrics=file_metrics,
             )
             tf.text = new_text
             apply_formatting(tf)
@@ -873,7 +893,7 @@ class TranslationBackend:
                         original,
                         target_language,
                         correlation_id=correlation_id,
-                        file_metrics=metrics,
+                        metrics=metrics,
                     )
                 )
                 self.segment_map[seg_id]["translated"] = new_text
