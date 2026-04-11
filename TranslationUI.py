@@ -86,10 +86,38 @@ class TranslationUI:
         # run on single port
         ui.run(host="0.0.0.0", port=8080)
 
+    def _inject_auto_device_routing(self, page: str) -> None:
+        ui.add_body_html(f"""
+<script>
+(() => {{
+    const page = {json.dumps(page)};
+    const currentPath = window.location.pathname;
+    const uaMobile = /Android|iPhone|iPad|iPod|Mobile|Opera Mini|IEMobile/i.test(navigator.userAgent || '');
+    const viewportMobile = window.matchMedia('(max-width: 768px)').matches;
+    const coarsePointer = window.matchMedia('(pointer: coarse)').matches;
+    const isMobile = uaMobile || (viewportMobile && coarsePointer);
+    const targetPath = isMobile ? '/mobile' : '/';
+    const key = 'device_auto_redirect';
+
+    if ((page === 'desktop' && targetPath === '/mobile' && currentPath !== '/mobile')
+        || (page === 'mobile' && targetPath === '/' && currentPath !== '/')) {{
+        const redirected = sessionStorage.getItem(key);
+        if (!redirected) {{
+            sessionStorage.setItem(key, '1');
+            window.location.replace(targetPath);
+            return;
+        }}
+    }}
+    sessionStorage.removeItem(key);
+}})();
+</script>
+        """)
+
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
     def main_page(self):
         self.mobile_mode = False
+        self._inject_auto_device_routing("desktop")
         # Header with Advanced + Voice buttons
         with ui.header().classes("items-center justify-between bg-gray-100 p-2"):
             with ui.row().classes("w-full flex justify-between items-center"):
@@ -103,10 +131,6 @@ class TranslationUI:
                         "Live Voice Translation",
                         on_click=lambda: ui.navigate.to("/voice")
                     ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
-                    ui.button(
-                        "Mobile Flow",
-                        on_click=lambda: ui.navigate.to("/mobile")
-                    ).classes("bg-blue-100 text-blue-800 px-4 py-2 rounded shadow")
 
         # Drawer for recent docs
         self.drawer = ui.drawer(side='left').classes("bg-gray-50")
@@ -354,6 +378,7 @@ class TranslationUI:
 
     def mobile_page(self):
         self.mobile_mode = True
+        self._inject_auto_device_routing("mobile")
         with ui.header().classes("items-center bg-white p-3 border-b"):
             with ui.row().classes("w-full items-center justify-between"):
                 ui.label("Mobile Translation Flow").classes("text-base font-semibold")

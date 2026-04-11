@@ -81,6 +81,9 @@ class TranslationBackend:
         self.retry_base_delay = 0.5
         self.retry_max_delay = 8.0
         self.metrics: TranslationMetrics = MetricsCollector()
+        self._jobs_lock = Lock()
+        self._jobs: dict[str, TranslationJob] = {}
+        self._job_results: dict[str, dict[str, Any]] = {}
 
     def reset_cancel(self) -> None:
         self.cancel_requested = False
