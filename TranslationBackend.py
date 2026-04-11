@@ -79,10 +79,7 @@ class TranslationBackend:
         self.max_openai_attempts = 4
         self.retry_base_delay = 0.5
         self.retry_max_delay = 8.0
-        self.metrics = MetricsCollector()
-        self._jobs: dict[str, TranslationJob] = {}
-        self._job_results: dict[str, dict[str, Any]] = {}
-        self._jobs_lock = Lock()
+        self.metrics: TranslationMetrics = MetricsCollector()
 
     def reset_cancel(self) -> None:
         self.cancel_requested = False
@@ -381,6 +378,26 @@ class TranslationBackend:
             logging.error("[Backend] refine translation error: %s", e, exc_info=True)
             return original_text
 
+    def _translate_text_with_context(
+        self,
+        text: str,
+        target_language: str,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ) -> str:
+        """Call translate_text with optional instrumentation, compatible with monkeypatched stubs."""
+        try:
+            return self.translate_text(
+                text,
+                target_language,
+                correlation_id=correlation_id,
+                file_metrics=file_metrics,
+            )
+        except TypeError as error:
+            if "unexpected keyword argument" not in str(error):
+                raise
+            return self.translate_text(text, target_language)
+
     # ──────────────────────── VOICE (WHISPER + TTS) ────────────────────── #
     def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, bytes]:
         """
@@ -531,7 +548,7 @@ class TranslationBackend:
                 break
             seg_start = time.time()
             new_text = (
-                self.translate_text(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
+                self._translate_text_with_context(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
                 if do_translate else original
             )
             para.text = new_text
@@ -568,7 +585,7 @@ class TranslationBackend:
                             break
                         seg_start = time.time()
                         new_text = (
-                            self.translate_text(
+                            self._translate_text_with_context(
                                 original,
                                 target_language,
                                 correlation_id=correlation_id,
@@ -717,7 +734,7 @@ class TranslationBackend:
                     tf = cell.text_frame
                     if not tf: continue
                     text = tf.text.strip()
-                    new_text = self.translate_text(
+                    new_text = self._translate_text_with_context(
                         text,
                         target_language,
                         correlation_id=correlation_id,
@@ -741,7 +758,7 @@ class TranslationBackend:
         elif hasattr(shape, "text_frame") and shape.text_frame:
             tf = shape.text_frame
             original = tf.text.strip()
-            new_text = self.translate_text(
+            new_text = self._translate_text_with_context(
                 original,
                 target_language,
                 correlation_id=correlation_id,
@@ -852,7 +869,7 @@ class TranslationBackend:
                 new_text = (
                     original
                     if not do_translate
-                    else self.translate_text(
+                    else self._translate_text_with_context(
                         original,
                         target_language,
                         correlation_id=correlation_id,
