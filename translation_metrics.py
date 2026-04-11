@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import quantiles
 from typing import Protocol
 
 
@@ -84,4 +85,99 @@ class MetricsCollector:
             "cache_misses": self.cache_misses,
             "retries": self.retries,
             "estimated_cost": round(self.estimated_cost, 6),
+        }
+
+
+@dataclass
+class DashboardThresholds:
+    error_rate: float = 0.1
+    p95_duration_seconds: float = 30.0
+    retry_spike_count: int = 10
+    queue_depth: int = 20
+
+
+class MetricsDashboard:
+    """Aggregates recent job metrics for dashboard widgets and alerting rules."""
+
+    def __init__(self, thresholds: DashboardThresholds | None = None) -> None:
+        self.thresholds = thresholds or DashboardThresholds()
+        self._job_rows: list[dict] = []
+
+    def ingest_job(
+        self,
+        *,
+        status: str,
+        duration_seconds: float,
+        retries: int,
+        queue_depth: int,
+        correlation_id: str | None = None,
+    ) -> None:
+        self._job_rows.append(
+            {
+                "status": status,
+                "duration_seconds": max(0.0, duration_seconds),
+                "retries": max(0, retries),
+                "queue_depth": max(0, queue_depth),
+                "correlation_id": correlation_id,
+            }
+        )
+
+    def snapshot(self) -> dict:
+        total = len(self._job_rows)
+        if total == 0:
+            return {
+                "job_count": 0,
+                "error_rate": 0.0,
+                "p95_duration_seconds": 0.0,
+                "retry_spike_count": 0,
+                "max_queue_depth": 0,
+                "alerts": [],
+            }
+
+        failures = sum(1 for row in self._job_rows if row["status"] in {"failed", "rejected", "dropped"})
+        error_rate = failures / total
+        durations = [row["duration_seconds"] for row in self._job_rows]
+        p95_duration = (
+            quantiles(durations, n=100, method="inclusive")[94]
+            if len(durations) > 1
+            else durations[0]
+        )
+        retry_spike_count = sum(row["retries"] for row in self._job_rows)
+        max_queue_depth = max(row["queue_depth"] for row in self._job_rows)
+
+        alerts: list[dict[str, str | float | int]] = []
+        if error_rate >= self.thresholds.error_rate:
+            alerts.append({"type": "error_rate", "value": round(error_rate, 4), "threshold": self.thresholds.error_rate})
+        if p95_duration >= self.thresholds.p95_duration_seconds:
+            alerts.append(
+                {
+                    "type": "p95_duration_seconds",
+                    "value": round(p95_duration, 3),
+                    "threshold": self.thresholds.p95_duration_seconds,
+                }
+            )
+        if retry_spike_count >= self.thresholds.retry_spike_count:
+            alerts.append(
+                {
+                    "type": "retry_spike_count",
+                    "value": retry_spike_count,
+                    "threshold": self.thresholds.retry_spike_count,
+                }
+            )
+        if max_queue_depth >= self.thresholds.queue_depth:
+            alerts.append(
+                {
+                    "type": "queue_depth",
+                    "value": max_queue_depth,
+                    "threshold": self.thresholds.queue_depth,
+                }
+            )
+
+        return {
+            "job_count": total,
+            "error_rate": round(error_rate, 4),
+            "p95_duration_seconds": round(p95_duration, 3),
+            "retry_spike_count": retry_spike_count,
+            "max_queue_depth": max_queue_depth,
+            "alerts": alerts,
         }
