@@ -5,9 +5,11 @@ import time
 import uuid
 import json
 import random
+from dataclasses import dataclass, field
+from threading import Lock, Thread
 from html import escape
 from io import BytesIO
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import dotenv
 import fitz  # PyMuPDF
@@ -26,6 +28,26 @@ LOGGER = logging.getLogger("translation.backend")
 
 WHITE = (1, 1, 1)  # RGB white for PDF overwrite
 MODEL_COST_PER_1K_TOKENS = 0.002
+
+
+JOB_STATE_QUEUED = "queued"
+JOB_STATE_RUNNING = "running"
+JOB_STATE_SUCCEEDED = "succeeded"
+JOB_STATE_FAILED = "failed"
+JOB_STATE_CANCELED = "canceled"
+
+
+@dataclass
+class TranslationJob:
+    job_id: str
+    state: str = JOB_STATE_QUEUED
+    progress: float = 0.0
+    status_message: str = "Queued"
+    result_handle: str | None = None
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
 
 
 def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
@@ -58,6 +80,7 @@ class TranslationBackend:
         self.max_openai_attempts = 4
         self.retry_base_delay = 0.5
         self.retry_max_delay = 8.0
+        self.metrics: TranslationMetrics = MetricsCollector()
 
     def reset_cancel(self) -> None:
         self.cancel_requested = False
@@ -65,6 +88,158 @@ class TranslationBackend:
     def request_cancel(self) -> None:
         self.cancel_requested = True
         logging.info("[Backend] Cancel requested.")
+
+    def start_translation_job(
+        self,
+        *,
+        input_stream: BytesIO,
+        file_extension: str,
+        target_language: str,
+        processed: bool = False,
+        font_size: int | None = None,
+        autofit: bool = False,
+        correlation_id: str | None = None,
+    ) -> str:
+        job_id = self.generate_segment_id()
+        job = TranslationJob(
+            job_id=job_id,
+            state=JOB_STATE_QUEUED,
+            progress=0.0,
+            status_message="Queued",
+            metadata={
+                "file_extension": file_extension,
+                "target_language": target_language,
+                "processed": processed,
+                "correlation_id": correlation_id,
+            },
+        )
+        with self._jobs_lock:
+            self._jobs[job_id] = job
+
+        def worker():
+            self._run_translation_job(
+                job_id=job_id,
+                input_stream=input_stream,
+                file_extension=file_extension,
+                target_language=target_language,
+                processed=processed,
+                font_size=font_size,
+                autofit=autofit,
+                correlation_id=correlation_id,
+            )
+
+        Thread(target=worker, daemon=True).start()
+        return job_id
+
+    def get_job(self, job_id: str) -> TranslationJob | None:
+        with self._jobs_lock:
+            return self._jobs.get(job_id)
+
+    def get_job_result(self, result_handle: str) -> dict[str, Any] | None:
+        with self._jobs_lock:
+            return self._job_results.get(result_handle)
+
+    def cancel_job(self, job_id: str) -> bool:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            if job.state in {JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELED}:
+                return False
+            job.state = JOB_STATE_CANCELED
+            job.status_message = "Cancel requested."
+            job.updated_at = time.time()
+        self.request_cancel()
+        return True
+
+    def _set_job_state(
+        self,
+        job_id: str,
+        *,
+        state: str | None = None,
+        progress: float | None = None,
+        status_message: str | None = None,
+        result_handle: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            if state is not None:
+                job.state = state
+            if progress is not None:
+                job.progress = max(0.0, min(100.0, progress))
+            if status_message is not None:
+                job.status_message = status_message
+            if result_handle is not None:
+                job.result_handle = result_handle
+            if error is not None:
+                job.error = error
+            job.updated_at = time.time()
+
+    def _run_translation_job(
+        self,
+        *,
+        job_id: str,
+        input_stream: BytesIO,
+        file_extension: str,
+        target_language: str,
+        processed: bool,
+        font_size: int | None,
+        autofit: bool,
+        correlation_id: str | None,
+    ) -> None:
+        self._set_job_state(job_id, state=JOB_STATE_RUNNING, status_message="Starting translation...")
+        file_metrics = MetricsCollector()
+        try:
+            out_stream, count, tokens, text_accum, seg_map = self.translate_file(
+                input_stream=input_stream,
+                file_extension=file_extension,
+                target_language=target_language,
+                processed=processed,
+                font_size=font_size,
+                autofit=autofit,
+                correlation_id=correlation_id,
+                file_metrics=file_metrics,
+                progress_callback=lambda progress, message: self._set_job_state(
+                    job_id,
+                    progress=progress,
+                    status_message=message,
+                ),
+            )
+            if self.cancel_requested:
+                self._set_job_state(
+                    job_id,
+                    state=JOB_STATE_CANCELED,
+                    status_message="Translation canceled.",
+                )
+                return
+
+            result_handle = self.generate_segment_id()
+            with self._jobs_lock:
+                self._job_results[result_handle] = {
+                    "output_stream": out_stream,
+                    "count": count,
+                    "tokens": tokens,
+                    "text": text_accum,
+                    "segment_map": seg_map,
+                    "metrics": file_metrics.snapshot(),
+                }
+            self._set_job_state(
+                job_id,
+                state=JOB_STATE_SUCCEEDED,
+                progress=100.0,
+                status_message="Translation complete.",
+                result_handle=result_handle,
+            )
+        except Exception as exc:
+            self._set_job_state(
+                job_id,
+                state=JOB_STATE_FAILED,
+                status_message="Translation failed.",
+                error=str(exc),
+            )
 
     def generate_segment_id(self) -> str:
         return str(uuid.uuid4())
@@ -223,6 +398,26 @@ class TranslationBackend:
             logging.error("[Backend] refine translation error: %s", e, exc_info=True)
             return original_text
 
+    def _translate_text_with_context(
+        self,
+        text: str,
+        target_language: str,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ) -> str:
+        """Call translate_text with optional instrumentation, compatible with monkeypatched stubs."""
+        try:
+            return self.translate_text(
+                text,
+                target_language,
+                correlation_id=correlation_id,
+                file_metrics=file_metrics,
+            )
+        except TypeError as error:
+            if "unexpected keyword argument" not in str(error):
+                raise
+            return self.translate_text(text, target_language)
+
     # ──────────────────────── VOICE (WHISPER + TTS) ────────────────────── #
     def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, bytes]:
         """
@@ -344,11 +539,12 @@ class TranslationBackend:
         self,
         input_stream,
         target_language,
-        progress_ui,
-        label_ui,
+        progress_ui=None,
+        label_ui=None,
         do_translate=True,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
     ):
         self.reset_cancel()
         metrics = file_metrics or self.metrics
@@ -372,7 +568,7 @@ class TranslationBackend:
                 break
             seg_start = time.time()
             new_text = (
-                self._translate_segment_text(original, target_language, correlation_id=correlation_id, metrics=metrics)
+                self._translate_text_with_context(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
                 if do_translate else original
             )
             para.text = new_text
@@ -388,7 +584,14 @@ class TranslationBackend:
             }
             processed += 1
             metrics.add_segment_duration(time.time() - seg_start)
-            self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
+            self.update_progress(
+                processed,
+                total_elements,
+                start_time,
+                progress_ui=progress_ui,
+                label_ui=label_ui,
+                progress_callback=progress_callback,
+            )
 
         # Table cells
         for t_idx, table in enumerate(doc.tables):
@@ -402,7 +605,7 @@ class TranslationBackend:
                             break
                         seg_start = time.time()
                         new_text = (
-                            self._translate_segment_text(
+                            self._translate_text_with_context(
                                 original,
                                 target_language,
                                 correlation_id=correlation_id,
@@ -423,7 +626,14 @@ class TranslationBackend:
                         }
                         processed += 1
                         metrics.add_segment_duration(time.time() - seg_start)
-                        self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
+                        self.update_progress(
+                            processed,
+                            total_elements,
+                            start_time,
+                            progress_ui=progress_ui,
+                            label_ui=label_ui,
+                            progress_callback=progress_callback,
+                        )
 
         out_stream = BytesIO()
         doc.save(out_stream)
@@ -444,13 +654,14 @@ class TranslationBackend:
         self,
         input_stream,
         target_language,
-        progress_ui,
-        label_ui,
+        progress_ui=None,
+        label_ui=None,
         do_translate=True,
         font_size=None,
         autofit=False,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
     ):
         metrics = file_metrics or self.metrics
         self.reset_cancel()
@@ -491,7 +702,14 @@ class TranslationBackend:
 
                 text_accum += new_text + "\n"
                 processed += 1
-                self.update_progress(processed, total_elements, start_time, progress_ui, label_ui)
+                self.update_progress(
+                    processed,
+                    total_elements,
+                    start_time,
+                    progress_ui=progress_ui,
+                    label_ui=label_ui,
+                    progress_callback=progress_callback,
+                )
 
         # output stream
         out_stream = BytesIO()
@@ -536,7 +754,7 @@ class TranslationBackend:
                     tf = cell.text_frame
                     if not tf: continue
                     text = tf.text.strip()
-                    new_text = self._translate_segment_text(
+                    new_text = self._translate_text_with_context(
                         text,
                         target_language,
                         correlation_id=correlation_id,
@@ -560,7 +778,7 @@ class TranslationBackend:
         elif hasattr(shape, "text_frame") and shape.text_frame:
             tf = shape.text_frame
             original = tf.text.strip()
-            new_text = self._translate_segment_text(
+            new_text = self._translate_text_with_context(
                 original,
                 target_language,
                 correlation_id=correlation_id,
@@ -602,11 +820,12 @@ class TranslationBackend:
         self,
         input_stream,
         target_language,
-        progress_ui,
-        label_ui,
+        progress_ui=None,
+        label_ui=None,
         do_translate=True,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
     ):
         metrics = file_metrics or self.metrics
         metrics.start_file(file_type="pdf", correlation_id=correlation_id)
@@ -670,7 +889,7 @@ class TranslationBackend:
                 new_text = (
                     original
                     if not do_translate
-                    else self._translate_segment_text(
+                    else self._translate_text_with_context(
                         original,
                         target_language,
                         correlation_id=correlation_id,
@@ -685,7 +904,14 @@ class TranslationBackend:
 
                 processed += 1
                 metrics.add_segment_duration(time.time() - seg_start)
-                self.update_progress(processed, total_blocks, start_time, progress_ui, label_ui)
+                self.update_progress(
+                    processed,
+                    total_blocks,
+                    start_time,
+                    progress_ui=progress_ui,
+                    label_ui=label_ui,
+                    progress_callback=progress_callback,
+                )
 
         # 4) Finalize, subset fonts & save
         out_stream = BytesIO()
@@ -707,13 +933,26 @@ class TranslationBackend:
     # ------------------
     # PROGRESS
     # ------------------
-    def update_progress(self, current, total, start_time, progress_ui, label_ui):
+    def update_progress(
+        self,
+        current,
+        total,
+        start_time,
+        progress_ui=None,
+        label_ui=None,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ):
         elapsed = time.time() - start_time
         avg = elapsed / current if current else 0
         remaining = total - current
         progress_value = (current / total) * 100 if total else 0
-        progress_ui.set_value(progress_value)
-        label_ui.text = f"Processing {current}/{total} (≈ {int(avg * remaining)}s remaining)"
+        label_text = f"Processing {current}/{total} (≈ {int(avg * remaining)}s remaining)"
+        if progress_ui is not None:
+            progress_ui.set_value(progress_value)
+        if label_ui is not None:
+            label_ui.text = label_text
+        if progress_callback is not None:
+            progress_callback(progress_value, label_text)
 
     # ------------------
     # UPDATE SEGMENT
@@ -758,13 +997,14 @@ class TranslationBackend:
         input_stream,
         file_extension,
         target_language,
-        progress_ui,
-        label_ui,
+        progress_ui=None,
+        label_ui=None,
         processed=False,
         font_size=None,
         autofit=False,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
     ):
         self.reset_cancel()
         self.current_target_language = target_language
@@ -786,6 +1026,7 @@ class TranslationBackend:
                 do_translate=not processed,
                 correlation_id=correlation_id,
                 file_metrics=metrics,
+                progress_callback=progress_callback,
             )
         elif ext == "pptx":
             result = self.process_pptx(
@@ -798,6 +1039,7 @@ class TranslationBackend:
                 autofit=autofit,
                 correlation_id=correlation_id,
                 file_metrics=metrics,
+                progress_callback=progress_callback,
             )
         elif ext == "pdf":
             result = self.process_pdf(
@@ -808,6 +1050,7 @@ class TranslationBackend:
                 do_translate=not processed,
                 correlation_id=correlation_id,
                 file_metrics=metrics,
+                progress_callback=progress_callback,
             )
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
