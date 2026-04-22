@@ -1024,6 +1024,7 @@ function startMobileDictation() {
 <script>
     /* Full recording/MediaRecorder logic from your original */
     let recorder = null, stream = null, chunks = [], isRecording = false;
+    let selectedMimeType = null;
 
     function updateStatus(msg) {
         let e = document.getElementById('status_label');
@@ -1040,24 +1041,80 @@ function startMobileDictation() {
         if (stop)  { stop.disabled  = !recording; stop.style.opacity = recording?'1':'0.5'; }
         isRecording = recording;
     }
+    function setRecordingControlsEnabled(enabled) {
+        let start = document.getElementById('start_btn'),
+            stop  = document.getElementById('stop_btn');
+        if (start) { start.disabled = !enabled; start.style.opacity = enabled ? '1' : '0.5'; }
+        if (stop)  { stop.disabled  = true; stop.style.opacity = '0.5'; }
+        if (!enabled) isRecording = false;
+    }
+
+    function resolveRecorderMimeType() {
+        if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== 'function') return undefined;
+        const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+        for (const mime of candidates) {
+            if (MediaRecorder.isTypeSupported(mime)) return mime;
+        }
+        if (MediaRecorder.isTypeSupported('')) return undefined;
+        return null;
+    }
+
+    function mapRecordingError(err) {
+        const name = err?.name || 'Error';
+        if (name === 'NotAllowedError') {
+            return 'Microphone permission denied. Allow mic access in browser/site settings and retry.';
+        }
+        if (name === 'NotFoundError') {
+            return 'No microphone found. Connect/enable a mic and try again.';
+        }
+        if (name === 'NotSupportedError') {
+            return 'Audio recording is not supported in this browser. Try a current Chrome/Edge/Safari.';
+        }
+        return err?.message || 'Unexpected recording error.';
+    }
 
     async function startRecording() {
+        const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+        const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+        const secureOk = window.isSecureContext || isLocalhost;
+        if (!hasGetUserMedia || !secureOk) {
+            setRecordingControlsEnabled(false);
+            updateStatus("Recording unavailable. Use HTTPS or localhost in a supported browser.");
+            updateDebug(`preflight getUserMedia=${hasGetUserMedia} secure=${secureOk}`);
+            return;
+        }
+
+        selectedMimeType = resolveRecorderMimeType();
+        if (selectedMimeType === null) {
+            setRecordingControlsEnabled(false);
+            updateStatus("No supported recording format found. Try a different browser.");
+            updateDebug(`mime=none secure=${secureOk}`);
+            return;
+        }
+
         updateStatus("Requesting mic…");
-        updateDebug("Starting...");
+        updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=requesting`);
         try {
             const constraints = {
-                audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,sampleRate:44100}
+                audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
             };
             stream = await navigator.mediaDevices.getUserMedia(constraints);
-            recorder = new MediaRecorder(stream, { mimeType:'audio/webm;codecs=opus' });
+            updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=granted`);
+            const recorderOptions = selectedMimeType ? { mimeType: selectedMimeType } : undefined;
+            recorder = recorderOptions ? new MediaRecorder(stream, recorderOptions) : new MediaRecorder(stream);
             chunks = [];
             recorder.ondataavailable = e => { if(e.data.size>0) { chunks.push(e.data); updateDebug(`Chunks:${chunks.length}`); } };
             recorder.onstart = () => { updateStatus("🔴 Recording…"); updateButtons(true); };
-            recorder.onerror = e => { updateStatus("Error: "+e.error.message); updateButtons(false); };
+            recorder.onerror = e => {
+                updateStatus("Error: " + mapRecordingError(e.error || e));
+                updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=granted`);
+                updateButtons(false);
+            };
             recorder.start(1000);
         } catch (err) {
-            updateStatus("Error: "+err.message);
-            updateDebug(err.message);
+            const mapped = mapRecordingError(err);
+            updateStatus("Error: " + mapped);
+            updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=denied (${err?.name || 'unknown'})`);
             if(stream) stream.getTracks().forEach(t=>t.stop());
         }
     }
@@ -1102,8 +1159,20 @@ function startMobileDictation() {
     }
 
     window.addEventListener('load', () => {
-        updateButtons(false);
-        updateStatus("Ready to record");
+        const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+        const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+        const secureOk = window.isSecureContext || isLocalhost;
+        selectedMimeType = resolveRecorderMimeType();
+        const canRecord = hasGetUserMedia && secureOk && selectedMimeType !== null;
+        setRecordingControlsEnabled(canRecord);
+        if (!hasGetUserMedia || !secureOk) {
+            updateStatus("Recording unavailable. Use HTTPS or localhost in a supported browser.");
+        } else if (selectedMimeType === null) {
+            updateStatus("No supported recording format found. Try a different browser.");
+        } else {
+            updateStatus("Ready to record");
+        }
+        updateDebug(`mime=${selectedMimeType === null ? 'none' : (selectedMimeType || 'browser-default')} secure=${secureOk} getUserMedia=${hasGetUserMedia}`);
     });
 </script>
         """)
