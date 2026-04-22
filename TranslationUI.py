@@ -54,7 +54,9 @@ class TranslationUI:
         # ── DRAWER & ADVANCED MODE ──────────────────────────────────────
         self.drawer = None
         self.advanced_mode = False
-        self.advanced_button = None
+        self.top_mode_control = None
+        self._syncing_mode_control = False
+        self.top_nav_control_classes = "h-8 min-h-0 px-2 rounded-md"
         self.document_editor_dialog = None
         self.document_editor_container = None
         self.document_editor_inputs: dict[str, Any] = {}
@@ -183,19 +185,15 @@ window.voiceUx = window.voiceUx || (() => {
     def main_page(self):
         self.mobile_mode = False
         self._inject_auto_device_routing("desktop")
-        # Header with Advanced + Voice buttons
+        # Header with a compact unified mode control
         with ui.header().classes("items-center justify-between bg-gray-100 p-2"):
             with ui.row().classes("w-full flex justify-between items-center"):
                 ui.label("Translation App").classes("text-lg font-bold text-black")
-                with ui.row().classes("space-x-2"):
-                    self.advanced_button = ui.button(
-                        "Enable Advanced Mode",
-                        on_click=self.toggle_advanced_mode
-                    ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
-                    ui.button(
-                        "Live Voice Translation",
-                        on_click=lambda: ui.navigate.to("/voice")
-                    ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
+                self.top_mode_control = ui.toggle(
+                    {"standard": "Standard", "advanced": "Advanced", "voice": "Voice"},
+                    value=self._current_top_mode()
+                ).classes(self.top_nav_control_classes)
+                self.top_mode_control.on_value_change(self.handle_top_mode_change)
 
         # Drawer for recent docs
         self.drawer = ui.drawer(side='left').classes("bg-gray-50")
@@ -215,13 +213,36 @@ window.voiceUx = window.voiceUx || (() => {
     def toggle_advanced_mode(self):
         self.advanced_mode = not self.advanced_mode
         if self.advanced_mode:
-            self.advanced_button.text = "Advanced Mode Enabled"
-            ui.notify("Advanced Mode activated! Segment editing features are now available.")
+            ui.notify("Advanced mode on.", type="positive")
         else:
-            self.advanced_button.text = "Enable Advanced Mode"
-            ui.notify("Advanced Mode disabled. Segment editing hidden.")
+            ui.notify("Advanced mode off.", type="info")
+        self.sync_top_mode_control()
         if self.original_segments_map:
             self.show_result()
+
+    def _current_top_mode(self) -> str:
+        return "advanced" if self.advanced_mode else "standard"
+
+    def sync_top_mode_control(self) -> None:
+        if not self.top_mode_control:
+            return
+        self._syncing_mode_control = True
+        self.top_mode_control.value = self._current_top_mode()
+        self._syncing_mode_control = False
+
+    def handle_top_mode_change(self, event) -> None:
+        if self._syncing_mode_control:
+            return
+
+        selected_mode = event.value
+        if selected_mode == "voice":
+            self.sync_top_mode_control()
+            ui.navigate.to("/voice")
+            return
+
+        should_enable_advanced = selected_mode == "advanced"
+        if should_enable_advanced != self.advanced_mode:
+            self.toggle_advanced_mode()
 
     def build_document_editor_dialog(self):
         if self.document_editor_dialog is not None:
@@ -1144,30 +1165,97 @@ window.addEventListener('load', initMobileVoiceUx);
         ui.add_head_html("""
 <script>
     let recorder = null, stream = null, chunks = [], isRecording = false;
+    let selectedMimeType = null;
+
+    function updateStatus(msg) {
+        let e = document.getElementById('status_label');
+        if (e) e.textContent = msg;
+    }
+    function updateDebug(msg) {
+        let e = document.getElementById('debug_info');
+        if (e) e.textContent = msg;
+    }
+    function updateButtons(recording) {
+        let start = document.getElementById('start_btn'),
+            stop  = document.getElementById('stop_btn');
+        if (start) { start.disabled = recording; start.style.opacity = recording?'0.5':'1'; }
+        if (stop)  { stop.disabled  = !recording; stop.style.opacity = recording?'1':'0.5'; }
+        isRecording = recording;
+    }
+    function setRecordingControlsEnabled(enabled) {
+        let start = document.getElementById('start_btn'),
+            stop  = document.getElementById('stop_btn');
+        if (start) { start.disabled = !enabled; start.style.opacity = enabled ? '1' : '0.5'; }
+        if (stop)  { stop.disabled  = true; stop.style.opacity = '0.5'; }
+        if (!enabled) isRecording = false;
+    }
+
+    function resolveRecorderMimeType() {
+        if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== 'function') return undefined;
+        const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+        for (const mime of candidates) {
+            if (MediaRecorder.isTypeSupported(mime)) return mime;
+        }
+        if (MediaRecorder.isTypeSupported('')) return undefined;
+        return null;
+    }
+
+    function mapRecordingError(err) {
+        const name = err?.name || 'Error';
+        if (name === 'NotAllowedError') {
+            return 'Microphone permission denied. Allow mic access in browser/site settings and retry.';
+        }
+        if (name === 'NotFoundError') {
+            return 'No microphone found. Connect/enable a mic and try again.';
+        }
+        if (name === 'NotSupportedError') {
+            return 'Audio recording is not supported in this browser. Try a current Chrome/Edge/Safari.';
+        }
+        return err?.message || 'Unexpected recording error.';
+    }
 
     async function startRecording() {
-        window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.REQUESTING_AUDIO);
-        window.voiceUx.setDebug('desktop_voice', 'Starting microphone capture.');
+        const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+        const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+        const secureOk = window.isSecureContext || isLocalhost;
+        if (!hasGetUserMedia || !secureOk) {
+            setRecordingControlsEnabled(false);
+            updateStatus("Recording unavailable. Use HTTPS or localhost in a supported browser.");
+            updateDebug(`preflight getUserMedia=${hasGetUserMedia} secure=${secureOk}`);
+            return;
+        }
+
+        selectedMimeType = resolveRecorderMimeType();
+        if (selectedMimeType === null) {
+            setRecordingControlsEnabled(false);
+            updateStatus("No supported recording format found. Try a different browser.");
+            updateDebug(`mime=none secure=${secureOk}`);
+            return;
+        }
+
+        updateStatus("Requesting mic…");
+        updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=requesting`);
         try {
             const constraints = {
-                audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,sampleRate:44100}
+                audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
             };
             stream = await navigator.mediaDevices.getUserMedia(constraints);
-            recorder = new MediaRecorder(stream, { mimeType:'audio/webm;codecs=opus' });
+            updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=granted`);
+            const recorderOptions = selectedMimeType ? { mimeType: selectedMimeType } : undefined;
+            recorder = recorderOptions ? new MediaRecorder(stream, recorderOptions) : new MediaRecorder(stream);
             chunks = [];
-            recorder.ondataavailable = e => { if(e.data.size>0) { chunks.push(e.data); window.voiceUx.setDebug('desktop_voice', `Chunks: ${chunks.length}`); } };
-            recorder.onstart = () => {
-                window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.RECORDING);
-                window.voiceUx.setRecordingButtons('desktop_voice', true);
-            };
+            recorder.ondataavailable = e => { if(e.data.size>0) { chunks.push(e.data); updateDebug(`Chunks:${chunks.length}`); } };
+            recorder.onstart = () => { updateStatus("🔴 Recording…"); updateButtons(true); };
             recorder.onerror = e => {
-                window.voiceUx.setStatus('desktop_voice', "Error: " + e.error.message);
-                window.voiceUx.setRecordingButtons('desktop_voice', false);
+                updateStatus("Error: " + mapRecordingError(e.error || e));
+                updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=granted`);
+                updateButtons(false);
             };
             recorder.start(1000);
         } catch (err) {
-            window.voiceUx.setStatus('desktop_voice', `Microphone unavailable. Use transcript fallback.`);
-            window.voiceUx.setDebug('desktop_voice', err.message);
+            const mapped = mapRecordingError(err);
+            updateStatus("Error: " + mapped);
+            updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=denied (${err?.name || 'unknown'})`);
             if(stream) stream.getTracks().forEach(t=>t.stop());
         }
     }
@@ -1211,36 +1299,22 @@ window.addEventListener('load', initMobileVoiceUx);
         recorder.stop();
     }
 
-    async function translateTranscriptFallback() {
-        const transcript = (document.getElementById('desktop_voice_transcript')?.value || '').trim();
-        if (!transcript) {
-            window.voiceUx.setStatus('desktop_voice', 'Please record audio or paste a transcript before translating.');
-            return;
+    window.addEventListener('load', () => {
+        const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+        const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+        const secureOk = window.isSecureContext || isLocalhost;
+        selectedMimeType = resolveRecorderMimeType();
+        const canRecord = hasGetUserMedia && secureOk && selectedMimeType !== null;
+        setRecordingControlsEnabled(canRecord);
+        if (!hasGetUserMedia || !secureOk) {
+            updateStatus("Recording unavailable. Use HTTPS or localhost in a supported browser.");
+        } else if (selectedMimeType === null) {
+            updateStatus("No supported recording format found. Try a different browser.");
+        } else {
+            updateStatus("Ready to record");
         }
-        const lang = document.getElementById('language_select')?.value || 'es';
-        const fd = new FormData();
-        fd.append('text', transcript);
-        fd.append('language', lang);
-        window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.TRANSLATING_TEXT);
-        window.voiceUx.setDebug('desktop_voice', 'Using transcript fallback path.');
-        try {
-            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd });
-            const payload = await resp.json();
-            if (!resp.ok) throw new Error(payload.error || 'Transcript translation failed');
-            document.getElementById('original_text').textContent = payload.original_text || transcript;
-            document.getElementById('translated_text').textContent = payload.translated_text || '';
-            window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.COMPLETE);
-        } catch (e) {
-            window.voiceUx.setStatus('desktop_voice', "Error: " + e.message);
-        }
-    }
-
-    const initDesktopVoiceUx = () => {
-        window.voiceUx.init('desktop_voice');
-        window.voiceUx.setDebug('desktop_voice', 'Preferred flow: record audio. Fallback: paste transcript.');
-    };
-    initDesktopVoiceUx();
-    window.addEventListener('load', initDesktopVoiceUx);
+        updateDebug(`mime=${selectedMimeType === null ? 'none' : (selectedMimeType || 'browser-default')} secure=${secureOk} getUserMedia=${hasGetUserMedia}`);
+    });
 </script>
         """)
 
