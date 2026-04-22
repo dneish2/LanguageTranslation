@@ -169,9 +169,10 @@ def test_translation_job_cancel_transitions_to_canceled(monkeypatch):
     backend = TranslationBackend()
 
     def slow_translate_file(**kwargs):
+        job_id = kwargs.get("job_id")
         progress_callback = kwargs.get("progress_callback")
         for idx in range(1, 20):
-            if backend.cancel_requested:
+            if backend._is_cancel_requested(job_id):
                 break
             if progress_callback:
                 progress_callback(idx * 5, f"Step {idx}")
@@ -197,3 +198,53 @@ def test_translation_job_cancel_transitions_to_canceled(monkeypatch):
 
     assert job is not None
     assert job.state == "canceled"
+
+
+def test_cancel_one_job_does_not_cancel_other_concurrent_job(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = TranslationBackend()
+
+    def slow_translate_file(**kwargs):
+        job_id = kwargs.get("job_id")
+        progress_callback = kwargs.get("progress_callback")
+        for idx in range(1, 20):
+            if backend._is_cancel_requested(job_id):
+                return BytesIO(b"canceled"), 0, 0, "", {}
+            if progress_callback:
+                progress_callback(idx * 5, f"Step {idx}")
+            time.sleep(0.01)
+        return BytesIO(f"done:{job_id}".encode()), 1, 0, f"text:{job_id}", {"seg-1": {"translated": job_id}}
+
+    monkeypatch.setattr(backend, "translate_file", slow_translate_file)
+
+    canceled_job_id = backend.start_translation_job(
+        input_stream=BytesIO(b"input-a"),
+        file_extension="docx",
+        target_language="Spanish",
+    )
+    surviving_job_id = backend.start_translation_job(
+        input_stream=BytesIO(b"input-b"),
+        file_extension="docx",
+        target_language="French",
+    )
+
+    time.sleep(0.03)
+    assert backend.cancel_job(canceled_job_id) is True
+
+    deadline = time.time() + 2
+    canceled_job = backend.get_job(canceled_job_id)
+    surviving_job = backend.get_job(surviving_job_id)
+    while (
+        canceled_job
+        and surviving_job
+        and (canceled_job.state in {"queued", "running"} or surviving_job.state in {"queued", "running"})
+        and time.time() < deadline
+    ):
+        time.sleep(0.01)
+        canceled_job = backend.get_job(canceled_job_id)
+        surviving_job = backend.get_job(surviving_job_id)
+
+    assert canceled_job is not None
+    assert canceled_job.state == "canceled"
+    assert surviving_job is not None
+    assert surviving_job.state == "succeeded"
