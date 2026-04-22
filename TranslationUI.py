@@ -11,7 +11,7 @@ from typing import Any
 
 from nicegui import ui, app
 from fastapi import UploadFile, File, Form
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 
 from TranslationBackend import TranslationBackend
 
@@ -77,6 +77,11 @@ class TranslationUI:
             self.api_voice_translate,
             methods=["POST"],
         )
+        app.add_api_route(
+            "/api/text_translate",
+            self.api_text_translate,
+            methods=["POST"],
+        )
 
     def start_ui(self):
         # register pages
@@ -112,6 +117,66 @@ class TranslationUI:
 }})();
 </script>
         """)
+
+    def _inject_voice_frontend_helpers(self) -> None:
+        ui.add_head_html("""
+<script>
+window.voiceUx = window.voiceUx || (() => {
+    const states = {
+        READY: 'Ready: record audio or paste transcript',
+        REQUESTING_AUDIO: 'Requesting microphone access…',
+        RECORDING: 'Recording audio…',
+        STOPPING: 'Stopping recording…',
+        PROCESSING_AUDIO: 'Processing audio…',
+        TRANSLATING_TEXT: 'Translating transcript…',
+        COMPLETE: 'Complete: output ready',
+    };
+
+    const resolve = (scope, key) => document.getElementById(`${scope}_${key}`);
+
+    function setStatus(scope, message) {
+        const node = resolve(scope, 'status');
+        if (node) node.textContent = message;
+    }
+
+    function setDebug(scope, message) {
+        const node = resolve(scope, 'debug');
+        if (node) node.textContent = message || '';
+    }
+
+    function setRecordingButtons(scope, recording) {
+        const start = resolve(scope, 'start_recording');
+        const stop = resolve(scope, 'stop_recording');
+        if (start) {
+            start.disabled = recording;
+            start.style.opacity = recording ? '0.5' : '1';
+        }
+        if (stop) {
+            stop.disabled = !recording;
+            stop.style.opacity = recording ? '1' : '0.5';
+        }
+    }
+
+    function init(scope) {
+        setStatus(scope, states.READY);
+        setDebug(scope, '');
+        setRecordingButtons(scope, false);
+    }
+
+    return { states, init, setStatus, setDebug, setRecordingButtons };
+})();
+</script>
+        """)
+
+    def _render_voice_status_block(self, scope: str) -> None:
+        ui.label("Status").classes("text-sm font-semibold text-gray-700 mt-3")
+        ui.label("")\
+            .classes("text-base text-gray-800")\
+            .props(f"id={scope}_status")
+        ui.label("Debug").classes("text-xs font-semibold text-gray-600 mt-1")
+        ui.label("")\
+            .classes("text-xs text-gray-500 min-h-[20px]")\
+            .props(f"id={scope}_debug")
 
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
@@ -392,6 +457,7 @@ class TranslationUI:
             self.refresh_upload_ui()
 
     def render_mobile_flow(self):
+        self._inject_voice_frontend_helpers()
         with self.upload_container:
             ui.label("1) Choose input").classes("text-sm font-semibold text-gray-700")
             mode = ui.toggle({"upload": "Upload", "voice": "Voice"}, value=self.mobile_input_mode)                .classes("w-full")
@@ -414,37 +480,84 @@ class TranslationUI:
                 if self.uploaded_file_name:
                     ui.label(f"Selected: {self.uploaded_file_name}").classes("text-sm text-gray-600")
             else:
-                ui.label("3) Record or paste speech text").classes("text-sm font-semibold text-gray-700 mt-2")
+                ui.label("3) Record audio or paste transcript").classes("text-sm font-semibold text-gray-700 mt-2")
                 self.mobile_voice_input = ui.textarea(
-                    label="Voice transcript",
-                    placeholder="Paste transcript or use dictation and edit if needed.",
+                    label="Transcript (fallback)",
+                    placeholder="Record when available, or paste text here as fallback.",
                 ).props("id=mobile_voice_text autogrow").classes("w-full")
-                ui.html('<button type="button" class="w-full bg-emerald-600 text-white rounded-lg py-4 text-lg font-semibold" '
-                        'onclick="startMobileDictation()">🎙️ Start Dictation</button>')
+                with ui.row().classes("w-full gap-2"):
+                    ui.html('<button id="mobile_voice_start_recording" type="button" '
+                            'class="w-full bg-emerald-600 text-white rounded-lg py-3 text-base font-semibold" '
+                            'onclick="startMobileVoiceRecording()">🎙️ Start Recording</button>')
+                    ui.html('<button id="mobile_voice_stop_recording" type="button" '
+                            'class="w-full bg-red-600 text-white rounded-lg py-3 text-base font-semibold" '
+                            'onclick="stopMobileVoiceRecording()" disabled>⏹️ Stop Recording</button>')
+                self._render_voice_status_block("mobile_voice")
                 ui.add_head_html("""
 <script>
-function startMobileDictation() {
+let mobileRecognition = null;
+
+function startMobileVoiceRecording() {
     const input = document.getElementById('mobile_voice_text') || document.querySelector('textarea');
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { alert('Speech recognition is not available on this browser.'); return; }
-    const recognition = new SR();
-    recognition.lang = 'en-US';
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
-    recognition.onresult = (event) => {
+    if (!SR) {
+        window.voiceUx.setStatus('mobile_voice', 'Microphone unavailable. Use transcript fallback.');
+        window.voiceUx.setDebug('mobile_voice', 'SpeechRecognition API is not available.');
+        return;
+    }
+    mobileRecognition = new SR();
+    mobileRecognition.lang = 'en-US';
+    mobileRecognition.interimResults = false;
+    mobileRecognition.maxAlternatives = 1;
+    mobileRecognition.onstart = () => {
+        window.voiceUx.setStatus('mobile_voice', window.voiceUx.states.RECORDING);
+        window.voiceUx.setDebug('mobile_voice', 'Dictation started.');
+        window.voiceUx.setRecordingButtons('mobile_voice', true);
+    };
+    mobileRecognition.onresult = (event) => {
         const text = event.results?.[0]?.[0]?.transcript || '';
         if (input) {
             input.value = text;
             input.dispatchEvent(new Event('input', { bubbles: true }));
         }
+        window.voiceUx.setDebug('mobile_voice', `Transcript length: ${text.length}`);
     };
-    recognition.start();
+    mobileRecognition.onerror = (event) => {
+        window.voiceUx.setStatus('mobile_voice', `Error: ${event.error || 'unknown error'}`);
+        window.voiceUx.setDebug('mobile_voice', 'Fallback available: paste transcript manually.');
+        window.voiceUx.setRecordingButtons('mobile_voice', false);
+    };
+    mobileRecognition.onend = () => {
+        window.voiceUx.setStatus('mobile_voice', 'Ready to translate');
+        window.voiceUx.setRecordingButtons('mobile_voice', false);
+    };
+    window.voiceUx.setStatus('mobile_voice', window.voiceUx.states.REQUESTING_AUDIO);
+    mobileRecognition.start();
 }
+
+function stopMobileVoiceRecording() {
+    if (!mobileRecognition) {
+        window.voiceUx.setDebug('mobile_voice', 'No active recording session.');
+        return;
+    }
+    window.voiceUx.setStatus('mobile_voice', window.voiceUx.states.STOPPING);
+    mobileRecognition.stop();
+}
+
+const initMobileVoiceUx = () => {
+    window.voiceUx.init('mobile_voice');
+    window.voiceUx.setDebug('mobile_voice', 'Use recording first. Transcript remains the fallback path.');
+};
+initMobileVoiceUx();
+window.addEventListener('load', initMobileVoiceUx);
 </script>
                 """)
 
             ui.label("4) Translate").classes("text-sm font-semibold text-gray-700 mt-2")
             ui.button("Translate", on_click=self.start_mobile_translation)                .classes("w-full bg-blue-600 text-white py-4 text-lg rounded-lg shadow")
+            if self.mobile_input_mode == "voice":
+                ui.label("Output includes translated text. Audio playback is available in desktop voice flow.")\
+                    .classes("text-xs text-gray-600")
 
     def set_mobile_input_mode(self, mode):
         self.mobile_input_mode = mode
@@ -472,7 +585,7 @@ function startMobileDictation() {
 
         voice_text = (self.mobile_voice_input.value or "").strip() if self.mobile_voice_input else ""
         if not voice_text:
-            self.show_error("Please provide voice transcript text before translating.")
+            self.show_error("Please record audio or paste a transcript before translating.")
             return
 
         self.current_target_language = language
@@ -485,6 +598,8 @@ function startMobileDictation() {
         with self.progress_container:
             progress_ui
             label_ui
+        ui.run_javascript("window.voiceUx?.setStatus('mobile_voice', window.voiceUx.states.TRANSLATING_TEXT)")
+        ui.run_javascript("window.voiceUx?.setDebug('mobile_voice', 'Submitting transcript to translation model.')")
 
         def voice_task():
             self._run_mobile_voice_translation(voice_text, language, progress_ui, label_ui)
@@ -497,12 +612,14 @@ function startMobileDictation() {
             label_ui.text = "Calling translation model..."
             translated = self.backend.translate_text(voice_text, language)
             progress_ui.set_value(100)
-            label_ui.text = "Translation complete."
+            label_ui.text = "Complete: output ready."
+            ui.run_javascript("window.voiceUx?.setStatus('mobile_voice', window.voiceUx.states.COMPLETE)")
             self.current_count = 1
             self.current_cost = 0.0
             self.show_mobile_voice_result(voice_text, translated, language)
         except Exception as ex:
             logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
+            ui.run_javascript(f"window.voiceUx?.setStatus('mobile_voice', {json.dumps(f'Error: {ex}')})")
             self.show_error(ex)
 
     def show_mobile_voice_result(self, original_text, translated_text, language):
@@ -979,6 +1096,7 @@ function startMobileDictation() {
     # ─────────────────────────────── VOICE TRANSLATION PAGE ─────────────────────────────────
 
     def voice_translation_page(self):
+        self._inject_voice_frontend_helpers()
         ui.label("Live Voice Translation").classes("text-2xl mb-4")
 
         with ui.row().classes("items-center space-x-2 mb-4"):
@@ -993,20 +1111,23 @@ function startMobileDictation() {
                 </select>
             ''')
 
-        status_label = ui.label("Ready to record")\
-                         .classes("text-lg mb-2")\
-                         .props("id=status_label")
+        self._render_voice_status_block("desktop_voice")
 
         with ui.row().classes("space-x-4 mb-4"):
-            ui.html('<button id="start_btn" class="bg-green-500 text-white px-4 py-2 rounded" '
+            ui.html('<button id="desktop_voice_start_recording" class="bg-green-500 text-white px-4 py-2 rounded" '
                     'onclick="startRecording()">🎤 Start Recording</button>')
-            ui.html('<button id="stop_btn" class="bg-red-500 text-white px-4 py-2 rounded" '
-                    'onclick="stopRecording()" disabled>⏹️ Stop & Translate</button>')
+            ui.html('<button id="desktop_voice_stop_recording" class="bg-red-500 text-white px-4 py-2 rounded" '
+                    'onclick="stopRecording()" disabled>⏹️ Stop Recording</button>')
             ui.button("← Back", on_click=lambda: ui.navigate.to("/"))\
               .classes("bg-gray-500 text-white px-4 py-2 rounded")
 
-        ui.label("Debug Info:").classes("font-bold mt-4")
-        ui.label("").classes("text-sm text-gray-600").props("id=debug_info")
+        ui.label("Transcript fallback (when recording is unavailable)").classes("text-sm font-semibold text-gray-700 mt-2")
+        ui.textarea(
+            label="Transcript (fallback)",
+            placeholder="Paste text if your browser cannot record audio.",
+        ).props("id=desktop_voice_transcript autogrow").classes("w-full")
+        ui.button("Translate", on_click=lambda: ui.run_javascript("translateTranscriptFallback()"))\
+            .classes("bg-blue-600 text-white px-4 py-2 rounded mt-2")
 
         ui.audio(src="data:audio/wav;base64,")\
           .props("id=out_audio controls")\
@@ -1022,28 +1143,11 @@ function startMobileDictation() {
 
         ui.add_head_html("""
 <script>
-    /* Full recording/MediaRecorder logic from your original */
     let recorder = null, stream = null, chunks = [], isRecording = false;
 
-    function updateStatus(msg) {
-        let e = document.getElementById('status_label');
-        if (e) e.textContent = msg;
-    }
-    function updateDebug(msg) {
-        let e = document.getElementById('debug_info');
-        if (e) e.textContent = msg;
-    }
-    function updateButtons(recording) {
-        let start = document.getElementById('start_btn'),
-            stop  = document.getElementById('stop_btn');
-        if (start) { start.disabled = recording; start.style.opacity = recording?'0.5':'1'; }
-        if (stop)  { stop.disabled  = !recording; stop.style.opacity = recording?'1':'0.5'; }
-        isRecording = recording;
-    }
-
     async function startRecording() {
-        updateStatus("Requesting mic…");
-        updateDebug("Starting...");
+        window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.REQUESTING_AUDIO);
+        window.voiceUx.setDebug('desktop_voice', 'Starting microphone capture.');
         try {
             const constraints = {
                 audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,sampleRate:44100}
@@ -1051,26 +1155,32 @@ function startMobileDictation() {
             stream = await navigator.mediaDevices.getUserMedia(constraints);
             recorder = new MediaRecorder(stream, { mimeType:'audio/webm;codecs=opus' });
             chunks = [];
-            recorder.ondataavailable = e => { if(e.data.size>0) { chunks.push(e.data); updateDebug(`Chunks:${chunks.length}`); } };
-            recorder.onstart = () => { updateStatus("🔴 Recording…"); updateButtons(true); };
-            recorder.onerror = e => { updateStatus("Error: "+e.error.message); updateButtons(false); };
+            recorder.ondataavailable = e => { if(e.data.size>0) { chunks.push(e.data); window.voiceUx.setDebug('desktop_voice', `Chunks: ${chunks.length}`); } };
+            recorder.onstart = () => {
+                window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.RECORDING);
+                window.voiceUx.setRecordingButtons('desktop_voice', true);
+            };
+            recorder.onerror = e => {
+                window.voiceUx.setStatus('desktop_voice', "Error: " + e.error.message);
+                window.voiceUx.setRecordingButtons('desktop_voice', false);
+            };
             recorder.start(1000);
         } catch (err) {
-            updateStatus("Error: "+err.message);
-            updateDebug(err.message);
+            window.voiceUx.setStatus('desktop_voice', `Microphone unavailable. Use transcript fallback.`);
+            window.voiceUx.setDebug('desktop_voice', err.message);
             if(stream) stream.getTracks().forEach(t=>t.stop());
         }
     }
 
     async function stopRecording() {
         if(!recorder || recorder.state!=='recording') {
-            updateStatus("Not recording");
+            window.voiceUx.setDebug('desktop_voice', 'No active recording session.');
             return;
         }
-        updateStatus("Stopping…");
-        updateButtons(false);
+        window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.STOPPING);
+        window.voiceUx.setRecordingButtons('desktop_voice', false);
         recorder.onstop = async () => {
-            updateStatus("Processing audio…");
+            window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.PROCESSING_AUDIO);
             const blob = new Blob(chunks, { type: recorder.mimeType });
             let lang = document.getElementById('language_select')?.value || 'es';
             let fd = new FormData();
@@ -1088,11 +1198,11 @@ function startMobileDictation() {
                     let url = URL.createObjectURL(audio);
                     let player = document.getElementById('out_audio');
                     player.src = url; player.play();
-                    updateStatus("✅ Done");
+                    window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.COMPLETE);
                 }
             } catch(e) {
-                updateStatus("Error:"+e.message);
-                updateDebug(e.message);
+                window.voiceUx.setStatus('desktop_voice', "Error: " + e.message);
+                window.voiceUx.setDebug('desktop_voice', e.message);
             } finally {
                 if(stream) stream.getTracks().forEach(t=>t.stop());
                 recorder = null; chunks = [];
@@ -1101,10 +1211,36 @@ function startMobileDictation() {
         recorder.stop();
     }
 
-    window.addEventListener('load', () => {
-        updateButtons(false);
-        updateStatus("Ready to record");
-    });
+    async function translateTranscriptFallback() {
+        const transcript = (document.getElementById('desktop_voice_transcript')?.value || '').trim();
+        if (!transcript) {
+            window.voiceUx.setStatus('desktop_voice', 'Please record audio or paste a transcript before translating.');
+            return;
+        }
+        const lang = document.getElementById('language_select')?.value || 'es';
+        const fd = new FormData();
+        fd.append('text', transcript);
+        fd.append('language', lang);
+        window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.TRANSLATING_TEXT);
+        window.voiceUx.setDebug('desktop_voice', 'Using transcript fallback path.');
+        try {
+            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd });
+            const payload = await resp.json();
+            if (!resp.ok) throw new Error(payload.error || 'Transcript translation failed');
+            document.getElementById('original_text').textContent = payload.original_text || transcript;
+            document.getElementById('translated_text').textContent = payload.translated_text || '';
+            window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.COMPLETE);
+        } catch (e) {
+            window.voiceUx.setStatus('desktop_voice', "Error: " + e.message);
+        }
+    }
+
+    const initDesktopVoiceUx = () => {
+        window.voiceUx.init('desktop_voice');
+        window.voiceUx.setDebug('desktop_voice', 'Preferred flow: record audio. Fallback: paste transcript.');
+    };
+    initDesktopVoiceUx();
+    window.addEventListener('load', initDesktopVoiceUx);
 </script>
         """)
 
@@ -1160,6 +1296,54 @@ function startMobileDictation() {
             msg = f"Translation error: {e}"
             return Response(content=msg.encode(), status_code=500,
                             media_type="text/plain", headers={"X-Error":msg})
+
+    async def api_text_translate(
+        self,
+        text: str = Form(...),
+        language: str = Form(...)
+    ) -> JSONResponse:
+        correlation_id = str(uuid.uuid4())
+        try:
+            cleaned_text = (text or "").strip()
+            if not cleaned_text:
+                return JSONResponse(
+                    {"error": "Transcript text is required."},
+                    status_code=400,
+                    headers={"X-Correlation-Id": correlation_id},
+                )
+            if not language or language.lower() in ('undefined', 'null', ''):
+                language = 'es'
+            _log_event(
+                "ui.text_translate_requested",
+                correlation_id=correlation_id,
+                language=language,
+                chars=len(cleaned_text),
+            )
+            translated = await asyncio.to_thread(
+                self.backend.translate_text,
+                cleaned_text,
+                language,
+            )
+            _log_event(
+                "ui.text_translate_succeeded",
+                correlation_id=correlation_id,
+                language=language,
+            )
+            return JSONResponse(
+                {
+                    "original_text": cleaned_text,
+                    "translated_text": translated,
+                    "target_language": language,
+                },
+                headers={"X-Correlation-Id": correlation_id},
+            )
+        except Exception as e:
+            _log_event("ui.text_translate_failed", correlation_id=correlation_id, error=str(e))
+            return JSONResponse(
+                {"error": f"Transcript translation failed: {e}"},
+                status_code=500,
+                headers={"X-Correlation-Id": correlation_id},
+            )
 
 
 if __name__ in {"__main__", "__mp_main__"}:

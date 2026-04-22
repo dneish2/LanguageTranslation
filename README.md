@@ -59,6 +59,13 @@ Demonstrate live voice translation by taking a short mic recording, turning it i
 2. Backend calls `translate_audio()` → Whisper (ASR) → GPT translate → TTS MP3.  
 3. Returns MP3; frontend sets `<audio src>` and displays original/translated text labels.
 
+**Voice UX Contract (desktop + mobile voice entry points):**
+1. **Record audio OR paste transcript** (transcript is the explicit fallback when recording is unavailable).
+2. **Translate** using the same action semantics across views.
+3. **Play/show output** (desktop plays audio + shows text; mobile voice flow shows translated text).
+
+Both voice views share the same status/debug progression language (`Ready`, `Requesting microphone access`, `Recording`, `Stopping`, `Processing`, `Translating transcript`, `Complete`) so behavior is intentional and consistent.
+
 **Error Handling (high level):**  
 - Empty upload → `400` with `X-Error`.  
 - Any pipeline failure → `500` with `X-Error` message.  
