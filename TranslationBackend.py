@@ -298,14 +298,14 @@ class TranslationBackend:
         text: str,
         target_language: str,
         correlation_id: str | None = None,
-        metrics: TranslationMetrics | None = None,
+        file_metrics: TranslationMetrics | None = None,
     ) -> str:
         try:
             return self.translate_text(
                 text,
                 target_language,
                 correlation_id=correlation_id,
-                file_metrics=metrics,
+                file_metrics=file_metrics,
             )
         except TypeError as error:
             if "unexpected keyword argument" not in str(error):
@@ -612,7 +612,7 @@ class TranslationBackend:
                                 original,
                                 target_language,
                                 correlation_id=correlation_id,
-                                metrics=metrics,
+                                file_metrics=metrics,
                             )
                             if do_translate else original
                         )
@@ -761,7 +761,7 @@ class TranslationBackend:
                         text,
                         target_language,
                         correlation_id=correlation_id,
-                        metrics=file_metrics,
+                        file_metrics=file_metrics,
                     )
                     tf.text = new_text
                     apply_formatting(tf)
@@ -785,7 +785,7 @@ class TranslationBackend:
                 original,
                 target_language,
                 correlation_id=correlation_id,
-                metrics=file_metrics,
+                file_metrics=file_metrics,
             )
             tf.text = new_text
             apply_formatting(tf)
@@ -896,7 +896,7 @@ class TranslationBackend:
                         original,
                         target_language,
                         correlation_id=correlation_id,
-                        metrics=metrics,
+                        file_metrics=metrics,
                     )
                 )
                 self.segment_map[seg_id]["translated"] = new_text
