@@ -64,9 +64,25 @@ class TranslationUI:
 
         # ── MOBILE FLOW ────────────────────────────────────────────────
         self.mobile_mode = False
-        self.mobile_input_mode = "upload"
+        self.input_mode = "Document"
+        self.mobile_input_mode = "Document"
+        self.source_language_input = None
+        self.target_language_input = None
+        self.text_source_input = None
         self.mobile_target_input = None
         self.mobile_voice_input = None
+        self.current_source_language = "English"
+        self.current_target_language = "Spanish"
+
+        # ── UI CONSISTENCY STANDARDS ───────────────────────────────────
+        self.button_primary_classes = "bg-blue-600 text-white px-4 py-2 rounded-lg shadow-sm"
+        self.button_secondary_classes = "bg-gray-200 text-gray-700 px-4 py-2 rounded-lg"
+        self.banner_classes = {
+            "info": "w-full rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-700",
+            "positive": "w-full rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700",
+            "negative": "w-full rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700",
+            "warning": "w-full rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700",
+        }
 
         # ── USAGE STATS ─────────────────────────────────────────────────
         self.current_count = 0
@@ -185,27 +201,29 @@ window.voiceUx = window.voiceUx || (() => {
     def main_page(self):
         self.mobile_mode = False
         self._inject_auto_device_routing("desktop")
-        # Header with a compact unified mode control
-        with ui.header().classes("items-center justify-between bg-gray-100 p-2"):
-            with ui.row().classes("w-full flex justify-between items-center"):
+        # Header with shallow navigation
+        with ui.header().classes("items-center justify-between bg-gray-100 px-3 py-2"):
+            with ui.row().classes("w-full justify-between items-center"):
                 ui.label("Translation App").classes("text-lg font-bold text-black")
-                self.top_mode_control = ui.toggle(
-                    {"standard": "Standard", "advanced": "Advanced", "voice": "Voice"},
-                    value=self._current_top_mode()
-                ).classes(self.top_nav_control_classes)
-                self.top_mode_control.on_value_change(self.handle_top_mode_change)
+                with ui.row().classes("items-center gap-2"):
+                    self.top_mode_control = ui.toggle(
+                        {"standard": "Default", "advanced": "Advanced"},
+                        value=self._current_top_mode()
+                    ).classes(self.top_nav_control_classes)
+                    self.top_mode_control.on_value_change(self.handle_top_mode_change)
+                    ui.button("Voice", on_click=lambda: ui.navigate.to("/voice")).classes(self.button_secondary_classes)
 
         # Drawer for recent docs
         self.drawer = ui.drawer(side='left').classes("bg-gray-50")
         with self.drawer:
             self.show_document_list()
 
-        # Main upload / progress / results / stats containers
-        with ui.column().classes("w-full h-full items-center justify-center p-4"):
-            self.upload_container = ui.column().classes("w-full max-w-3xl items-center")
-            self.progress_container = ui.column().classes("w-full max-w-3xl items-center")
-            self.result_container = ui.column().classes("w-full max-w-3xl items-center")
-            self.stats_container = ui.column().classes("w-full max-w-3xl items-center")
+        # Default workspace page
+        with ui.column().classes("w-full h-full items-center justify-start p-4"):
+            self.upload_container = ui.column().classes("w-full max-w-6xl")
+            self.progress_container = ui.column().classes("w-full max-w-6xl")
+            self.result_container = ui.column().classes("w-full max-w-6xl")
+            self.stats_container = ui.column().classes("w-full max-w-6xl")
             self.refresh_upload_ui()
 
         self.build_document_editor_dialog()
@@ -235,14 +253,19 @@ window.voiceUx = window.voiceUx || (() => {
             return
 
         selected_mode = event.value
-        if selected_mode == "voice":
-            self.sync_top_mode_control()
-            ui.navigate.to("/voice")
-            return
-
         should_enable_advanced = selected_mode == "advanced"
         if should_enable_advanced != self.advanced_mode:
             self.toggle_advanced_mode()
+
+    def _show_banner(self, container, message: str, kind: str = "info") -> None:
+        with container:
+            ui.label(message).classes(self.banner_classes.get(kind, self.banner_classes["info"]))
+
+    def swap_languages(self):
+        source = self.source_language_input.value if self.source_language_input else self.current_source_language
+        target = self.target_language_input.value if self.target_language_input else self.current_target_language
+        self.current_source_language, self.current_target_language = target, source
+        self.refresh_upload_ui()
 
     def build_document_editor_dialog(self):
         if self.document_editor_dialog is not None:
@@ -449,139 +472,84 @@ window.voiceUx = window.voiceUx || (() => {
         self.stats_container.clear()
         self.backend.segment_map.clear()
 
-        if self.mobile_mode:
-            self.render_mobile_flow()
+        self.render_unified_workspace()
+
+    def render_unified_workspace(self):
+        max_width = "max-w-md" if self.mobile_mode else "max-w-6xl"
+        with self.upload_container:
+            with ui.column().classes(f"w-full {max_width} gap-3"):
+                ui.label("Unified Translation Workspace").classes("text-xl font-semibold text-gray-800")
+                ui.label(
+                    "Use one workflow for text, document, and image/camera inputs. "
+                    "Realtime/OCR internals are plugged in next."
+                ).classes("text-sm text-gray-600")
+
+                with ui.row().classes("w-full items-end gap-2 flex-wrap rounded-lg border bg-white p-3"):
+                    self.source_language_input = ui.input(
+                        label="From",
+                        value=self.current_source_language or "English",
+                        placeholder="Source language",
+                    ).classes("min-w-[120px] flex-1")
+                    ui.button("⇄", on_click=self.swap_languages).classes(self.button_secondary_classes)
+                    self.target_language_input = ui.input(
+                        label="To",
+                        value=self.current_target_language or "Spanish",
+                        placeholder="Target language",
+                    ).classes("min-w-[120px] flex-1")
+
+                    mode_selector = ui.toggle(
+                        {"Text": "Text", "Document": "Document", "Image/Camera": "Image/Camera"},
+                        value=self.input_mode,
+                    ).classes("h-10 min-h-0 px-2 rounded-md")
+                    mode_selector.on("update:model-value", lambda e: self.set_mobile_input_mode(e.args))
+                    ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
+
+                with ui.grid(columns=1 if self.mobile_mode else 2).classes("w-full gap-3"):
+                    with ui.card().classes("w-full p-4 space-y-3"):
+                        ui.label("Source").classes("text-base font-semibold text-gray-700")
+                        self._render_source_input_panel()
+                    with ui.card().classes("w-full p-4 space-y-2"):
+                        ui.label("Translated output").classes("text-base font-semibold text-gray-700")
+                        self._show_banner(self.progress_container, "Status: Ready to translate.", "info")
+
+    def _render_source_input_panel(self):
+        if self.input_mode == "Text":
+            self.text_source_input = ui.textarea(
+                label="Enter text to translate",
+                placeholder="Type or paste text…",
+            ).props("autogrow rows=8").classes("w-full")
+            return
+        if self.input_mode == "Document":
+            ui.upload(
+                label="Click or drop DOCX, PPTX, or PDF",
+                multiple=False,
+                on_upload=self.handle_mobile_upload,
+            ).classes("w-full")
+            if self.uploaded_file_name:
+                ui.label(f"Selected file: {self.uploaded_file_name}").classes("text-sm text-gray-600")
             return
 
-        with self.upload_container:
-            ui.label("Upload a document (DOCX, PPTX, or PDF)")\
-                .style("font-size: 20px; color: #333; margin-bottom: 10px; text-align: center;")
-            ui.upload(
-                label="Click or drop a file here",
-                multiple=False,
-                on_upload=self.handle_upload
-            )
+        ui.label("Image/Camera input mode selected.").classes("text-sm text-gray-700")
+        ui.label("OCR + camera capture hooks will connect here in the realtime phase.").classes("text-sm text-gray-500")
 
     def mobile_page(self):
         self.mobile_mode = True
         self._inject_auto_device_routing("mobile")
         with ui.header().classes("items-center bg-white p-3 border-b"):
             with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Mobile Translation Flow").classes("text-base font-semibold")
-                ui.button("Desktop", on_click=lambda: ui.navigate.to("/"))                    .classes("bg-gray-200 text-gray-700 px-4 py-2 rounded")
+                ui.label("Mobile Translation").classes("text-base font-semibold")
+                ui.button("Desktop", on_click=lambda: ui.navigate.to("/")).classes(self.button_secondary_classes)
 
         with ui.column().classes("w-full items-center p-3"):
             self.upload_container = ui.column().classes("w-full max-w-md space-y-3")
-            self.progress_container = ui.column().classes("w-full max-w-md items-center space-y-2")
+            self.progress_container = ui.column().classes("w-full max-w-md space-y-2")
             self.result_container = ui.column().classes("w-full max-w-md space-y-3")
             self.stats_container = ui.column().classes("w-full max-w-md space-y-1")
             self.refresh_upload_ui()
 
-    def render_mobile_flow(self):
-        self._inject_voice_frontend_helpers()
-        with self.upload_container:
-            ui.label("1) Choose input").classes("text-sm font-semibold text-gray-700")
-            mode = ui.toggle({"upload": "Upload", "voice": "Voice"}, value=self.mobile_input_mode)                .classes("w-full")
-            mode.on("update:model-value", lambda e: self.set_mobile_input_mode(e.args))
-
-            ui.label("2) Select language").classes("text-sm font-semibold text-gray-700 mt-2")
-            self.mobile_target_input = ui.input(
-                label="Target language",
-                placeholder="e.g., Spanish",
-                value=self.current_target_language or ""
-            ).classes("w-full")
-
-            if self.mobile_input_mode == "upload":
-                ui.label("3) Upload a document").classes("text-sm font-semibold text-gray-700 mt-2")
-                ui.upload(
-                    label="Tap to pick DOCX, PPTX, or PDF",
-                    multiple=False,
-                    on_upload=self.handle_mobile_upload,
-                ).classes("w-full")
-                if self.uploaded_file_name:
-                    ui.label(f"Selected: {self.uploaded_file_name}").classes("text-sm text-gray-600")
-            else:
-                ui.label("3) Record audio or paste transcript").classes("text-sm font-semibold text-gray-700 mt-2")
-                self.mobile_voice_input = ui.textarea(
-                    label="Transcript (fallback)",
-                    placeholder="Record when available, or paste text here as fallback.",
-                ).props("id=mobile_voice_text autogrow").classes("w-full")
-                with ui.row().classes("w-full gap-2"):
-                    ui.html('<button id="mobile_voice_start_recording" type="button" '
-                            'class="w-full bg-emerald-600 text-white rounded-lg py-3 text-base font-semibold" '
-                            'onclick="startMobileVoiceRecording()">🎙️ Start Recording</button>')
-                    ui.html('<button id="mobile_voice_stop_recording" type="button" '
-                            'class="w-full bg-red-600 text-white rounded-lg py-3 text-base font-semibold" '
-                            'onclick="stopMobileVoiceRecording()" disabled>⏹️ Stop Recording</button>')
-                self._render_voice_status_block("mobile_voice")
-                ui.add_head_html("""
-<script>
-let mobileRecognition = null;
-
-function startMobileVoiceRecording() {
-    const input = document.getElementById('mobile_voice_text') || document.querySelector('textarea');
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-        window.voiceUx.setStatus('mobile_voice', 'Microphone unavailable. Use transcript fallback.');
-        window.voiceUx.setDebug('mobile_voice', 'SpeechRecognition API is not available.');
-        return;
-    }
-    mobileRecognition = new SR();
-    mobileRecognition.lang = 'en-US';
-    mobileRecognition.interimResults = false;
-    mobileRecognition.maxAlternatives = 1;
-    mobileRecognition.onstart = () => {
-        window.voiceUx.setStatus('mobile_voice', window.voiceUx.states.RECORDING);
-        window.voiceUx.setDebug('mobile_voice', 'Dictation started.');
-        window.voiceUx.setRecordingButtons('mobile_voice', true);
-    };
-    mobileRecognition.onresult = (event) => {
-        const text = event.results?.[0]?.[0]?.transcript || '';
-        if (input) {
-            input.value = text;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-        window.voiceUx.setDebug('mobile_voice', `Transcript length: ${text.length}`);
-    };
-    mobileRecognition.onerror = (event) => {
-        window.voiceUx.setStatus('mobile_voice', `Error: ${event.error || 'unknown error'}`);
-        window.voiceUx.setDebug('mobile_voice', 'Fallback available: paste transcript manually.');
-        window.voiceUx.setRecordingButtons('mobile_voice', false);
-    };
-    mobileRecognition.onend = () => {
-        window.voiceUx.setStatus('mobile_voice', 'Ready to translate');
-        window.voiceUx.setRecordingButtons('mobile_voice', false);
-    };
-    window.voiceUx.setStatus('mobile_voice', window.voiceUx.states.REQUESTING_AUDIO);
-    mobileRecognition.start();
-}
-
-function stopMobileVoiceRecording() {
-    if (!mobileRecognition) {
-        window.voiceUx.setDebug('mobile_voice', 'No active recording session.');
-        return;
-    }
-    window.voiceUx.setStatus('mobile_voice', window.voiceUx.states.STOPPING);
-    mobileRecognition.stop();
-}
-
-const initMobileVoiceUx = () => {
-    window.voiceUx.init('mobile_voice');
-    window.voiceUx.setDebug('mobile_voice', 'Use recording first. Transcript remains the fallback path.');
-};
-initMobileVoiceUx();
-window.addEventListener('load', initMobileVoiceUx);
-</script>
-                """)
-
-            ui.label("4) Translate").classes("text-sm font-semibold text-gray-700 mt-2")
-            ui.button("Translate", on_click=self.start_mobile_translation)                .classes("w-full bg-blue-600 text-white py-4 text-lg rounded-lg shadow")
-            if self.mobile_input_mode == "voice":
-                ui.label("Output includes translated text. Audio playback is available in desktop voice flow.")\
-                    .classes("text-xs text-gray-600")
-
     def set_mobile_input_mode(self, mode):
         self.mobile_input_mode = mode
+        self.input_mode = mode
         self.refresh_upload_ui()
 
     def handle_mobile_upload(self, event):
@@ -592,38 +560,46 @@ window.addEventListener('load', initMobileVoiceUx);
         self.refresh_upload_ui()
 
     def start_mobile_translation(self):
-        language = self.mobile_target_input.value if self.mobile_target_input else None
+        language = self.target_language_input.value if self.target_language_input else self.current_target_language
+        self.current_target_language = language
         if not language:
             self.show_error("Please enter a valid target language.")
             return
 
-        if self.mobile_input_mode == "upload":
+        if self.input_mode == "Document":
             if not self.uploaded_file:
                 self.show_error("Please upload a file before translating.")
                 return
             self.handle_translation(language)
             return
 
-        voice_text = (self.mobile_voice_input.value or "").strip() if self.mobile_voice_input else ""
-        if not voice_text:
-            self.show_error("Please record audio or paste a transcript before translating.")
+        if self.input_mode == "Image/Camera":
+            self.progress_container.clear()
+            self.result_container.clear()
+            self._show_banner(
+                self.result_container,
+                "Image/Camera mode is wired to the shared workspace. OCR/realtime processing will be added next.",
+                "warning",
+            )
             return
 
-        self.current_target_language = language
+        source_text = (self.text_source_input.value or "").strip() if self.text_source_input else ""
+        if not source_text:
+            self.show_error("Please provide source text before translating.")
+            return
+
         self.progress_container.clear()
         self.result_container.clear()
         self.stats_container.clear()
 
         progress_ui = ui.circular_progress(value=0, max=100, show_value=True).classes("mt-3")
-        label_ui = ui.label("Translating transcript...").classes("text-sm text-gray-700")
+        label_ui = ui.label("Translating text...").classes("text-sm text-gray-700")
         with self.progress_container:
             progress_ui
             label_ui
-        ui.run_javascript("window.voiceUx?.setStatus('mobile_voice', window.voiceUx.states.TRANSLATING_TEXT)")
-        ui.run_javascript("window.voiceUx?.setDebug('mobile_voice', 'Submitting transcript to translation model.')")
 
         def voice_task():
-            self._run_mobile_voice_translation(voice_text, language, progress_ui, label_ui)
+            self._run_mobile_voice_translation(source_text, language, progress_ui, label_ui)
 
         Thread(target=voice_task).start()
 
@@ -633,14 +609,12 @@ window.addEventListener('load', initMobileVoiceUx);
             label_ui.text = "Calling translation model..."
             translated = self.backend.translate_text(voice_text, language)
             progress_ui.set_value(100)
-            label_ui.text = "Complete: output ready."
-            ui.run_javascript("window.voiceUx?.setStatus('mobile_voice', window.voiceUx.states.COMPLETE)")
+            label_ui.text = "Translation complete."
             self.current_count = 1
             self.current_cost = 0.0
             self.show_mobile_voice_result(voice_text, translated, language)
         except Exception as ex:
             logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
-            ui.run_javascript(f"window.voiceUx?.setStatus('mobile_voice', {json.dumps(f'Error: {ex}')})")
             self.show_error(ex)
 
     def show_mobile_voice_result(self, original_text, translated_text, language):
@@ -661,7 +635,7 @@ window.addEventListener('load', initMobileVoiceUx);
                             f"navigator.clipboard.writeText({json.dumps(translated_text)})"
                         )
                     ).classes("w-full bg-blue-600 text-white py-3 text-base rounded-lg")
-                    ui.button("Start Over", on_click=self.refresh_upload_ui)                        .classes("w-full bg-gray-500 text-white py-3 text-base rounded-lg")
+                    ui.button("Start Over", on_click=self.refresh_upload_ui).classes("w-full bg-gray-500 text-white py-3 text-base rounded-lg")
 
     def handle_upload(self, event):
         # file picked → ask for language & PPTX options
@@ -1107,12 +1081,9 @@ window.addEventListener('load', initMobileVoiceUx);
             ui.notify(f"Save failed: {ex}", type="negative")
 
     def show_error(self, error):
-        # clear UI, then show error label
         self.result_container.clear()
         self.stats_container.clear()
-        with self.result_container:
-            ui.label(f"An error occurred: {error}")\
-              .style("font-size: 18px; color: #e53935;")
+        self._show_banner(self.result_container, f"Error: {error}", "negative")
 
     # ─────────────────────────────── VOICE TRANSLATION PAGE ─────────────────────────────────
 

@@ -85,6 +85,37 @@ Both voice views share the same status/debug progression language (`Ready`, `Req
      - Supports real-time feedback and correction workflows, allowing users to refine results with minimal friction.
      - Designed for accessibility and scalability across use cases.
 
+### Unified UX Contract (default workflow page)
+
+The default experience is now a **single workspace** used across desktop and mobile so upcoming realtime/OCR work does not fragment the UI.
+
+1. **One primary layout**
+   - Source panel on the left (or top on mobile).
+   - Translated output panel on the right (or bottom on mobile).
+   - Compact control bar with:
+     - language direction + swap
+     - one `Input Mode` selector
+     - one primary translation action button
+
+2. **Single Input Mode selector**
+   - `Text`
+   - `Document`
+   - `Image/Camera` (shared UI path now; OCR/camera internals can plug in later)
+   - All modes feed the same output/status/result area to preserve interaction consistency.
+
+3. **Shallow navigation**
+   - Keep specialized pages (e.g., advanced segment editing or voice page) where needed.
+   - Most users stay on the default unified workflow page.
+
+4. **Consistency standards (desktop + mobile)**
+   - Shared button system (primary/secondary visual language).
+   - Consistent spacing scale and card rhythm.
+   - Standardized status/loading/success/error banners.
+   - Reuse the same action/result semantics across input modes.
+
+5. **Regression safety**
+   - UI tests lock mode-switching semantics and translation entry behavior before realtime/OCR logic expands.
+
 ### Job Queue, Recovery, and Ops Metrics
 
 - **Bounded concurrency:** translation jobs run through a worker pool with a configurable max worker count.
