@@ -54,7 +54,9 @@ class TranslationUI:
         # ── DRAWER & ADVANCED MODE ──────────────────────────────────────
         self.drawer = None
         self.advanced_mode = False
-        self.advanced_button = None
+        self.top_mode_control = None
+        self._syncing_mode_control = False
+        self.top_nav_control_classes = "h-8 min-h-0 px-2 rounded-md"
         self.document_editor_dialog = None
         self.document_editor_container = None
         self.document_editor_inputs: dict[str, Any] = {}
@@ -118,19 +120,15 @@ class TranslationUI:
     def main_page(self):
         self.mobile_mode = False
         self._inject_auto_device_routing("desktop")
-        # Header with Advanced + Voice buttons
+        # Header with a compact unified mode control
         with ui.header().classes("items-center justify-between bg-gray-100 p-2"):
             with ui.row().classes("w-full flex justify-between items-center"):
                 ui.label("Translation App").classes("text-lg font-bold text-black")
-                with ui.row().classes("space-x-2"):
-                    self.advanced_button = ui.button(
-                        "Enable Advanced Mode",
-                        on_click=self.toggle_advanced_mode
-                    ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
-                    ui.button(
-                        "Live Voice Translation",
-                        on_click=lambda: ui.navigate.to("/voice")
-                    ).classes("bg-gray-200 text-gray-700 px-4 py-2 rounded shadow")
+                self.top_mode_control = ui.toggle(
+                    {"standard": "Standard", "advanced": "Advanced", "voice": "Voice"},
+                    value=self._current_top_mode()
+                ).classes(self.top_nav_control_classes)
+                self.top_mode_control.on_value_change(self.handle_top_mode_change)
 
         # Drawer for recent docs
         self.drawer = ui.drawer(side='left').classes("bg-gray-50")
@@ -150,13 +148,36 @@ class TranslationUI:
     def toggle_advanced_mode(self):
         self.advanced_mode = not self.advanced_mode
         if self.advanced_mode:
-            self.advanced_button.text = "Advanced Mode Enabled"
-            ui.notify("Advanced Mode activated! Segment editing features are now available.")
+            ui.notify("Advanced mode on.", type="positive")
         else:
-            self.advanced_button.text = "Enable Advanced Mode"
-            ui.notify("Advanced Mode disabled. Segment editing hidden.")
+            ui.notify("Advanced mode off.", type="info")
+        self.sync_top_mode_control()
         if self.original_segments_map:
             self.show_result()
+
+    def _current_top_mode(self) -> str:
+        return "advanced" if self.advanced_mode else "standard"
+
+    def sync_top_mode_control(self) -> None:
+        if not self.top_mode_control:
+            return
+        self._syncing_mode_control = True
+        self.top_mode_control.value = self._current_top_mode()
+        self._syncing_mode_control = False
+
+    def handle_top_mode_change(self, event) -> None:
+        if self._syncing_mode_control:
+            return
+
+        selected_mode = event.value
+        if selected_mode == "voice":
+            self.sync_top_mode_control()
+            ui.navigate.to("/voice")
+            return
+
+        should_enable_advanced = selected_mode == "advanced"
+        if should_enable_advanced != self.advanced_mode:
+            self.toggle_advanced_mode()
 
     def build_document_editor_dialog(self):
         if self.document_editor_dialog is not None:
