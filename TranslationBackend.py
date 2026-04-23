@@ -50,6 +50,17 @@ class TranslationJob:
     updated_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class TranslationRunState:
+    segment_map: dict[str, dict] = field(default_factory=dict)
+    current_file_type: str | None = None
+    current_document: Any | None = None
+    current_presentation: Any | None = None
+    current_pdf: Any | None = None
+    output_stream: BytesIO | None = None
+    pdf_overlay_ocg: Any | None = None
+
+
 def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
     payload: dict[str, Any] = {"event": event, **fields}
     if correlation_id:
@@ -68,13 +79,8 @@ class TranslationBackend:
         self.client = openai.OpenAI(api_key=self.api_key)
 
         self._manual_cancel_requested = False
-        self.segment_map: dict[str, dict] = {}
-        self.current_file_type = None
-        self.current_document = None
-        self.current_presentation = None
-        self.current_pdf = None
-        self.output_stream: BytesIO | None = None
-        self.pdf_overlay_ocg = None
+        self._active_run_state = TranslationRunState()
+        self._run_states: dict[str, TranslationRunState] = {}
         self.translation_cache: dict[tuple[str, str, str], str] = {}
         self.metrics = MetricsCollector()
         self.max_openai_attempts = 4
@@ -84,6 +90,46 @@ class TranslationBackend:
         self._jobs_lock = Lock()
         self._jobs: dict[str, TranslationJob] = {}
         self._job_results: dict[str, dict[str, Any]] = {}
+        self._result_handle_to_job_id: dict[str, str] = {}
+
+    @property
+    def segment_map(self) -> dict[str, dict]:
+        return self._active_run_state.segment_map
+
+    @property
+    def current_file_type(self):
+        return self._active_run_state.current_file_type
+
+    @property
+    def current_document(self):
+        return self._active_run_state.current_document
+
+    @property
+    def current_presentation(self):
+        return self._active_run_state.current_presentation
+
+    @property
+    def current_pdf(self):
+        return self._active_run_state.current_pdf
+
+    @property
+    def output_stream(self) -> BytesIO | None:
+        return self._active_run_state.output_stream
+
+    @property
+    def pdf_overlay_ocg(self):
+        return self._active_run_state.pdf_overlay_ocg
+
+    def _resolve_run_state(self, *, job_id: str | None = None, run_state: TranslationRunState | None = None) -> TranslationRunState:
+        if run_state is not None:
+            return run_state
+        if job_id is None:
+            return self._active_run_state
+        with self._jobs_lock:
+            return self._run_states.setdefault(job_id, TranslationRunState())
+
+    def _set_active_run_state(self, run_state: TranslationRunState) -> None:
+        self._active_run_state = run_state
 
     def _set_job_cancel_requested(self, job_id: str, requested: bool) -> None:
         with self._jobs_lock:
@@ -141,6 +187,7 @@ class TranslationBackend:
         )
         with self._jobs_lock:
             self._jobs[job_id] = job
+            self._run_states[job_id] = TranslationRunState()
 
         def worker():
             self._run_translation_job(
@@ -163,7 +210,25 @@ class TranslationBackend:
 
     def get_job_result(self, result_handle: str) -> dict[str, Any] | None:
         with self._jobs_lock:
-            return self._job_results.get(result_handle)
+            result = self._job_results.get(result_handle)
+            job_id = self._result_handle_to_job_id.get(result_handle)
+            if result is None or job_id is None:
+                return result
+            run_state = self._run_states.get(job_id)
+        if run_state is not None:
+            self._set_active_run_state(run_state)
+        return result
+
+    def get_run_state_for_job(self, job_id: str) -> TranslationRunState | None:
+        with self._jobs_lock:
+            return self._run_states.get(job_id)
+
+    def get_run_state_for_result(self, result_handle: str) -> TranslationRunState | None:
+        with self._jobs_lock:
+            job_id = self._result_handle_to_job_id.get(result_handle)
+            if job_id is None:
+                return None
+            return self._run_states.get(job_id)
 
     def cancel_job(self, job_id: str) -> bool:
         with self._jobs_lock:
@@ -219,6 +284,7 @@ class TranslationBackend:
         self._set_job_state(job_id, state=JOB_STATE_RUNNING, status_message="Starting translation...")
         file_metrics = MetricsCollector()
         try:
+            run_state = self._resolve_run_state(job_id=job_id)
             out_stream, count, tokens, text_accum, seg_map = self.translate_file(
                 input_stream=input_stream,
                 file_extension=file_extension,
@@ -229,6 +295,7 @@ class TranslationBackend:
                 correlation_id=correlation_id,
                 file_metrics=file_metrics,
                 job_id=job_id,
+                run_state=run_state,
                 progress_callback=lambda progress, message: self._set_job_state(
                     job_id,
                     progress=progress,
@@ -245,6 +312,7 @@ class TranslationBackend:
 
             result_handle = self.generate_segment_id()
             with self._jobs_lock:
+                self._result_handle_to_job_id[result_handle] = job_id
                 self._job_results[result_handle] = {
                     "output_stream": out_stream,
                     "count": count,
@@ -252,6 +320,7 @@ class TranslationBackend:
                     "text": text_accum,
                     "segment_map": seg_map,
                     "metrics": file_metrics.snapshot(),
+                    "job_id": job_id,
                 }
             self._set_job_state(
                 job_id,
@@ -487,14 +556,20 @@ class TranslationBackend:
         return any(ch.isalnum() for ch in stripped)
 
     # ───────────────────── OUTPUT REGENERATION ────────────────────────── #
-    def regenerate_output_stream(self) -> Optional[BytesIO]:
-        if self.current_file_type == "docx" and self.current_document:
-            out = BytesIO(); self.current_document.save(out); out.seek(0); self.output_stream = out
-        elif self.current_file_type == "pptx" and self.current_presentation:
-            out = BytesIO(); self.current_presentation.save(out); out.seek(0); self.output_stream = out
-        elif self.current_file_type == "pdf" and self.current_pdf:
-            out = BytesIO(); self.current_pdf.ez_save(out); out.seek(0); self.output_stream = out
-        return self.output_stream
+    def regenerate_output_stream(
+        self,
+        *,
+        job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
+    ) -> Optional[BytesIO]:
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
+        if state.current_file_type == "docx" and state.current_document:
+            out = BytesIO(); state.current_document.save(out); out.seek(0); state.output_stream = out
+        elif state.current_file_type == "pptx" and state.current_presentation:
+            out = BytesIO(); state.current_presentation.save(out); out.seek(0); state.output_stream = out
+        elif state.current_file_type == "pdf" and state.current_pdf:
+            out = BytesIO(); state.current_pdf.ez_save(out); out.seek(0); state.output_stream = out
+        return state.output_stream
 
     def _compute_pdf_block_css(self, text: str, bbox: fitz.Rect) -> str:
         """Estimate a legible font size for the block based on its bounding box."""
@@ -509,9 +584,17 @@ class TranslationBackend:
             "}"
         )
 
-    def _render_pdf_block(self, page: fitz.Page, bbox: fitz.Rect, text: str) -> str:
+    def _render_pdf_block(
+        self,
+        page: fitz.Page,
+        bbox: fitz.Rect,
+        text: str,
+        *,
+        run_state: TranslationRunState | None = None,
+    ) -> str:
         """Overwrite an existing PDF block and insert updated HTML content."""
-        oc = getattr(self, "pdf_overlay_ocg", None)
+        state = self._resolve_run_state(run_state=run_state)
+        oc = state.pdf_overlay_ocg
         safe_html = escape(text).replace("\n", "<br />") or "&nbsp;"
         css = self._compute_pdf_block_css(text, bbox)
         page.draw_rect(bbox, color=None, fill=WHITE, oc=oc)
@@ -525,10 +608,17 @@ class TranslationBackend:
         return css
 
 
-    def delete_segment(self, segment_id):
-        if segment_id not in self.segment_map:
+    def delete_segment(
+        self,
+        segment_id,
+        *,
+        job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
+    ):
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
+        if segment_id not in state.segment_map:
             raise ValueError(f"Segment ID {segment_id} not found.")
-        seg = self.segment_map[segment_id]
+        seg = state.segment_map[segment_id]
         seg_type = seg["type"]
         # DOCX paragraph or table cell
         if seg_type in ["paragraph", "table_cell"]:
@@ -543,9 +633,9 @@ class TranslationBackend:
         elif seg_type == "pdf_block":
             # seg["page_idx"] is the zero-based page index
             # seg["bbox"] is a fitz.Rect
-            if hasattr(self, "current_pdf") and self.current_pdf:
-                oc = getattr(self, "pdf_overlay_ocg", None)
-                page = self.current_pdf[seg["page_idx"]]
+            if state.current_pdf:
+                oc = state.pdf_overlay_ocg
+                page = state.current_pdf[seg["page_idx"]]
                 page.draw_rect(seg["bbox"], color=None, fill=WHITE, oc=oc)
             else:
                 logging.warning(f"[Backend] No current_pdf to delete PDF block {segment_id}")
@@ -555,9 +645,9 @@ class TranslationBackend:
             logging.warning(f"[Backend] delete_segment: unhandled segment type '{seg_type}' for ID {segment_id}")
 
         # Remove from map and regenerate output
-        del self.segment_map[segment_id]
-        logging.info(f"[Backend] {segment_id[:8]} removed; {len(self.segment_map)} segments remain.")
-        self.regenerate_output_stream()
+        del state.segment_map[segment_id]
+        logging.info(f"[Backend] {segment_id[:8]} removed; {len(state.segment_map)} segments remain.")
+        self.regenerate_output_stream(run_state=state)
 
     # ------------------
     # PROCESSING DOCX
@@ -572,15 +662,20 @@ class TranslationBackend:
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
         job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
         self.reset_cancel(job_id)
         metrics = file_metrics or self.metrics
         metrics.start_file(file_type="docx", correlation_id=correlation_id)
         doc = Document(input_stream)
-        self.current_file_type = 'docx'
-        self.current_document = doc
-        self.pdf_overlay_ocg = None
+        state.current_file_type = 'docx'
+        state.current_document = doc
+        state.current_presentation = None
+        state.current_pdf = None
+        state.pdf_overlay_ocg = None
+        state.segment_map.clear()
 
         total_elements = len(doc.paragraphs) + sum(len(t.rows)*len(t.columns) for t in doc.tables)
         processed = 0
@@ -602,7 +697,7 @@ class TranslationBackend:
             para.text = new_text
             text_accum += new_text + "\n"
             seg_id = self.generate_segment_id()
-            self.segment_map[seg_id] = {
+            state.segment_map[seg_id] = {
                 "type": "paragraph",
                 "location": f"docx:paragraph:{idx}",
                 "original": original,
@@ -650,7 +745,7 @@ class TranslationBackend:
                         para.text = new_text
                         text_accum += new_text + "\n"
                         seg_id = self.generate_segment_id()
-                        self.segment_map[seg_id] = {
+                        state.segment_map[seg_id] = {
                             "type": "table_cell",
                             "location": f"docx:table:{t_idx}:row:{r_idx}:col:{c_idx}:para:{p_idx}",
                             "original": original,
@@ -672,14 +767,14 @@ class TranslationBackend:
         out_stream = BytesIO()
         doc.save(out_stream)
         out_stream.seek(0)
-        self.output_stream = out_stream
+        state.output_stream = out_stream
         tokens = self.calculate_tokens(text_accum)
         metrics.finish_file(
             file_type="docx",
             segment_count=processed,
             duration_seconds=time.time() - start_time,
         )
-        return out_stream, processed, tokens, text_accum, self.segment_map
+        return out_stream, processed, tokens, text_accum, state.segment_map
 
     # ------------------
     # PROCESSING PPTX
@@ -696,15 +791,20 @@ class TranslationBackend:
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
         job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
         metrics = file_metrics or self.metrics
         self.reset_cancel(job_id)
         metrics.start_file(file_type="pptx", correlation_id=correlation_id)
         prs = Presentation(input_stream)
-        self.current_file_type = 'pptx'
-        self.current_presentation = prs
-        self.pdf_overlay_ocg = None
+        state.current_file_type = 'pptx'
+        state.current_document = None
+        state.current_presentation = prs
+        state.current_pdf = None
+        state.pdf_overlay_ocg = None
+        state.segment_map.clear()
 
         total_elements = sum(len(slide.shapes) for slide in prs.slides)
         processed = 0
@@ -734,7 +834,7 @@ class TranslationBackend:
 
                 # record in segment_map
                 seg_id = self.generate_segment_id()
-                self.segment_map[seg_id] = {
+                state.segment_map[seg_id] = {
                     "type": "pptx_shape",
                     "location": f"pptx:slide:{s_idx}:shape:{sh_idx}",
                     "original": original_text,
@@ -758,14 +858,14 @@ class TranslationBackend:
         out_stream = BytesIO()
         prs.save(out_stream)
         out_stream.seek(0)
-        self.output_stream = out_stream
+        state.output_stream = out_stream
         tokens = self.calculate_tokens(text_accum)
         metrics.finish_file(
             file_type="pptx",
             segment_count=processed,
             duration_seconds=time.time() - start_time,
         )
-        return out_stream, processed, tokens, text_accum, self.segment_map
+        return out_stream, processed, tokens, text_accum, state.segment_map
 
     def _translate_shape(
         self,
@@ -877,15 +977,20 @@ class TranslationBackend:
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
         job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
         metrics = file_metrics or self.metrics
         metrics.start_file(file_type="pdf", correlation_id=correlation_id)
         logging.info("[PDF] Opening document for translation")
         doc = fitz.open(stream=input_stream, filetype="pdf")
-        self.current_file_type = 'pdf'
-        self.current_pdf = doc
-        self.pdf_overlay_ocg = None
+        state.current_file_type = 'pdf'
+        state.current_document = None
+        state.current_presentation = None
+        state.current_pdf = doc
+        state.pdf_overlay_ocg = None
+        state.segment_map.clear()
 
         # 1) Build page_blocks with proper text extraction
         total_blocks = 0
@@ -919,7 +1024,7 @@ class TranslationBackend:
         # 2) Prepare for translation overlays
         processed = 0
         start_time = time.time()
-        self.pdf_overlay_ocg = doc.add_ocg("Translated", on=True)
+        state.pdf_overlay_ocg = doc.add_ocg("Translated", on=True)
 
         # 3) Translate & redraw each block
         for p_idx, (page, blocks) in enumerate(zip(doc, page_blocks), start=1):
@@ -930,7 +1035,7 @@ class TranslationBackend:
                 bbox = blk["bbox"]
                 original = blk["text"]
                 seg_id = self.generate_segment_id()
-                self.segment_map[seg_id] = {
+                state.segment_map[seg_id] = {
                     "type": "pdf_block",
                     "page_idx": p_idx-1,
                     "bbox": bbox,
@@ -950,10 +1055,10 @@ class TranslationBackend:
                         file_metrics=metrics,
                     )
                 )
-                self.segment_map[seg_id]["translated"] = new_text
+                state.segment_map[seg_id]["translated"] = new_text
 
-                last_css = self._render_pdf_block(page, bbox, new_text)
-                self.segment_map[seg_id]["last_css"] = last_css
+                last_css = self._render_pdf_block(page, bbox, new_text, run_state=state)
+                state.segment_map[seg_id]["last_css"] = last_css
                 logging.debug(f"[PDF] Translated segment {seg_id[:8]}")
 
                 processed += 1
@@ -973,7 +1078,7 @@ class TranslationBackend:
         doc.subset_fonts()
         doc.ez_save(out_stream)
         out_stream.seek(0)
-        self.output_stream = out_stream
+        state.output_stream = out_stream
 
         tokens = self.calculate_tokens("")  # or track actual text if desired
         logging.info(f"[PDF] Done – {processed}/{total_blocks} blocks processed, tokens={tokens}")
@@ -982,7 +1087,7 @@ class TranslationBackend:
             segment_count=processed,
             duration_seconds=time.time() - start_time,
         )
-        return out_stream, processed, tokens, "", self.segment_map
+        return out_stream, processed, tokens, "", state.segment_map
 
     # ------------------
     # PROGRESS
@@ -1011,11 +1116,22 @@ class TranslationBackend:
     # ------------------
     # UPDATE SEGMENT
     # ------------------
-    def update_segment(self, segment_id, new_text, target_language, instructions=None, regenerate=True):
-        if segment_id not in self.segment_map:
+    def update_segment(
+        self,
+        segment_id,
+        new_text,
+        target_language,
+        instructions=None,
+        regenerate=True,
+        *,
+        job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
+    ):
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
+        if segment_id not in state.segment_map:
             raise ValueError(f"Segment ID {segment_id} not found.")
 
-        seg = self.segment_map[segment_id]
+        seg = state.segment_map[segment_id]
         new_text = new_text.replace('\t', ' ').strip()
         if instructions:
             updated = self.translate_text_with_instructions(new_text, target_language, instructions)
@@ -1032,15 +1148,15 @@ class TranslationBackend:
             if "object" in seg and hasattr(seg["object"], "text_frame") and seg["object"].text_frame:
                 seg["object"].text_frame.text = updated
         elif seg_type == "pdf_block":
-            if not self.current_pdf:
+            if not state.current_pdf:
                 raise ValueError("No active PDF document for update.")
-            page = self.current_pdf[seg["page_idx"]]
-            last_css = self._render_pdf_block(page, seg["bbox"], updated)
+            page = state.current_pdf[seg["page_idx"]]
+            last_css = self._render_pdf_block(page, seg["bbox"], updated, run_state=state)
             seg["last_css"] = last_css
 
         logging.info(f"[Backend] Updated segment {segment_id} with new translation length {len(updated)}")
         if regenerate:
-            self.regenerate_output_stream()
+            self.regenerate_output_stream(run_state=state)
         return updated
 
     # ------------------
@@ -1059,11 +1175,15 @@ class TranslationBackend:
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
         job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
         self.reset_cancel(job_id)
         self.current_target_language = target_language
         metrics = file_metrics or self.metrics
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
+        if job_id is None and run_state is None:
+            state = TranslationRunState()
         _log_event(
             "translation.file_started",
             correlation_id=correlation_id,
@@ -1082,6 +1202,7 @@ class TranslationBackend:
                 correlation_id=correlation_id,
                 file_metrics=metrics,
                 job_id=job_id,
+                run_state=state,
                 progress_callback=progress_callback,
             )
         elif ext == "pptx":
@@ -1096,6 +1217,7 @@ class TranslationBackend:
                 correlation_id=correlation_id,
                 file_metrics=metrics,
                 job_id=job_id,
+                run_state=state,
                 progress_callback=progress_callback,
             )
         elif ext == "pdf":
@@ -1108,10 +1230,12 @@ class TranslationBackend:
                 correlation_id=correlation_id,
                 file_metrics=metrics,
                 job_id=job_id,
+                run_state=state,
                 progress_callback=progress_callback,
             )
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
+        self._set_active_run_state(state)
         _log_event(
             "translation.file_finished",
             correlation_id=correlation_id,
