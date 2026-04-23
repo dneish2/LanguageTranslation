@@ -47,6 +47,32 @@ def test_translate_text_cache_hit_uses_normalized_key(monkeypatch):
     assert stub.calls == 1
 
 
+def test_translate_text_normalization_deduplicates_equivalent_inputs(monkeypatch):
+    backend = _build_backend(monkeypatch)
+    stub = _StubChatCreate(responses=["Bonjour monde"])
+    monkeypatch.setattr(backend.client.chat.completions, "create", stub)
+
+    first = backend.translate_text(" Hello\t world ", " French ")
+    second = backend.translate_text("Hello   world", "french")
+
+    assert first == "Bonjour monde"
+    assert second == "Bonjour monde"
+    assert stub.calls == 1
+
+
+def test_translate_text_cache_metrics_not_double_counted(monkeypatch):
+    backend = _build_backend(monkeypatch)
+    stub = _StubChatCreate(responses=["Ciao mondo"])
+    monkeypatch.setattr(backend.client.chat.completions, "create", stub)
+
+    backend.translate_text("Hello world", "Italian")
+    backend.translate_text("  Hello\tworld  ", " italian ")
+
+    assert backend.metrics.cache_misses == 1
+    assert backend.metrics.cache_hits == 1
+    assert stub.calls == 1
+
+
 def test_instruction_translation_cache_hit_uses_mode_and_instructions(monkeypatch):
     backend = _build_backend(monkeypatch)
     stub = _StubChatCreate(responses=["Veuillez reformuler"])

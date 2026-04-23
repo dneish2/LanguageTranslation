@@ -349,10 +349,11 @@ class TranslationBackend:
         if not text:
             return text
         metrics = file_metrics or self.metrics
-        cache_key = (target_language, text)
-        if cache_key in self.translation_cache:
-            cached = self.translation_cache[cache_key]
+        cache_key = self._normalize_cache_key(text, target_language, mode="translate")
+        cached = self.translation_cache.get(cache_key)
+        if cached is not None:
             metrics.record_cache_hit()
+            logging.info("[Backend] translate_text cache hit for target=%s", target_language)
             _log_event(
                 "translation.cache_hit",
                 correlation_id=correlation_id,
@@ -361,12 +362,6 @@ class TranslationBackend:
             )
             return cached
         metrics.record_cache_miss()
-
-        cache_key = self._normalize_cache_key(text, target_language, mode="translate")
-        cached = self.translation_cache.get(cache_key)
-        if cached is not None:
-            logging.info("[Backend] translate_text cache hit for target=%s", target_language)
-            return cached
 
         prompt = (
             f"Translate the following text to {target_language}, preserving meaning and context. "
