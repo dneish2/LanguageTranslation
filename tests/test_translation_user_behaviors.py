@@ -248,3 +248,57 @@ def test_cancel_one_job_does_not_cancel_other_concurrent_job(monkeypatch):
     assert canceled_job.state == "canceled"
     assert surviving_job is not None
     assert surviving_job.state == "succeeded"
+
+
+def test_parallel_jobs_keep_isolated_run_state_and_outputs(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = TranslationBackend()
+
+    def fake_translate_file(**kwargs):
+        job_id = kwargs["job_id"]
+        run_state = kwargs["run_state"]
+        run_state.current_file_type = "docx"
+        run_state.segment_map[f"seg-{job_id}"] = {
+            "type": "paragraph",
+            "original": f"orig-{job_id}",
+            "translated": f"translated-{job_id}",
+        }
+        run_state.output_stream = BytesIO(f"output-{job_id}".encode())
+        time.sleep(0.02)
+        return run_state.output_stream, 1, 0, f"text-{job_id}", run_state.segment_map
+
+    monkeypatch.setattr(backend, "translate_file", fake_translate_file)
+
+    job_a = backend.start_translation_job(
+        input_stream=BytesIO(b"input-a"),
+        file_extension="docx",
+        target_language="Spanish",
+    )
+    job_b = backend.start_translation_job(
+        input_stream=BytesIO(b"input-b"),
+        file_extension="docx",
+        target_language="French",
+    )
+
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        a = backend.get_job(job_a)
+        b = backend.get_job(job_b)
+        if a and b and a.state == "succeeded" and b.state == "succeeded":
+            break
+        time.sleep(0.01)
+
+    a = backend.get_job(job_a)
+    b = backend.get_job(job_b)
+    assert a is not None and a.result_handle is not None
+    assert b is not None and b.result_handle is not None
+
+    result_a = backend.get_job_result(a.result_handle)
+    result_b = backend.get_job_result(b.result_handle)
+    assert result_a is not None
+    assert result_b is not None
+
+    assert result_a["segment_map"] == {f"seg-{job_a}": {"type": "paragraph", "original": f"orig-{job_a}", "translated": f"translated-{job_a}"}}
+    assert result_b["segment_map"] == {f"seg-{job_b}": {"type": "paragraph", "original": f"orig-{job_b}", "translated": f"translated-{job_b}"}}
+    assert result_a["output_stream"].getvalue() == f"output-{job_a}".encode()
+    assert result_b["output_stream"].getvalue() == f"output-{job_b}".encode()
