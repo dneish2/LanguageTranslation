@@ -43,10 +43,11 @@ def _build_mobile_ui() -> TranslationUI:
 
 
 def test_mobile_upload_happy_path_invokes_translation():
-    """Primary mobile happy path: upload + language kicks off translation."""
+    """Unified workflow: Document mode + language should kick off translation."""
     ui_app = _build_mobile_ui()
-    ui_app.mobile_input_mode = "upload"
-    ui_app.mobile_target_input = DummyInput("Spanish")
+    ui_app.input_mode = "Document"
+    ui_app.mobile_input_mode = "Document"
+    ui_app.target_language_input = DummyInput("Spanish")
     ui_app.uploaded_file = BytesIO(b"doc")
 
     called = {}
@@ -61,10 +62,11 @@ def test_mobile_upload_happy_path_invokes_translation():
 
 
 def test_mobile_upload_error_path_requires_file():
-    """Primary mobile error path: translate with no file shows guidance."""
+    """Unified workflow: document mode still requires an uploaded file."""
     ui_app = _build_mobile_ui()
-    ui_app.mobile_input_mode = "upload"
-    ui_app.mobile_target_input = DummyInput("French")
+    ui_app.input_mode = "Document"
+    ui_app.mobile_input_mode = "Document"
+    ui_app.target_language_input = DummyInput("French")
     ui_app.uploaded_file = None
 
     errors = []
@@ -75,8 +77,11 @@ def test_mobile_upload_error_path_requires_file():
     assert errors == ["Please upload a file before translating."]
 
 
-def test_mobile_voice_happy_path_updates_progress_and_result(monkeypatch):
+def test_text_mode_happy_path_updates_progress_and_result(monkeypatch):
     ui_app = _build_mobile_ui()
+    ui_app.input_mode = "Text"
+    ui_app.target_language_input = DummyInput("German")
+    ui_app.text_source_input = DummyInput("hello")
     progress = DummyProgress()
     label = DummyLabel()
 
@@ -100,15 +105,27 @@ def test_mobile_voice_happy_path_updates_progress_and_result(monkeypatch):
     }
 
 
-def test_mobile_voice_error_path_requires_transcript():
+def test_text_mode_error_path_requires_text():
     ui_app = _build_mobile_ui()
-    ui_app.mobile_input_mode = "voice"
-    ui_app.mobile_target_input = DummyInput("German")
-    ui_app.mobile_voice_input = DummyInput("   ")
+    ui_app.input_mode = "Text"
+    ui_app.target_language_input = DummyInput("German")
+    ui_app.text_source_input = DummyInput("   ")
 
     errors = []
     ui_app.show_error = lambda message: errors.append(str(message))
 
     ui_app.start_mobile_translation()
 
-    assert errors == ["Please provide voice transcript text before translating."]
+    assert errors == ["Please provide source text before translating."]
+
+
+def test_mode_switch_syncs_mobile_and_unified_mode():
+    ui_app = _build_mobile_ui()
+    refresh_calls = {"count": 0}
+    ui_app.refresh_upload_ui = lambda: refresh_calls.__setitem__("count", refresh_calls["count"] + 1)
+
+    ui_app.set_mobile_input_mode("Image/Camera")
+
+    assert ui_app.mobile_input_mode == "Image/Camera"
+    assert ui_app.input_mode == "Image/Camera"
+    assert refresh_calls["count"] == 1
