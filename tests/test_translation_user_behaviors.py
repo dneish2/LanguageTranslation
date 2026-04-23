@@ -112,6 +112,42 @@ def test_segment_update_modifies_regenerated_output(monkeypatch):
     assert regenerated.paragraphs[0].text == "Contenido actualizado"
 
 
+def test_translate_file_resets_segment_state_between_runs(monkeypatch):
+    """Sequential runs on one backend should not keep prior segment IDs."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = TranslationBackend()
+    monkeypatch.setattr(backend, "translate_text", lambda text, target_language, **_kwargs: f"{target_language}:{text}")
+    monkeypatch.setattr(backend, "calculate_tokens", lambda _text: 0)
+
+    first_stream = BytesIO(_docx_bytes("First run paragraph"))
+    _out1, _count1, _tokens1, _text1, first_map = backend.translate_file(
+        input_stream=first_stream,
+        file_extension="docx",
+        target_language="Spanish",
+        progress_ui=DummyProgress(),
+        label_ui=DummyLabel(),
+        processed=False,
+    )
+
+    first_ids = set(first_map.keys())
+    assert len(first_ids) == 1
+
+    second_stream = BytesIO(_docx_bytes("Second run paragraph", "Second run paragraph 2"))
+    _out2, _count2, _tokens2, _text2, second_map = backend.translate_file(
+        input_stream=second_stream,
+        file_extension="docx",
+        target_language="French",
+        progress_ui=DummyProgress(),
+        label_ui=DummyLabel(),
+        processed=False,
+    )
+
+    second_ids = set(second_map.keys())
+    assert len(second_ids) == 2
+    assert first_ids.isdisjoint(second_ids)
+    assert len(backend.segment_map) == 2
+
+
 def test_translate_fallback_returns_original_on_openai_exception(monkeypatch):
     """If OpenAI fails, user still receives their original text."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")

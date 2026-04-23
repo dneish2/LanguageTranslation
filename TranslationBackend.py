@@ -1179,6 +1179,12 @@ class TranslationBackend:
         progress_callback: Callable[[float, str], None] | None = None,
     ):
         self.reset_cancel(job_id)
+        # Per-run state must not leak across sequential requests.
+        self.segment_map.clear()
+        self.current_document = None
+        self.current_presentation = None
+        self.current_pdf = None
+        self.pdf_overlay_ocg = None
         self.current_target_language = target_language
         metrics = file_metrics or self.metrics
         state = self._resolve_run_state(job_id=job_id, run_state=run_state)
