@@ -129,3 +129,18 @@ def test_mode_switch_syncs_mobile_and_unified_mode():
     assert ui_app.mobile_input_mode == "Image/Camera"
     assert ui_app.input_mode == "Image/Camera"
     assert refresh_calls["count"] == 1
+
+
+def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
+    source = Path("TranslationUI.py").read_text()
+
+    assert "document.getElementById('status_label')" not in source
+    assert "document.getElementById('debug_info')" not in source
+    assert "document.getElementById('start_btn')" not in source
+    assert "document.getElementById('stop_btn')" not in source
+    assert "const DESKTOP_SCOPE = 'desktop_voice';" in source
+    assert "window.voiceUx.setStatus(DESKTOP_SCOPE, msg);" in source
+    assert "window.voiceUx.setDebug(DESKTOP_SCOPE, msg);" in source
+    assert "window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, recording);" in source
+    assert "document.getElementById('desktop_voice_start_recording')" in source
+    assert "document.getElementById('desktop_voice_stop_recording')" in source

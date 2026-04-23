@@ -1137,27 +1137,29 @@ window.voiceUx = window.voiceUx || (() => {
 <script>
     let recorder = null, stream = null, chunks = [], isRecording = false;
     let selectedMimeType = null;
+    const DESKTOP_SCOPE = 'desktop_voice';
 
     function updateStatus(msg) {
-        let e = document.getElementById('status_label');
-        if (e) e.textContent = msg;
+        window.voiceUx.setStatus(DESKTOP_SCOPE, msg);
     }
     function updateDebug(msg) {
-        let e = document.getElementById('debug_info');
-        if (e) e.textContent = msg;
+        window.voiceUx.setDebug(DESKTOP_SCOPE, msg);
     }
     function updateButtons(recording) {
-        let start = document.getElementById('start_btn'),
-            stop  = document.getElementById('stop_btn');
-        if (start) { start.disabled = recording; start.style.opacity = recording?'0.5':'1'; }
-        if (stop)  { stop.disabled  = !recording; stop.style.opacity = recording?'1':'0.5'; }
+        window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, recording);
         isRecording = recording;
     }
     function setRecordingControlsEnabled(enabled) {
-        let start = document.getElementById('start_btn'),
-            stop  = document.getElementById('stop_btn');
-        if (start) { start.disabled = !enabled; start.style.opacity = enabled ? '1' : '0.5'; }
-        if (stop)  { stop.disabled  = true; stop.style.opacity = '0.5'; }
+        const start = document.getElementById('desktop_voice_start_recording');
+        const stop = document.getElementById('desktop_voice_stop_recording');
+        if (start) {
+            start.disabled = !enabled;
+            start.style.opacity = enabled ? '1' : '0.5';
+        }
+        if (stop) {
+            stop.disabled = true;
+            stop.style.opacity = '0.5';
+        }
         if (!enabled) isRecording = false;
     }
 
@@ -1233,13 +1235,13 @@ window.voiceUx = window.voiceUx || (() => {
 
     async function stopRecording() {
         if(!recorder || recorder.state!=='recording') {
-            window.voiceUx.setDebug('desktop_voice', 'No active recording session.');
+            window.voiceUx.setDebug(DESKTOP_SCOPE, 'No active recording session.');
             return;
         }
-        window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.STOPPING);
-        window.voiceUx.setRecordingButtons('desktop_voice', false);
+        window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.STOPPING);
+        window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, false);
         recorder.onstop = async () => {
-            window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.PROCESSING_AUDIO);
+            window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.PROCESSING_AUDIO);
             const blob = new Blob(chunks, { type: recorder.mimeType });
             let lang = document.getElementById('language_select')?.value || 'es';
             let fd = new FormData();
@@ -1257,11 +1259,11 @@ window.voiceUx = window.voiceUx || (() => {
                     let url = URL.createObjectURL(audio);
                     let player = document.getElementById('out_audio');
                     player.src = url; player.play();
-                    window.voiceUx.setStatus('desktop_voice', window.voiceUx.states.COMPLETE);
+                    window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
                 }
             } catch(e) {
-                window.voiceUx.setStatus('desktop_voice', "Error: " + e.message);
-                window.voiceUx.setDebug('desktop_voice', e.message);
+                window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
+                window.voiceUx.setDebug(DESKTOP_SCOPE, e.message);
             } finally {
                 if(stream) stream.getTracks().forEach(t=>t.stop());
                 recorder = null; chunks = [];
