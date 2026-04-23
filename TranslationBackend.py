@@ -67,7 +67,7 @@ class TranslationBackend:
             raise ValueError("OPENAI_API_KEY not set.")
         self.client = openai.OpenAI(api_key=self.api_key)
 
-        self.cancel_requested = False
+        self._manual_cancel_requested = False
         self.segment_map: dict[str, dict] = {}
         self.current_file_type = None
         self.current_document = None
@@ -85,12 +85,35 @@ class TranslationBackend:
         self._jobs: dict[str, TranslationJob] = {}
         self._job_results: dict[str, dict[str, Any]] = {}
 
-    def reset_cancel(self) -> None:
-        self.cancel_requested = False
+    def _set_job_cancel_requested(self, job_id: str, requested: bool) -> None:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.metadata["cancel_requested"] = requested
+            job.updated_at = time.time()
 
-    def request_cancel(self) -> None:
-        self.cancel_requested = True
+    def reset_cancel(self, job_id: str | None = None) -> None:
+        if job_id is None:
+            self._manual_cancel_requested = False
+            return
+        self._set_job_cancel_requested(job_id, False)
+
+    def request_cancel(self, job_id: str | None = None) -> None:
+        if job_id is None:
+            self._manual_cancel_requested = True
+        else:
+            self._set_job_cancel_requested(job_id, True)
         logging.info("[Backend] Cancel requested.")
+
+    def _is_cancel_requested(self, job_id: str | None = None) -> bool:
+        if job_id is None:
+            return self._manual_cancel_requested
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            return bool(job.metadata.get("cancel_requested")) or job.state == JOB_STATE_CANCELED
 
     def start_translation_job(
         self,
@@ -151,8 +174,8 @@ class TranslationBackend:
                 return False
             job.state = JOB_STATE_CANCELED
             job.status_message = "Cancel requested."
+            job.metadata["cancel_requested"] = True
             job.updated_at = time.time()
-        self.request_cancel()
         return True
 
     def _set_job_state(
@@ -205,13 +228,14 @@ class TranslationBackend:
                 autofit=autofit,
                 correlation_id=correlation_id,
                 file_metrics=file_metrics,
+                job_id=job_id,
                 progress_callback=lambda progress, message: self._set_job_state(
                     job_id,
                     progress=progress,
                     status_message=message,
                 ),
             )
-            if self.cancel_requested:
+            if self._is_cancel_requested(job_id):
                 self._set_job_state(
                     job_id,
                     state=JOB_STATE_CANCELED,
@@ -547,9 +571,10 @@ class TranslationBackend:
         do_translate=True,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        job_id: str | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
-        self.reset_cancel()
+        self.reset_cancel(job_id)
         metrics = file_metrics or self.metrics
         metrics.start_file(file_type="docx", correlation_id=correlation_id)
         doc = Document(input_stream)
@@ -567,7 +592,7 @@ class TranslationBackend:
             original = para.text.strip()
             if not original:
                 continue
-            if self.cancel_requested:
+            if self._is_cancel_requested(job_id):
                 break
             seg_start = time.time()
             new_text = (
@@ -598,13 +623,19 @@ class TranslationBackend:
 
         # Table cells
         for t_idx, table in enumerate(doc.tables):
+            if self._is_cancel_requested(job_id):
+                break
             for r_idx, row in enumerate(table.rows):
+                if self._is_cancel_requested(job_id):
+                    break
                 for c_idx, cell in enumerate(row.cells):
+                    if self._is_cancel_requested(job_id):
+                        break
                     for p_idx, para in enumerate(cell.paragraphs):
                         original = para.text.strip()
                         if not original:
                             continue
-                        if self.cancel_requested:
+                        if self._is_cancel_requested(job_id):
                             break
                         seg_start = time.time()
                         new_text = (
@@ -664,10 +695,11 @@ class TranslationBackend:
         autofit=False,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        job_id: str | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
         metrics = file_metrics or self.metrics
-        self.reset_cancel()
+        self.reset_cancel(job_id)
         metrics.start_file(file_type="pptx", correlation_id=correlation_id)
         prs = Presentation(input_stream)
         self.current_file_type = 'pptx'
@@ -682,12 +714,20 @@ class TranslationBackend:
         for s_idx, slide in enumerate(prs.slides):
             for sh_idx, shape in enumerate(slide.shapes):
                 original_text = self._get_shape_text(shape).strip()
-                if not original_text or self.cancel_requested:
+                if not original_text or self._is_cancel_requested(job_id):
                     continue
 
                 if do_translate:
                     seg_start = time.time()
-                    new_text = self._translate_shape(shape, target_language, font_size, autofit, correlation_id, metrics)
+                    new_text = self._translate_shape(
+                        shape,
+                        target_language,
+                        font_size,
+                        autofit,
+                        correlation_id,
+                        metrics,
+                        job_id=job_id,
+                    )
                     metrics.add_segment_duration(time.time() - seg_start)
                 else:
                     new_text = original_text
@@ -735,6 +775,7 @@ class TranslationBackend:
         autofit=False,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        job_id: str | None = None,
     ):
         def apply_formatting(tf):
             # 1) Set every paragraph & run to the user’s max size
@@ -753,7 +794,11 @@ class TranslationBackend:
 
         if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
             for row in shape.table.rows:
+                if self._is_cancel_requested(job_id):
+                    break
                 for cell in row.cells:
+                    if self._is_cancel_requested(job_id):
+                        break
                     tf = cell.text_frame
                     if not tf: continue
                     text = tf.text.strip()
@@ -769,6 +814,8 @@ class TranslationBackend:
 
         elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
             for sub in shape.shapes:
+                if self._is_cancel_requested(job_id):
+                    break
                 result += self._translate_shape(
                     sub,
                     target_language,
@@ -776,6 +823,7 @@ class TranslationBackend:
                     autofit,
                     correlation_id=correlation_id,
                     file_metrics=file_metrics,
+                    job_id=job_id,
                 ) + "\n"
 
         elif hasattr(shape, "text_frame") and shape.text_frame:
@@ -828,6 +876,7 @@ class TranslationBackend:
         do_translate=True,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        job_id: str | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
         metrics = file_metrics or self.metrics
@@ -876,6 +925,8 @@ class TranslationBackend:
         for p_idx, (page, blocks) in enumerate(zip(doc, page_blocks), start=1):
             logging.info(f"[PDF] Page {p_idx}/{len(doc)}: {len(blocks)} blocks")
             for blk in blocks:
+                if self._is_cancel_requested(job_id):
+                    break
                 bbox = blk["bbox"]
                 original = blk["text"]
                 seg_id = self.generate_segment_id()
@@ -1007,9 +1058,10 @@ class TranslationBackend:
         autofit=False,
         correlation_id: str | None = None,
         file_metrics: TranslationMetrics | None = None,
+        job_id: str | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ):
-        self.reset_cancel()
+        self.reset_cancel(job_id)
         self.current_target_language = target_language
         metrics = file_metrics or self.metrics
         _log_event(
@@ -1029,6 +1081,7 @@ class TranslationBackend:
                 do_translate=not processed,
                 correlation_id=correlation_id,
                 file_metrics=metrics,
+                job_id=job_id,
                 progress_callback=progress_callback,
             )
         elif ext == "pptx":
@@ -1042,6 +1095,7 @@ class TranslationBackend:
                 autofit=autofit,
                 correlation_id=correlation_id,
                 file_metrics=metrics,
+                job_id=job_id,
                 progress_callback=progress_callback,
             )
         elif ext == "pdf":
@@ -1053,6 +1107,7 @@ class TranslationBackend:
                 do_translate=not processed,
                 correlation_id=correlation_id,
                 file_metrics=metrics,
+                job_id=job_id,
                 progress_callback=progress_callback,
             )
         else:
