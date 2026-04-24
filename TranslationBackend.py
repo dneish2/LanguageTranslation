@@ -5,6 +5,7 @@ import time
 import uuid
 import json
 import random
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from threading import Lock, Thread
 from html import escape
@@ -35,6 +36,52 @@ JOB_STATE_RUNNING = "running"
 JOB_STATE_SUCCEEDED = "succeeded"
 JOB_STATE_FAILED = "failed"
 JOB_STATE_CANCELED = "canceled"
+
+
+class BaseTranslationProvider(ABC):
+    @abstractmethod
+    def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def transcribe_audio(self, *, audio_file: BytesIO) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def synthesize_speech(self, *, text: str) -> bytes:
+        raise NotImplementedError
+
+
+class OpenAITranslationProvider(BaseTranslationProvider):
+    def __init__(self, api_key: str) -> None:
+        self.client = openai.OpenAI(api_key=api_key)
+
+    def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
+        return self.client.chat.completions.create(
+            model="gpt-4.1-nano",
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+
+    def transcribe_audio(self, *, audio_file: BytesIO) -> str:
+        transcription = self.client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        return transcription.text
+
+    def synthesize_speech(self, *, text: str) -> bytes:
+        tts_resp = self.client.audio.speech.create(
+            model="tts-1",
+            voice="nova",
+            input=text,
+            response_format="mp3",
+        )
+        return tts_resp.content if hasattr(tts_resp, "content") else tts_resp
+
+
+def build_translation_provider(provider_name: str, api_key: str) -> BaseTranslationProvider:
+    name = (provider_name or "openai").strip().lower()
+    if name == "openai":
+        return OpenAITranslationProvider(api_key)
+    raise ValueError(f"Unsupported translation provider: {provider_name}")
 
 
 @dataclass
@@ -76,7 +123,10 @@ class TranslationBackend:
         self.api_key = os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY not set.")
-        self.client = openai.OpenAI(api_key=self.api_key)
+        provider_name = os.getenv("TRANSLATION_PROVIDER", "openai")
+        self.provider = build_translation_provider(provider_name, self.api_key)
+        # Backward-compatible attribute used in tests and monkeypatches.
+        self.client = getattr(self.provider, "client", None)
 
         self._manual_cancel_requested = False
         self._active_run_state = TranslationRunState()
@@ -368,7 +418,7 @@ class TranslationBackend:
         attempts = self.max_openai_attempts
         for attempt in range(1, attempts + 1):
             try:
-                return self.client.chat.completions.create(model="gpt-4.1-nano", messages=messages, max_tokens=4000)
+                return self.provider.create_chat_completion(messages=messages, max_tokens=4000)
             except Exception as error:
                 is_transient = self._is_transient_openai_error(error)
                 if attempt >= attempts or not is_transient:
@@ -510,7 +560,7 @@ class TranslationBackend:
             return self.translate_text(text, target_language)
 
     # ──────────────────────── VOICE (WHISPER + TTS) ────────────────────── #
-    def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, bytes]:
+    def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, str, bytes]:
         """
         1. Transcribe `audio_bytes` with Whisper.  
         2. Translate resulting text.  
@@ -521,18 +571,13 @@ class TranslationBackend:
             audio_file = BytesIO(audio_bytes)
             audio_file.name = "speech.webm"  # Whisper needs a filename
 
-            transcription = self.client.audio.transcriptions.create(model="whisper-1", file=audio_file)
-            source_text: str = transcription.text
+            source_text = self.provider.transcribe_audio(audio_file=audio_file)
             logging.info("[Backend] Whisper transcription: %s", source_text[:60] + "…")
 
             translated_text = self.translate_text(source_text, target_language)
-
-            tts_resp = self.client.audio.speech.create(
-                model="tts-1", voice="nova", input=translated_text, response_format="mp3"
-            )
-            audio_mp3: bytes = tts_resp.content if hasattr(tts_resp, "content") else tts_resp
+            audio_mp3 = self.provider.synthesize_speech(text=translated_text)
             logging.info("[Backend] TTS done (%d bytes)", len(audio_mp3))
-            return translated_text, audio_mp3
+            return source_text, translated_text, audio_mp3
         except Exception as e:
             logging.error("[Backend] translate_audio error: %s", e, exc_info=True)
             raise
@@ -1174,17 +1219,17 @@ class TranslationBackend:
         progress_callback: Callable[[float, str], None] | None = None,
     ):
         self.reset_cancel(job_id)
-        # Per-run state must not leak across sequential requests.
-        self.segment_map.clear()
-        self.current_document = None
-        self.current_presentation = None
-        self.current_pdf = None
-        self.pdf_overlay_ocg = None
-        self.current_target_language = target_language
-        metrics = file_metrics or self.metrics
         state = self._resolve_run_state(job_id=job_id, run_state=run_state)
         if job_id is None and run_state is None:
             state = TranslationRunState()
+        # Per-run state must not leak across sequential requests.
+        state.segment_map.clear()
+        state.current_document = None
+        state.current_presentation = None
+        state.current_pdf = None
+        state.pdf_overlay_ocg = None
+        self.current_target_language = target_language
+        metrics = file_metrics or self.metrics
         _log_event(
             "translation.file_started",
             correlation_id=correlation_id,
