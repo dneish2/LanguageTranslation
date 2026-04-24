@@ -258,4 +258,35 @@ def build_default_job_executor() -> JobQueueExecutor:
     policy = os.getenv("TRANSLATION_JOB_QUEUE_POLICY", "fifo").strip().lower()
 
     store = JobStore(db_path=db_path)
-    return JobQueueExecutor(handlers={}, store=store, max_workers=max_workers, max_queue_depth=max_depth, queue_policy=policy)
+
+    _backend = {"instance": None}
+
+    def _get_backend():
+        if _backend["instance"] is None:
+            from TranslationBackend import TranslationBackend
+            _backend["instance"] = TranslationBackend()
+        return _backend["instance"]
+
+    def _translate_text_handler(payload: dict[str, Any]) -> dict[str, Any]:
+        text = str(payload.get("text", "")).strip()
+        target_language = str(payload.get("target_language", "")).strip()
+        if not text:
+            raise ValueError("payload.text is required")
+        if not target_language:
+            raise ValueError("payload.target_language is required")
+        translated = _get_backend().translate_text(text, target_language)
+        return {
+            "translated_text": translated,
+            "target_language": target_language,
+        }
+
+    handlers = {
+        "translate_text": _translate_text_handler,
+    }
+    return JobQueueExecutor(
+        handlers=handlers,
+        store=store,
+        max_workers=max_workers,
+        max_queue_depth=max_depth,
+        queue_policy=policy,
+    )

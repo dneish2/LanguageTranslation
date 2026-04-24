@@ -144,3 +144,18 @@ def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
     assert "window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, recording);" in source
     assert "document.getElementById('desktop_voice_start_recording')" in source
     assert "document.getElementById('desktop_voice_stop_recording')" in source
+
+
+def test_transcript_fallback_js_handler_is_defined_and_exported():
+    source = Path("TranslationUI.py").read_text()
+
+    assert "async function translateTranscriptFallback()" in source
+    assert "window.translateTranscriptFallback = translateTranscriptFallback;" in source
+    assert "fetch('/api/text_translate'" in source
+
+
+def test_voice_ui_decodes_percent_encoded_translation_headers():
+    source = Path("TranslationUI.py").read_text()
+
+    assert "decodeURIComponent(value)" in source
+    assert "const transHeader = resp.headers.get('X-Translated-Text')" in source

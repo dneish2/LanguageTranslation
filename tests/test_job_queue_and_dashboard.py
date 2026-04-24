@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from job_queue import JobQueueExecutor, JobStore
+from job_queue import JobQueueExecutor, JobStore, build_default_job_executor
 from translation_metrics import DashboardThresholds, MetricsDashboard
 
 
@@ -94,3 +94,11 @@ def test_metrics_dashboard_alerts_for_error_p95_retries_and_queue_depth():
     assert snapshot["max_queue_depth"] >= 3
     alert_types = {alert["type"] for alert in snapshot["alerts"]}
     assert {"error_rate", "p95_duration_seconds", "retry_spike_count", "queue_depth"}.issubset(alert_types)
+
+
+def test_build_default_job_executor_registers_translate_text_handler(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("TRANSLATION_JOB_DB", str(tmp_path / "default_jobs.db"))
+
+    executor = build_default_job_executor()
+
+    assert "translate_text" in executor.handlers
