@@ -8,6 +8,7 @@ import uuid
 from io import BytesIO
 from threading import Thread
 from typing import Any
+from urllib.parse import quote
 
 from nicegui import ui, app
 from fastapi import UploadFile, File, Form
@@ -1251,8 +1252,14 @@ window.voiceUx = window.voiceUx || (() => {
                 const resp = await fetch('/api/voice_translate', { method:'POST', body:fd });
                 if(!resp.ok) throw new Error(await resp.text());
                 const audio = await resp.blob();
-                const orig = resp.headers.get('X-Original-Text') || '';
-                const trans = resp.headers.get('X-Translated-Text') || '';
+                const origHeader = resp.headers.get('X-Original-Text') || '';
+                const transHeader = resp.headers.get('X-Translated-Text') || '';
+                const decodeHeader = (value) => {
+                    if (!value) return '';
+                    try { return decodeURIComponent(value); } catch (_err) { return value; }
+                };
+                const orig = decodeHeader(origHeader);
+                const trans = decodeHeader(transHeader);
                 document.getElementById('original_text').textContent   = orig;
                 document.getElementById('translated_text').textContent= trans;
                 if(audio.size>0){
@@ -1271,6 +1278,34 @@ window.voiceUx = window.voiceUx || (() => {
         };
         recorder.stop();
     }
+
+    async function translateTranscriptFallback() {
+        const lang = document.getElementById('language_select')?.value || 'es';
+        const transcript = document.getElementById('desktop_voice_transcript')?.value || '';
+        const cleaned = transcript.trim();
+        if (!cleaned) {
+            window.voiceUx.setStatus(DESKTOP_SCOPE, 'Please provide transcript text before translating.');
+            return;
+        }
+        window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.TRANSLATING_TEXT);
+        window.voiceUx.setDebug(DESKTOP_SCOPE, `chars=${cleaned.length}`);
+        try {
+            const fd = new FormData();
+            fd.append('text', cleaned);
+            fd.append('language', lang);
+            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data?.error || 'Transcript translation failed.');
+            document.getElementById('original_text').textContent = data.original_text || cleaned;
+            document.getElementById('translated_text').textContent = data.translated_text || '';
+            window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
+        } catch (e) {
+            window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
+            window.voiceUx.setDebug(DESKTOP_SCOPE, e.message || 'unknown error');
+        }
+    }
+
+    window.translateTranscriptFallback = translateTranscriptFallback;
 
     window.addEventListener('load', () => {
         const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -1307,31 +1342,19 @@ window.voiceUx = window.voiceUx || (() => {
             data = await file.read()
             if not data:
                 return Response(content=b"", status_code=400, headers={"X-Error":"Empty audio data"})
-            original_text, mp3_bytes = await asyncio.to_thread(
+            original_text, translated_text, mp3_bytes = await asyncio.to_thread(
                 self.backend.translate_audio, data, language
             )
-            # build headers
-            translation_text = {
-                'es':'Translated to Spanish',
-                'fr':'Translated to French',
-                'de':'Translated to German',
-                'zh':'Translated to Chinese'
-            }.get(language, f"Translated to {language.upper()}")
-            safe = original_text[:200] if original_text else "Transcription failed"
-            try:
-                import urllib.parse
-                if len(safe.encode('ascii','ignore')) > len(safe)*0.5:
-                    header_orig = safe
-                else:
-                    header_orig = f"Text in {language}"
-            except:
-                header_orig = f"Text in {language}"
+            safe_original = (original_text or "")[:400]
+            safe_translated = (translated_text or "")[:400]
+            header_orig = quote(safe_original, safe="")
+            header_translated = quote(safe_translated, safe="")
             return Response(
                 content=mp3_bytes,
                 media_type="audio/mpeg",
                 headers={
                     "X-Original-Text": header_orig,
-                    "X-Translated-Text": translation_text,
+                    "X-Translated-Text": header_translated,
                     "X-Target-Language": language,
                     "X-Correlation-Id": correlation_id,
                     "Content-Length": str(len(mp3_bytes))
