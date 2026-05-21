@@ -72,6 +72,11 @@ class TranslationUI:
         self.text_source_input = None
         self.mobile_target_input = None
         self.mobile_voice_input = None
+        self.image_source_upload = None
+        self.image_capture_upload = None
+        self.image_upload_bytes: bytes | None = None
+        self.image_upload_name: str | None = None
+        self.image_translation_result: dict[str, Any] | None = None
         self.current_source_language = "English"
         self.current_target_language = "Spanish"
 
@@ -99,6 +104,11 @@ class TranslationUI:
         app.add_api_route(
             "/api/text_translate",
             self.api_text_translate,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/api/image_translate",
+            self.api_image_translate,
             methods=["POST"],
         )
 
@@ -531,7 +541,19 @@ window.voiceUx = window.voiceUx || (() => {
             return
 
         ui.label("Image/Camera input mode selected.").classes("text-sm text-gray-700")
-        ui.label("OCR + camera capture hooks will connect here in the realtime phase.").classes("text-sm text-gray-500")
+        ui.upload(
+            label="Upload image (PNG/JPG/JPEG/WEBP)",
+            multiple=False,
+            on_upload=self.handle_mobile_image_upload,
+        ).classes("w-full")
+        ui.upload(
+            label="Camera capture fallback",
+            multiple=False,
+            auto_upload=True,
+            on_upload=self.handle_mobile_image_upload,
+        ).props("accept=image/* capture=environment").classes("w-full")
+        if self.image_upload_name:
+            ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm text-gray-600")
 
     def mobile_page(self):
         self.mobile_mode = True
@@ -575,13 +597,21 @@ window.voiceUx = window.voiceUx || (() => {
             return
 
         if self.input_mode == "Image/Camera":
+            if not self.image_upload_bytes or not self.image_upload_name:
+                self.show_error("Please upload or capture an image before translating.")
+                return
             self.progress_container.clear()
             self.result_container.clear()
-            self._show_banner(
-                self.result_container,
-                "Image/Camera mode is wired to the shared workspace. OCR/realtime processing will be added next.",
-                "warning",
-            )
+            self.stats_container.clear()
+            try:
+                self.image_translation_result = self.backend.translate_image_text_blocks(
+                    self.image_upload_bytes,
+                    self.image_upload_name,
+                    language,
+                )
+                self.show_mobile_image_result(language)
+            except Exception as ex:
+                self.show_error(str(ex))
             return
 
         source_text = (self.text_source_input.value or "").strip() if self.text_source_input else ""
@@ -617,6 +647,33 @@ window.voiceUx = window.voiceUx || (() => {
         except Exception as ex:
             logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
             self.show_error(ex)
+
+    def handle_mobile_image_upload(self, event):
+        self.image_upload_name = event.name
+        self.image_upload_bytes = event.content.read()
+        ui.notify(f"Selected image '{self.image_upload_name}'", type="positive")
+        self.refresh_upload_ui()
+
+    def show_mobile_image_result(self, language: str) -> None:
+        self.result_container.clear()
+        result = self.image_translation_result or {}
+        blocks = result.get("translated_blocks", [])
+        confidence = result.get("confidence_metadata", {})
+        with self.result_container:
+            with ui.card().classes("w-full p-4 space-y-3"):
+                ui.label(f"Image OCR translation → {language}").classes("text-lg font-semibold")
+                ui.label(
+                    f"Confidence avg: {confidence.get('average_confidence', 0)} "
+                    f"across {confidence.get('block_count', 0)} blocks"
+                ).classes("text-xs text-gray-600")
+                for idx, block in enumerate(blocks, start=1):
+                    with ui.grid(columns=2).classes("w-full gap-2 border rounded p-2"):
+                        with ui.column().classes("w-full"):
+                            ui.label(f"Extracted #{idx}").classes("text-xs font-semibold text-gray-600")
+                            ui.label(block.get("source_text", "")).classes("text-sm bg-gray-50 border rounded p-2")
+                        with ui.column().classes("w-full"):
+                            ui.label(f"Translated #{idx}").classes("text-xs font-semibold text-gray-600")
+                            ui.label(block.get("translated_text", "")).classes("text-sm bg-blue-50 border rounded p-2")
 
     def show_mobile_voice_result(self, original_text, translated_text, language):
         self.result_container.clear()
@@ -1411,6 +1468,34 @@ window.voiceUx = window.voiceUx || (() => {
             _log_event("ui.text_translate_failed", correlation_id=correlation_id, error=str(e))
             return JSONResponse(
                 {"error": f"Transcript translation failed: {e}"},
+                status_code=500,
+                headers={"X-Correlation-Id": correlation_id},
+            )
+
+    async def api_image_translate(
+        self,
+        file: UploadFile = File(...),
+        language: str = Form(...),
+    ) -> JSONResponse:
+        correlation_id = str(uuid.uuid4())
+        try:
+            payload = await file.read()
+            result = await asyncio.to_thread(
+                self.backend.translate_image_text_blocks,
+                payload,
+                file.filename or "uploaded_image",
+                language or "es",
+            )
+            return JSONResponse(result, headers={"X-Correlation-Id": correlation_id})
+        except ValueError as err:
+            return JSONResponse(
+                {"error": str(err)},
+                status_code=400,
+                headers={"X-Correlation-Id": correlation_id},
+            )
+        except Exception as err:
+            return JSONResponse(
+                {"error": f"Image translation failed: {err}"},
                 status_code=500,
                 headers={"X-Correlation-Id": correlation_id},
             )
