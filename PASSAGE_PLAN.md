@@ -54,7 +54,25 @@ machine translation and human edit.
   a failed state. Tests updated (`test_translate_text_raises_after_max_attempts`,
   `test_translate_raises_on_openai_exception`). Plus two mobile fixes: NiceGUI
   `on_value_change` for the mode selector, progress widgets created inside their container.
-- **Suite green**: 44/44 passing locally.
+- **Suite green**: 57/57 passing locally.
+- **Interim API hardening shipped** (branch `security/api-hardening`): the four public `/api/*`
+  endpoints were fully open — anyone with the URL could burn the OpenAI key. Now gated by a
+  short-lived signed session token (`api_security.py`) that only app-served pages embed
+  (`window.PASSAGE_TOKEN`, sent as `X-Passage-Token`), plus a per-IP rate limit (30/min default,
+  `PASSAGE_API_RATE_LIMIT`), text length cap (8,000 chars, `PASSAGE_MAX_TEXT_CHARS`) and upload
+  cap (8 MB, `PASSAGE_MAX_UPLOAD_BYTES`). `PASSAGE_PUBLIC_API=1` disables the gate for local dev.
+  This is abuse prevention, NOT auth — real accounts are Phase 4 and replace/absorb this gate.
+  Prompt-injection hardening: the translation prompt now pins the model as a translation engine,
+  wraps user text in BEGIN/END markers, and instructs it to translate embedded instructions
+  literally rather than follow them. Empty model output and refine failures now raise instead of
+  silently echoing the source (completes the honest-error contract).
+- **Design picked (2026-07-05): Direction A "Press" palette** (warm paper #F6F0E3, letterpress
+  ink #2B241C, burgundy #802F3D, Palatino display / Georgia body) **plus Direction C's monospace
+  data accents used sparingly** — for metadata, counts, traces, states; NOT for buttons.
+  Motion principle from David: subtle animations and loading loops **synced to real data
+  movement** (progress reflects actual job/segment state, never decorative spinners) — keeps the
+  user in the loop and doubles as debugging/state visibility. Mockup artifact: "Passage — design
+  directions" (Press / Gallery / Ledger).
 
 ### Blocked on David (do these once, in the browser)
 
@@ -67,14 +85,13 @@ machine translation and human edit.
 
 ### Phase 0 — Unbreak prod — DONE (pending PR merge + secret above)
 
-### Phase 1 — Brand + design prototypes (next up)
+### Phase 1 — Brand + design prototypes
 
-1. [ ] 2–3 static HTML mockups (Artifact) of the main workspace in editorial directions —
-       e.g. (a) warm paper/ink + burgundy + serif display, (b) gallery-white + deep green,
-       (c) cream + midnight-blue. Each shows: header with Passage wordmark, language bar,
-       source/target panels, segment list, error + loading states.
-2. [ ] David picks → extract winner into design tokens: `static/passage.css` (CSS variables)
-       + `theme.py` (token constants for NiceGUI classes). Kill ad-hoc Tailwind color strings.
+1. [x] 2–3 static HTML mockups (Artifact) — done: Press / Gallery / Ledger, interactive comp.
+2. [x] David picked: **Press palette + Ledger's mono data accents (sparingly, not buttons);
+       motion synced to real data transfer.** Next: extract into design tokens:
+       `static/passage.css` (CSS variables) + `theme.py` (token constants for NiceGUI classes).
+       Kill ad-hoc Tailwind color strings.
 3. [ ] Brand assets: favicon, page title, `ui.run(favicon=...)`, OG meta, replace `Multilingual.png`.
 
 ### Phase 2 — UI/UX rehaul (NiceGUI, on the chosen tokens)
