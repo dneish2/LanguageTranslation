@@ -72,6 +72,7 @@ class TranslationUI:
         self.text_source_input = None
         self.mobile_target_input = None
         self.mobile_voice_input = None
+        self.text_status_scope = "workspace_text"
         self.current_source_language = "English"
         self.current_target_language = "Spanish"
 
@@ -196,6 +197,77 @@ window.voiceUx = window.voiceUx || (() => {
         ui.label("")\
             .classes("text-xs text-gray-500 min-h-[20px]")\
             .props(f"id={scope}_debug")
+
+    def _inject_workspace_text_live_translation_js(self) -> None:
+        ui.add_body_html("""
+<script>
+(() => {
+    const scope = 'workspace_text';
+    const DEBOUNCE_MS = 350;
+    const stateLabels = { READY: 'Ready', TRANSLATING: 'Translating…', UPDATED: 'Updated', ERROR: 'Error' };
+    let debounceTimer = null;
+    let activeRequestToken = 0;
+    const byId = (id) => document.getElementById(id);
+    const sourceEl = () => byId(`${scope}_source`);
+    const targetEl = () => byId(`${scope}_target`);
+    const outputEl = () => byId(`${scope}_output`);
+    const statusEl = () => byId(`${scope}_status`);
+    function setStatus(text) {
+        const node = statusEl();
+        if (node) node.textContent = text;
+    }
+    async function requestTranslation() {
+        const source = sourceEl();
+        const target = targetEl();
+        const output = outputEl();
+        if (!source || !target || !output) return;
+        const text = (source.value || '').trim();
+        const language = (target.value || 'Spanish').trim();
+        if (!text) {
+            output.textContent = '';
+            setStatus(stateLabels.READY);
+            return;
+        }
+        const token = ++activeRequestToken;
+        setStatus(stateLabels.TRANSLATING);
+        try {
+            const fd = new FormData();
+            fd.append('text', text);
+            fd.append('language', language || 'Spanish');
+            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd });
+            const data = await resp.json();
+            if (token !== activeRequestToken) return;
+            if (!resp.ok) throw new Error(data?.error || 'Translation failed.');
+            output.textContent = data.translated_text || '';
+            setStatus(stateLabels.UPDATED);
+        } catch (err) {
+            if (token !== activeRequestToken) return;
+            setStatus(`${stateLabels.ERROR}: ${err?.message || 'unknown error'}`);
+        }
+    }
+    function scheduleDebouncedTranslation() {
+        if (debounceTimer) window.clearTimeout(debounceTimer);
+        debounceTimer = window.setTimeout(requestTranslation, DEBOUNCE_MS);
+    }
+    function init() {
+        const source = sourceEl();
+        const manualBtn = byId(`${scope}_manual_translate`);
+        if (source && !source.dataset.liveTranslateBound) {
+            source.dataset.liveTranslateBound = '1';
+            source.addEventListener('input', scheduleDebouncedTranslation);
+        }
+        if (manualBtn && !manualBtn.dataset.liveTranslateBound) {
+            manualBtn.dataset.liveTranslateBound = '1';
+            manualBtn.addEventListener('click', requestTranslation);
+        }
+        setStatus(stateLabels.READY);
+    }
+    window.workspaceTextLiveTranslation = { init, requestTranslation };
+    window.addEventListener('load', init);
+    window.setTimeout(init, 0);
+})();
+</script>
+        """)
 
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
@@ -503,7 +575,8 @@ window.voiceUx = window.voiceUx || (() => {
                         value=self.input_mode,
                     ).classes("h-10 min-h-0 px-2 rounded-md")
                     mode_selector.on("update:model-value", lambda e: self.set_mobile_input_mode(e.args))
-                    ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
+                    translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
+                    translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
                 with ui.grid(columns=1 if self.mobile_mode else 2).classes("w-full gap-3"):
                     with ui.card().classes("w-full p-4 space-y-3"):
@@ -511,14 +584,26 @@ window.voiceUx = window.voiceUx || (() => {
                         self._render_source_input_panel()
                     with ui.card().classes("w-full p-4 space-y-2"):
                         ui.label("Translated output").classes("text-base font-semibold text-gray-700")
-                        self._show_banner(self.progress_container, "Status: Ready to translate.", "info")
+                        if self.input_mode == "Text":
+                            ui.label("Ready").classes(self.banner_classes["info"]).props(
+                                f"id={self.text_status_scope}_status"
+                            )
+                            ui.label("").classes("w-full min-h-[140px] rounded border bg-blue-50 p-3 text-base").props(
+                                f"id={self.text_status_scope}_output"
+                            )
+                        else:
+                            self._show_banner(self.progress_container, "Status: Ready to translate.", "info")
+        if self.input_mode == "Text":
+            self._inject_workspace_text_live_translation_js()
 
     def _render_source_input_panel(self):
         if self.input_mode == "Text":
             self.text_source_input = ui.textarea(
                 label="Enter text to translate",
                 placeholder="Type or paste text…",
-            ).props("autogrow rows=8").classes("w-full")
+            ).props(f"autogrow rows=8 id={self.text_status_scope}_source").classes("w-full")
+            if self.target_language_input:
+                self.target_language_input.props(f"id={self.text_status_scope}_target")
             return
         if self.input_mode == "Document":
             ui.upload(
