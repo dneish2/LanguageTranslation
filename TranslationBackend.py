@@ -12,6 +12,8 @@ from html import escape
 from io import BytesIO
 from typing import Any, Callable, Optional, Tuple
 
+from PIL import Image
+
 import dotenv
 import fitz  # PyMuPDF
 import openai
@@ -22,6 +24,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
 
 from translation_metrics import MetricsCollector, TranslationMetrics
+from image_compositor import ImageCompositor, OverlayStyle
 
 dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -106,6 +109,7 @@ class TranslationRunState:
     current_pdf: Any | None = None
     output_stream: BytesIO | None = None
     pdf_overlay_ocg: Any | None = None
+    current_image_bytes: bytes | None = None
 
 
 def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
@@ -609,6 +613,10 @@ class TranslationBackend:
             out = BytesIO(); state.current_presentation.save(out); out.seek(0); state.output_stream = out
         elif state.current_file_type == "pdf" and state.current_pdf:
             out = BytesIO(); state.current_pdf.ez_save(out); out.seek(0); state.output_stream = out
+        elif state.current_file_type == "image" and state.current_image_bytes and state.segment_map:
+            compositor = ImageCompositor()
+            composed = compositor.compose(state.current_image_bytes, list(state.segment_map.values()))
+            out = BytesIO(composed); out.seek(0); state.output_stream = out
         return state.output_stream
 
     def _compute_pdf_block_css(self, text: str, bbox: fitz.Rect) -> str:
@@ -715,6 +723,7 @@ class TranslationBackend:
         state.current_presentation = None
         state.current_pdf = None
         state.pdf_overlay_ocg = None
+        state.current_image_bytes = None
         state.segment_map.clear()
 
         total_elements = len(doc.paragraphs) + sum(len(t.rows)*len(t.columns) for t in doc.tables)
@@ -1004,6 +1013,66 @@ class TranslationBackend:
 
             return text.strip()
 
+
+    def process_image(
+        self,
+        input_stream,
+        target_language,
+        *,
+        show_original: bool = False,
+        font_size: int = 24,
+        font_family: str = "DejaVuSans.ttf",
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+        job_id: str | None = None,
+        run_state: TranslationRunState | None = None,
+    ):
+        state = self._resolve_run_state(job_id=job_id, run_state=run_state)
+        metrics = file_metrics or self.metrics
+        metrics.start_file(file_type="image", correlation_id=correlation_id)
+        state.current_file_type = "image"
+        state.current_document = None
+        state.current_presentation = None
+        state.current_pdf = None
+        state.pdf_overlay_ocg = None
+        image_bytes = input_stream.read() if hasattr(input_stream, "read") else input_stream
+        state.current_image_bytes = image_bytes
+        state.segment_map.clear()
+
+        ocr_blocks = self.extract_image_text_regions(image_bytes)
+        start = time.time()
+        processed = 0
+        for block in ocr_blocks:
+            original = block.get("text", "").strip()
+            if not original:
+                continue
+            seg_id = self.generate_segment_id()
+            translated = self._translate_text_with_context(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
+            state.segment_map[seg_id] = {
+                "type": "image_region",
+                "bbox": block.get("bbox"),
+                "direction": block.get("direction", "ltr"),
+                "original": original,
+                "translated": translated,
+                "location": f"image:region:{processed}",
+            }
+            processed += 1
+
+        compositor = ImageCompositor(OverlayStyle(font_size=font_size, font_family=font_family))
+        regions = list(state.segment_map.values())
+        composed = compositor.compose(image_bytes, regions, show_original=show_original)
+        out_stream = BytesIO(composed)
+        out_stream.seek(0)
+        state.output_stream = out_stream
+        metrics.finish_file(file_type="image", segment_count=processed, duration_seconds=time.time() - start)
+        return out_stream, processed, self.calculate_tokens(""), "", state.segment_map
+
+    def extract_image_text_regions(self, image_bytes: bytes) -> list[dict[str, Any]]:
+        """Fallback OCR region extractor. Override/monkeypatch with real OCR output in production."""
+        with Image.open(BytesIO(image_bytes)) as img:
+            w, h = img.size
+        return [{"bbox": [int(w*0.1), int(h*0.1), int(w*0.9), int(h*0.25)], "text": "", "direction": "ltr"}]
+
     # ------------------
     # PROCESSING PDF
     # ------------------
@@ -1278,6 +1347,16 @@ class TranslationBackend:
                 job_id=job_id,
                 run_state=state,
                 progress_callback=progress_callback,
+            )
+        elif ext in {"png", "jpg", "jpeg", "webp"}:
+            result = self.process_image(
+                input_stream,
+                target_language,
+                font_size=font_size or 24,
+                correlation_id=correlation_id,
+                file_metrics=metrics,
+                job_id=job_id,
+                run_state=state,
             )
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
