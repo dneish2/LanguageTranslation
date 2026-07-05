@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from nicegui import ui, app
 from fastapi import UploadFile, File, Form
-from starlette.responses import Response, JSONResponse
+from starlette.responses import Response, JSONResponse, StreamingResponse
 
 from TranslationBackend import TranslationBackend
 
@@ -99,6 +99,11 @@ class TranslationUI:
         app.add_api_route(
             "/api/text_translate",
             self.api_text_translate,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/api/text_translate_stream",
+            self.api_text_translate_stream,
             methods=["POST"],
         )
 
@@ -1293,11 +1298,45 @@ window.voiceUx = window.voiceUx || (() => {
             const fd = new FormData();
             fd.append('text', cleaned);
             fd.append('language', lang);
-            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd });
-            const data = await resp.json();
-            if (!resp.ok) throw new Error(data?.error || 'Transcript translation failed.');
-            document.getElementById('original_text').textContent = data.original_text || cleaned;
-            document.getElementById('translated_text').textContent = data.translated_text || '';
+            const resp = await fetch('/api/text_translate_stream', { method: 'POST', body: fd });
+            const contentType = resp.headers.get('content-type') || '';
+            if (contentType.includes('text/event-stream')) {
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let streamed = false;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const events = buffer.split('\n\n');
+                    buffer = events.pop() || '';
+                    for (const evt of events) {
+                        const eventLine = evt.split('\n').find(line => line.startsWith('event: '));
+                        const dataLine = evt.split('\n').find(line => line.startsWith('data: '));
+                        const eventType = eventLine ? eventLine.replace('event: ', '').trim() : '';
+                        const payload = dataLine ? JSON.parse(dataLine.replace('data: ', '')) : {};
+                        if (eventType === 'start') {
+                            document.getElementById('original_text').textContent = payload.original_text || cleaned;
+                        } else if (eventType === 'partial') {
+                            streamed = true;
+                            document.getElementById('translated_text').textContent = payload.translated_text || '';
+                        } else if (eventType === 'complete') {
+                            document.getElementById('translated_text').textContent = payload.translated_text || '';
+                        } else if (eventType === 'error') {
+                            throw new Error(payload.error || 'Transcript streaming failed.');
+                        }
+                    }
+                }
+                if (!streamed) {
+                    window.voiceUx.setDebug(DESKTOP_SCOPE, 'Streaming unavailable; translation returned without partial chunks.');
+                }
+            } else {
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data?.error || 'Transcript translation failed.');
+                document.getElementById('original_text').textContent = data.original_text || cleaned;
+                document.getElementById('translated_text').textContent = data.translated_text || '';
+            }
             window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
         } catch (e) {
             window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
@@ -1414,6 +1453,57 @@ window.voiceUx = window.voiceUx || (() => {
                 status_code=500,
                 headers={"X-Correlation-Id": correlation_id},
             )
+
+    async def api_text_translate_stream(
+        self,
+        text: str = Form(...),
+        language: str = Form(...),
+    ) -> Response:
+        correlation_id = str(uuid.uuid4())
+        cleaned_text = (text or "").strip()
+        if not cleaned_text:
+            return JSONResponse(
+                {"error": "Transcript text is required."},
+                status_code=400,
+                headers={"X-Correlation-Id": correlation_id},
+            )
+        if not language or language.lower() in ('undefined', 'null', ''):
+            language = 'es'
+
+        live_streaming_enabled = os.getenv("LIVE_TEXT_STREAMING", "false").lower() in {"1", "true", "yes", "on"}
+        threshold = int(os.getenv("LIVE_TEXT_STREAMING_CHAR_THRESHOLD", "250"))
+        should_stream = live_streaming_enabled or len(cleaned_text) >= threshold
+
+        if not should_stream:
+            return JSONResponse(
+                {
+                    "fallback": True,
+                    "original_text": cleaned_text,
+                    "translated_text": await asyncio.to_thread(self.backend.translate_text, cleaned_text, language),
+                    "target_language": language,
+                },
+                headers={"X-Correlation-Id": correlation_id},
+            )
+
+        async def event_generator():
+            yield f"event: start\ndata: {json.dumps({'target_language': language, 'original_text': cleaned_text})}\n\n"
+            try:
+                final_text, partials = await asyncio.to_thread(
+                    self.backend.stream_translate_text,
+                    cleaned_text,
+                    language,
+                )
+                for partial in partials[:-1]:
+                    yield f"event: partial\ndata: {json.dumps({'translated_text': partial})}\n\n"
+                yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True})}\n\n"
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Correlation-Id": correlation_id},
+        )
 
 
 if __name__ in {"__main__", "__mp_main__"}:
