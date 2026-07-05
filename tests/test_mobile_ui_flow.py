@@ -159,3 +159,21 @@ def test_voice_ui_decodes_percent_encoded_translation_headers():
 
     assert "decodeURIComponent(value)" in source
     assert "const transHeader = resp.headers.get('X-Translated-Text')" in source
+
+
+def test_workspace_text_mode_js_has_debounce_and_auto_translation_trigger():
+    source = Path("TranslationUI.py").read_text()
+
+    assert "const DEBOUNCE_MS = 350;" in source
+    assert "source.addEventListener('input', scheduleDebouncedTranslation);" in source
+    assert "window.setTimeout(requestTranslation, DEBOUNCE_MS);" in source
+    assert "fetch('/api/text_translate'" in source
+
+
+def test_workspace_text_mode_js_discards_stale_responses():
+    source = Path("TranslationUI.py").read_text()
+
+    assert "let activeRequestToken = 0;" in source
+    assert "const token = ++activeRequestToken;" in source
+    assert "if (token !== activeRequestToken) return;" in source
+    assert "stateLabels = { READY: 'Ready', TRANSLATING: 'Translating…', UPDATED: 'Updated', ERROR: 'Error' }" in source
