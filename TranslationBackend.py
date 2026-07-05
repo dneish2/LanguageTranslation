@@ -1,5 +1,6 @@
 import logging
 import os
+import base64
 import string
 import time
 import uuid
@@ -581,6 +582,71 @@ class TranslationBackend:
         except Exception as e:
             logging.error("[Backend] translate_audio error: %s", e, exc_info=True)
             raise
+
+    def translate_image_text_blocks(self, image_bytes: bytes, filename: str, target_language: str) -> dict[str, Any]:
+        supported_extensions = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+        extension = os.path.splitext((filename or "").lower())[1]
+        mime_type = supported_extensions.get(extension)
+        if not mime_type:
+            raise ValueError("Unsupported image format. Use PNG, JPG, JPEG, or WEBP.")
+
+        if not image_bytes:
+            raise ValueError("Image payload is empty.")
+
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        prompt = (
+            "Extract all readable text from this image and return JSON with this exact shape: "
+            '{"recognized_blocks":[{"text":"...", "confidence":0.0}]}. '
+            "Confidence must be between 0 and 1."
+        )
+        messages = [
+            {"role": "system", "content": "You are an OCR extraction assistant. Return valid JSON only."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+            ]},
+        ]
+        completion = self.provider.client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            max_tokens=1200,
+        )
+        raw = completion.choices[0].message.content.strip()
+        payload = json.loads(raw)
+        recognized_blocks = payload.get("recognized_blocks", [])
+        if not recognized_blocks:
+            raise ValueError("No text recognized in image.")
+
+        translated_blocks: list[dict[str, Any]] = []
+        confidences: list[float] = []
+        for block in recognized_blocks:
+            source_text = (block.get("text") or "").strip()
+            if not source_text:
+                continue
+            confidence = float(block.get("confidence", 0.0))
+            translated_text = self.translate_text(source_text, target_language)
+            translated_blocks.append({
+                "source_text": source_text,
+                "translated_text": translated_text,
+                "confidence": confidence,
+            })
+            confidences.append(confidence)
+
+        if not translated_blocks:
+            raise ValueError("No valid OCR blocks were returned.")
+        avg_confidence = sum(confidences) / len(confidences)
+        if avg_confidence < 0.45:
+            raise ValueError("Low OCR confidence. Please retake the image in better lighting.")
+
+        return {
+            "recognized_blocks": recognized_blocks,
+            "translated_blocks": translated_blocks,
+            "confidence_metadata": {
+                "average_confidence": round(avg_confidence, 4),
+                "min_confidence": round(min(confidences), 4),
+                "block_count": len(translated_blocks),
+            },
+        }
 
     # ─────────────────────────── TOKEN COUNTS ─────────────────────────── #
     def calculate_tokens(self, total_text: str) -> int:
