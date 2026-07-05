@@ -11,9 +11,10 @@ from typing import Any
 from urllib.parse import quote
 
 from nicegui import ui, app
-from fastapi import UploadFile, File, Form
+from fastapi import Request, UploadFile, File, Form
 from starlette.responses import Response, JSONResponse, StreamingResponse
 
+from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
 from TranslationBackend import TranslationBackend
 
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +32,7 @@ class TranslationUI:
     def __init__(self):
         # ── CORE BACKEND ─────────────────────────────────────────────────
         self.backend = TranslationBackend()
+        self.api_guard = ApiGuard()
 
         # ── UI CONTAINERS ────────────────────────────────────────────────
         self.upload_container = None
@@ -255,7 +257,7 @@ window.voiceUx = window.voiceUx || (() => {
             const fd = new FormData();
             fd.append('text', text);
             fd.append('language', language || 'Spanish');
-            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd });
+            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd, headers: { 'X-Passage-Token': window.PASSAGE_TOKEN || '' } });
             const data = await resp.json();
             if (token !== activeRequestToken) return;
             if (!resp.ok) throw new Error(data?.error || 'Translation failed.');
@@ -294,6 +296,7 @@ window.voiceUx = window.voiceUx || (() => {
 
     def main_page(self):
         self.mobile_mode = False
+        self._inject_api_token()
         self._inject_auto_device_routing("desktop")
         # Header with shallow navigation
         with ui.header().classes("items-center justify-between bg-gray-100 px-3 py-2"):
@@ -653,6 +656,7 @@ window.voiceUx = window.voiceUx || (() => {
 
     def mobile_page(self):
         self.mobile_mode = True
+        self._inject_api_token()
         self._inject_auto_device_routing("mobile")
         with ui.header().classes("items-center bg-white p-3 border-b"):
             with ui.row().classes("w-full items-center justify-between"):
@@ -1270,6 +1274,7 @@ window.voiceUx = window.voiceUx || (() => {
     # ─────────────────────────────── VOICE TRANSLATION PAGE ─────────────────────────────────
 
     def voice_translation_page(self):
+        self._inject_api_token()
         self._inject_voice_frontend_helpers()
         ui.label("Live Voice Translation").classes("text-2xl mb-4")
 
@@ -1430,7 +1435,7 @@ window.voiceUx = window.voiceUx || (() => {
             fd.append('file', blob, `rec.${blob.type.includes('webm')?'webm':'mp4'}`);
             fd.append('language', lang);
             try {
-                const resp = await fetch('/api/voice_translate', { method:'POST', body:fd });
+                const resp = await fetch('/api/voice_translate', { method:'POST', body:fd, headers: { 'X-Passage-Token': window.PASSAGE_TOKEN || '' } });
                 if(!resp.ok) throw new Error(await resp.text());
                 const audio = await resp.blob();
                 const origHeader = resp.headers.get('X-Original-Text') || '';
@@ -1474,7 +1479,7 @@ window.voiceUx = window.voiceUx || (() => {
             const fd = new FormData();
             fd.append('text', cleaned);
             fd.append('language', lang);
-            const resp = await fetch('/api/text_translate_stream', { method: 'POST', body: fd });
+            const resp = await fetch('/api/text_translate_stream', { method: 'POST', body: fd, headers: { 'X-Passage-Token': window.PASSAGE_TOKEN || '' } });
             const contentType = resp.headers.get('content-type') || '';
             if (contentType.includes('text/event-stream')) {
                 const reader = resp.body.getReader();
@@ -1543,12 +1548,44 @@ window.voiceUx = window.voiceUx || (() => {
 
     # ─────────────────────────── VOICE TRANSLATION API ────────────────────────────────────
 
+    def _check_api_access(self, request: Request, correlation_id: str) -> JSONResponse | None:
+        """Gate /api/* behind the app-issued session token plus a per-IP rate
+        limit. Returns an error response to send, or None if allowed."""
+        if gate_disabled():
+            return None
+        token = request.headers.get("x-passage-token", "")
+        if not self.api_guard.validate_token(token):
+            _log_event("api.rejected_no_token", correlation_id=correlation_id, ip=client_ip(request))
+            return JSONResponse(
+                {"error": "This API is used by the Passage app. Open the app to translate."},
+                status_code=401,
+                headers={"X-Correlation-Id": correlation_id},
+            )
+        if not self.api_guard.allow_request(client_ip(request)):
+            _log_event("api.rejected_rate_limited", correlation_id=correlation_id, ip=client_ip(request))
+            return JSONResponse(
+                {"error": "Too many requests. Try again in a minute."},
+                status_code=429,
+                headers={"X-Correlation-Id": correlation_id, "Retry-After": "60"},
+            )
+        return None
+
+    def _inject_api_token(self) -> None:
+        """Expose a short-lived token to the page's own fetch() calls."""
+        ui.add_head_html(
+            f"<script>window.PASSAGE_TOKEN = {json.dumps(self.api_guard.issue_token())};</script>"
+        )
+
     async def api_voice_translate(
         self,
+        request: Request,
         file: UploadFile = File(...),
         language: str = Form(...)
     ) -> Response:
         correlation_id = str(uuid.uuid4())
+        denied = self._check_api_access(request, correlation_id)
+        if denied:
+            return denied
         try:
             if not language or language.lower() in ('undefined','null',''):
                 language = 'es'
@@ -1557,6 +1594,13 @@ window.voiceUx = window.voiceUx || (() => {
             data = await file.read()
             if not data:
                 return Response(content=b"", status_code=400, headers={"X-Error":"Empty audio data"})
+            if len(data) > MAX_UPLOAD_BYTES:
+                return Response(
+                    content=b"Audio file is too large.",
+                    status_code=413,
+                    media_type="text/plain",
+                    headers={"X-Correlation-Id": correlation_id},
+                )
             original_text, translated_text, mp3_bytes = await asyncio.to_thread(
                 self.backend.translate_audio, data, language
             )
@@ -1584,16 +1628,26 @@ window.voiceUx = window.voiceUx || (() => {
 
     async def api_text_translate(
         self,
+        request: Request,
         text: str = Form(...),
         language: str = Form(...)
     ) -> JSONResponse:
         correlation_id = str(uuid.uuid4())
+        denied = self._check_api_access(request, correlation_id)
+        if denied:
+            return denied
         try:
             cleaned_text = (text or "").strip()
             if not cleaned_text:
                 return JSONResponse(
                     {"error": "Transcript text is required."},
                     status_code=400,
+                    headers={"X-Correlation-Id": correlation_id},
+                )
+            if len(cleaned_text) > MAX_TEXT_CHARS:
+                return JSONResponse(
+                    {"error": f"Text is too long ({len(cleaned_text)} characters). The limit is {MAX_TEXT_CHARS} — split it or upload it as a document."},
+                    status_code=413,
                     headers={"X-Correlation-Id": correlation_id},
                 )
             if not language or language.lower() in ('undefined', 'null', ''):
@@ -1632,15 +1686,25 @@ window.voiceUx = window.voiceUx || (() => {
 
     async def api_text_translate_stream(
         self,
+        request: Request,
         text: str = Form(...),
         language: str = Form(...),
     ) -> Response:
         correlation_id = str(uuid.uuid4())
+        denied = self._check_api_access(request, correlation_id)
+        if denied:
+            return denied
         cleaned_text = (text or "").strip()
         if not cleaned_text:
             return JSONResponse(
                 {"error": "Transcript text is required."},
                 status_code=400,
+                headers={"X-Correlation-Id": correlation_id},
+            )
+        if len(cleaned_text) > MAX_TEXT_CHARS:
+            return JSONResponse(
+                {"error": f"Text is too long ({len(cleaned_text)} characters). The limit is {MAX_TEXT_CHARS} — split it or upload it as a document."},
+                status_code=413,
                 headers={"X-Correlation-Id": correlation_id},
             )
         if not language or language.lower() in ('undefined', 'null', ''):
@@ -1683,12 +1747,22 @@ window.voiceUx = window.voiceUx || (() => {
 
     async def api_image_translate(
         self,
+        request: Request,
         file: UploadFile = File(...),
         language: str = Form(...),
     ) -> JSONResponse:
         correlation_id = str(uuid.uuid4())
+        denied = self._check_api_access(request, correlation_id)
+        if denied:
+            return denied
         try:
             payload = await file.read()
+            if len(payload) > MAX_UPLOAD_BYTES:
+                return JSONResponse(
+                    {"error": "Image is too large. The limit is 8 MB."},
+                    status_code=413,
+                    headers={"X-Correlation-Id": correlation_id},
+                )
             result = await asyncio.to_thread(
                 self.backend.translate_image_text_blocks,
                 payload,

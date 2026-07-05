@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,13 +16,21 @@ def _build_ui() -> TranslationUI:
     return TranslationUI()
 
 
+def _app_request(ui_app: TranslationUI):
+    """A request carrying the token the app's own pages embed."""
+    return types.SimpleNamespace(
+        headers={"x-passage-token": ui_app.api_guard.issue_token()},
+        client=types.SimpleNamespace(host="127.0.0.1"),
+    )
+
+
 def test_stream_endpoint_fallbacks_to_non_streaming(monkeypatch):
     ui_app = _build_ui()
     monkeypatch.setenv("LIVE_TEXT_STREAMING", "false")
     monkeypatch.setenv("LIVE_TEXT_STREAMING_CHAR_THRESHOLD", "999")
     monkeypatch.setattr(ui_app.backend, "translate_text", lambda text, language: f"{language}:{text}")
 
-    resp = asyncio.run(ui_app.api_text_translate_stream(text="short", language="es"))
+    resp = asyncio.run(ui_app.api_text_translate_stream(_app_request(ui_app), text="short", language="es"))
 
     assert resp.media_type == "application/json"
     payload = json.loads(resp.body.decode())
@@ -38,7 +47,7 @@ def test_stream_endpoint_emits_start_and_complete(monkeypatch):
         lambda text, language: ("hola mundo", ["hola", "hola mundo"]),
     )
 
-    resp = asyncio.run(ui_app.api_text_translate_stream(text="hello world", language="es"))
+    resp = asyncio.run(ui_app.api_text_translate_stream(_app_request(ui_app), text="hello world", language="es"))
 
     async def _collect_events():
         chunks = []
@@ -62,7 +71,7 @@ def test_stream_endpoint_emits_error_event(monkeypatch):
 
     monkeypatch.setattr(ui_app.backend, "stream_translate_text", _raise)
 
-    resp = asyncio.run(ui_app.api_text_translate_stream(text="hello world", language="es"))
+    resp = asyncio.run(ui_app.api_text_translate_stream(_app_request(ui_app), text="hello world", language="es"))
 
     async def _collect_events():
         chunks = []

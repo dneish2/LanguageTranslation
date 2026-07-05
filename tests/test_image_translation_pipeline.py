@@ -85,8 +85,13 @@ def test_backend_image_ocr_unsupported_format_error():
 
 
 async def _call_api_image_translate(ui_app):
+    import types
+    request = types.SimpleNamespace(
+        headers={"x-passage-token": ui_app.api_guard.issue_token()},
+        client=types.SimpleNamespace(host="127.0.0.1"),
+    )
     upload = _Upload(b"abc", "sample.gif")
-    return await ui_app.api_image_translate(upload, "Spanish")
+    return await ui_app.api_image_translate(request, upload, "Spanish")
 
 
 def test_api_image_translate_error_path_for_unsupported_format():
