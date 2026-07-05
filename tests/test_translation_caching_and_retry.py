@@ -111,7 +111,9 @@ def test_translate_text_retries_on_transient_openai_error(monkeypatch):
     assert slept[0] >= backend.retry_base_delay
 
 
-def test_translate_text_stops_after_max_attempts(monkeypatch):
+def test_translate_text_raises_after_max_attempts(monkeypatch):
+    # A failed translation must surface as an error, never echo the source
+    # text back as if it were translated.
     backend = _build_backend(monkeypatch)
     backend.max_openai_attempts = 3
     backend.retry_base_delay = 0
@@ -123,8 +125,7 @@ def test_translate_text_stops_after_max_attempts(monkeypatch):
     monkeypatch.setattr(backend.client.chat.completions, "create", stub)
     monkeypatch.setattr("TranslationBackend.time.sleep", lambda _seconds: None)
 
-    original = "Fallback text"
-    translated = backend.translate_text(original, "Italian")
+    with pytest.raises(Exception, match="still failing"):
+        backend.translate_text("Fallback text", "Italian")
 
-    assert translated == original
     assert stub.calls == backend.max_openai_attempts

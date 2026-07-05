@@ -148,8 +148,9 @@ def test_translate_file_resets_segment_state_between_runs(monkeypatch):
     assert len(backend.segment_map) == 2
 
 
-def test_translate_fallback_returns_original_on_openai_exception(monkeypatch):
-    """If OpenAI fails, user still receives their original text."""
+def test_translate_raises_on_openai_exception(monkeypatch):
+    """If the provider fails, the error surfaces — the source text must never
+    be echoed back to the user disguised as a translation."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     backend = TranslationBackend()
@@ -159,10 +160,8 @@ def test_translate_fallback_returns_original_on_openai_exception(monkeypatch):
 
     monkeypatch.setattr(backend.client.chat.completions, "create", raise_openai_error)
 
-    original = "\tKeep me as-is\t"
-    translated = backend.translate_text(original, target_language="German")
-
-    assert translated == "Keep me as-is"
+    with pytest.raises(RuntimeError, match="simulated OpenAI outage"):
+        backend.translate_text("\tKeep me as-is\t", target_language="German")
 
 
 def test_translation_job_reaches_succeeded_with_result_handle(monkeypatch):
