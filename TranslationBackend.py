@@ -517,8 +517,9 @@ class TranslationBackend:
             logging.info("[Backend] Translated len=%d → len=%d", len(text), len(result))
             return result
         except Exception as e:
+            # Never echo the source back as a "translation" — surface the failure.
             logging.error("[Backend] translate_text error: %s", e, exc_info=True)
-            return text
+            raise
 
     def translate_text_with_instructions(
         self, original_text: str, target_language: str, instructions: str

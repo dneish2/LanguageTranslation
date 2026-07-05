@@ -595,7 +595,7 @@ window.voiceUx = window.voiceUx || (() => {
                         {"Text": "Text", "Document": "Document", "Image/Camera": "Image/Camera"},
                         value=self.input_mode,
                     ).classes("h-10 min-h-0 px-2 rounded-md")
-                    mode_selector.on("update:model-value", lambda e: self.set_mobile_input_mode(e.args))
+                    mode_selector.on_value_change(lambda e: self.set_mobile_input_mode(e.value))
                     translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
                     translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
@@ -719,11 +719,9 @@ window.voiceUx = window.voiceUx || (() => {
         self.result_container.clear()
         self.stats_container.clear()
 
-        progress_ui = ui.circular_progress(value=0, max=100, show_value=True).classes("mt-3")
-        label_ui = ui.label("Translating text...").classes("text-sm text-gray-700")
         with self.progress_container:
-            progress_ui
-            label_ui
+            progress_ui = ui.circular_progress(value=0, max=100, show_value=True).classes("mt-3")
+            label_ui = ui.label("Translating text...").classes("text-sm text-gray-700")
 
         def voice_task():
             self._run_mobile_voice_translation(source_text, language, progress_ui, label_ui)
