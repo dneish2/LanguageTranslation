@@ -5,3 +5,4 @@ PyMuPDF>=1.23.6
 openai>=1.25.0
 tiktoken>=0.5.1
 python-dotenv>=1.0.1
+Pillow>=10.0.0

@@ -43,6 +43,10 @@ class TranslationUI:
         self.uploaded_file_name: str | None = None
         self.uploaded_file_extension: str | None = None
         self.current_target_language: str | None = None
+        self.overlay_show_original = False
+        self.overlay_font_size = 24
+        self.overlay_font_family = "DejaVuSans.ttf"
+        self.overlay_preview_visible = True
         self.current_correlation_id: str | None = None
         self.cancel_button = None
         self.active_job_id: str | None = None
@@ -1086,6 +1090,21 @@ window.voiceUx = window.voiceUx || (() => {
                                                 self.retranslate_segment_callback(s, ta)
                                              ).props("size=sm color=secondary")
 
+                if self.uploaded_file_extension in {"png", "jpg", "jpeg", "webp"}:
+                    ui.separator().classes("my-3")
+                    ui.label("Image overlay controls").classes("text-lg font-semibold")
+                    with ui.row().classes("items-center gap-2 flex-wrap"):
+                        ui.number("Font size", value=self.overlay_font_size, min=8, max=64, step=1, on_change=lambda e: setattr(self, "overlay_font_size", int(e.value))).classes("w-32")
+                        ui.input("Font family", value=self.overlay_font_family, on_change=lambda e: setattr(self, "overlay_font_family", e.value)).classes("w-48")
+                        ui.switch("Show original overlay", value=self.overlay_show_original, on_change=lambda e: setattr(self, "overlay_show_original", bool(e.value)))
+                        ui.switch("Preview visible", value=self.overlay_preview_visible, on_change=lambda e: setattr(self, "overlay_preview_visible", bool(e.value)) or self.show_result())
+                        ui.button("Refresh overlay", on_click=self.refresh_image_overlay).classes("bg-indigo-600 text-white px-3 py-1")
+                    if self.overlay_preview_visible and self.backend.output_stream is not None:
+                        import base64
+                        self.backend.output_stream.seek(0)
+                        encoded = base64.b64encode(self.backend.output_stream.read()).decode("ascii")
+                        ui.html(f'<img alt="overlay preview" style="max-width:100%;border:1px solid #ddd;border-radius:8px" src="data:image/png;base64,{encoded}"/>')
+
                 # ── DOWNLOAD & NAV ───────────────────────────────
                 ui.separator().classes("my-4")
                 with ui.row().classes("justify-center space-x-4 mt-6 flex-wrap"):
@@ -1101,6 +1120,21 @@ window.voiceUx = window.voiceUx || (() => {
             if self.current_cost > 0:
                 ui.label(f"Estimated cost: ${self.current_cost:.4f}")\
                   .classes("text-sm text-gray-600")
+
+    def refresh_image_overlay(self):
+        try:
+            self.backend.process_image(
+                BytesIO(self.uploaded_file.getvalue()),
+                self.current_target_language,
+                show_original=self.overlay_show_original,
+                font_size=self.overlay_font_size,
+                font_family=self.overlay_font_family,
+                run_state=self.backend._active_run_state,
+            )
+            self.show_result()
+        except Exception as ex:
+            logging.error(f"[UI] refresh_image_overlay failed: {ex}", exc_info=True)
+            ui.notify(f"Overlay refresh failed: {ex}", type="negative")
 
     def download_file(self):
         try:
