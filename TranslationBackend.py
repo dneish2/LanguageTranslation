@@ -540,6 +540,25 @@ class TranslationBackend:
             logging.error("[Backend] refine translation error: %s", e, exc_info=True)
             return original_text
 
+    def stream_translate_text(
+        self,
+        text: str,
+        target_language: str,
+        *,
+        chunk_size: int = 80,
+    ) -> tuple[str, list[str]]:
+        """Return deterministic partials and canonical final text for streaming UI updates."""
+        final_translation = self.translate_text(text, target_language)
+        if not final_translation:
+            return "", [""]
+        step = max(1, chunk_size)
+        partials = [
+            final_translation[:index]
+            for index in range(step, len(final_translation), step)
+        ]
+        partials.append(final_translation)
+        return final_translation, partials
+
     def _translate_text_with_context(
         self,
         text: str,

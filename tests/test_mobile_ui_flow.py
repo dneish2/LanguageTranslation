@@ -151,7 +151,7 @@ def test_transcript_fallback_js_handler_is_defined_and_exported():
 
     assert "async function translateTranscriptFallback()" in source
     assert "window.translateTranscriptFallback = translateTranscriptFallback;" in source
-    assert "fetch('/api/text_translate'" in source
+    assert "fetch('/api/text_translate_stream'" in source
 
 
 def test_voice_ui_decodes_percent_encoded_translation_headers():
