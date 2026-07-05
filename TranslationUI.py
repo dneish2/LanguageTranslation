@@ -70,6 +70,9 @@ class TranslationUI:
         # ── MOBILE FLOW ────────────────────────────────────────────────
         self.mobile_mode = False
         self.input_mode = "Document"
+        # DOM id prefix for the Text-mode workspace elements; must match the
+        # hardcoded `scope` in _inject_workspace_text_live_translation_js.
+        self.text_status_scope = "workspace_text"
         self.mobile_input_mode = "Document"
         self.source_language_input = None
         self.target_language_input = None
@@ -96,7 +99,7 @@ class TranslationUI:
 
         # ── USAGE STATS ─────────────────────────────────────────────────
         self.current_count = 0
-        self.current_cost = 0.0
+        self.current_tokens = 0
 
         # ── VOICE TRANSLATION API ──────────────────────────────────────
         # registers /api/voice_translate on the same port
@@ -113,6 +116,9 @@ class TranslationUI:
         app.add_api_route(
             "/api/text_translate_stream",
             self.api_text_translate_stream,
+            methods=["POST"],
+        )
+        app.add_api_route(
             "/api/image_translate",
             self.api_image_translate,
             methods=["POST"],
@@ -123,8 +129,8 @@ class TranslationUI:
         ui.page("/")(self.main_page)
         ui.page("/voice")(self.voice_translation_page)
         ui.page("/mobile")(self.mobile_page)
-        # run on single port
-        ui.run(host="0.0.0.0", port=8080)
+        # run on single port; Cloud Run injects PORT
+        ui.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
     def _inject_auto_device_routing(self, page: str) -> None:
         ui.add_body_html(f"""
@@ -732,7 +738,7 @@ window.voiceUx = window.voiceUx || (() => {
             progress_ui.set_value(100)
             label_ui.text = "Translation complete."
             self.current_count = 1
-            self.current_cost = 0.0
+            self.current_tokens = 0
             self.show_mobile_voice_result(voice_text, translated, language)
         except Exception as ex:
             logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
@@ -976,7 +982,7 @@ window.voiceUx = window.voiceUx || (() => {
             seg_map = result["segment_map"]
 
             self.current_count = count
-            self.current_cost = 0.0 if processed else tokens * 0.002 / 1000
+            self.current_tokens = 0 if processed else tokens
             if processed:
                 self.current_target_language = "Processed"
 
@@ -1117,8 +1123,8 @@ window.voiceUx = window.voiceUx || (() => {
         with self.stats_container:
             ui.label(f"Elements translated: {self.current_count}")\
               .classes("text-base text-gray-700")
-            if self.current_cost > 0:
-                ui.label(f"Estimated cost: ${self.current_cost:.4f}")\
+            if self.current_tokens > 0:
+                ui.label(f"Tokens used: {self.current_tokens:,}")\
                   .classes("text-sm text-gray-600")
 
     def refresh_image_overlay(self):

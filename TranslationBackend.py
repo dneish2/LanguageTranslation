@@ -126,10 +126,15 @@ class TranslationBackend:
     # ─────────────────────────── INITIALISATION ────────────────────────── #
     def __init__(self) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OPENAI_API_KEY not set.")
         provider_name = os.getenv("TRANSLATION_PROVIDER", "openai")
-        self.provider = build_translation_provider(provider_name, self.api_key)
+        if self.api_key:
+            self.provider: BaseTranslationProvider | None = build_translation_provider(provider_name, self.api_key)
+        else:
+            # Boot without a provider so the UI can still serve (Cloud Run
+            # health-checks the port before any secret may be configured);
+            # translation calls fail with a clear message via _require_provider.
+            LOGGER.warning("OPENAI_API_KEY not set — translation disabled until a provider is configured.")
+            self.provider = None
         # Backward-compatible attribute used in tests and monkeypatches.
         self.client = getattr(self.provider, "client", None)
 
@@ -146,6 +151,13 @@ class TranslationBackend:
         self._jobs: dict[str, TranslationJob] = {}
         self._job_results: dict[str, dict[str, Any]] = {}
         self._result_handle_to_job_id: dict[str, str] = {}
+
+    def _require_provider(self) -> BaseTranslationProvider:
+        if self.provider is None:
+            raise RuntimeError(
+                "No translation provider configured. Set OPENAI_API_KEY and restart the service."
+            )
+        return self.provider
 
     @property
     def segment_map(self) -> dict[str, dict]:
@@ -420,10 +432,11 @@ class TranslationBackend:
         return status_code in {408, 409, 429, 500, 502, 503, 504}
 
     def _create_chat_completion_with_retry(self, messages):
+        provider = self._require_provider()
         attempts = self.max_openai_attempts
         for attempt in range(1, attempts + 1):
             try:
-                return self.provider.create_chat_completion(messages=messages, max_tokens=4000)
+                return provider.create_chat_completion(messages=messages, max_tokens=4000)
             except Exception as error:
                 is_transient = self._is_transient_openai_error(error)
                 if attempt >= attempts or not is_transient:
@@ -595,11 +608,11 @@ class TranslationBackend:
             audio_file = BytesIO(audio_bytes)
             audio_file.name = "speech.webm"  # Whisper needs a filename
 
-            source_text = self.provider.transcribe_audio(audio_file=audio_file)
+            source_text = self._require_provider().transcribe_audio(audio_file=audio_file)
             logging.info("[Backend] Whisper transcription: %s", source_text[:60] + "…")
 
             translated_text = self.translate_text(source_text, target_language)
-            audio_mp3 = self.provider.synthesize_speech(text=translated_text)
+            audio_mp3 = self._require_provider().synthesize_speech(text=translated_text)
             logging.info("[Backend] TTS done (%d bytes)", len(audio_mp3))
             return source_text, translated_text, audio_mp3
         except Exception as e:
@@ -629,7 +642,7 @@ class TranslationBackend:
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
             ]},
         ]
-        completion = self.provider.client.chat.completions.create(
+        completion = self._require_provider().client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
             max_tokens=1200,
