@@ -3,9 +3,33 @@ name: Deploy to Cloud Run
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
   deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -33,3 +57,5 @@ jobs:
           service: translation-app
           region: us-central1
           image: gcr.io/translation-app-452812/translation-app:${{ github.sha }}
+          env_vars: |
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}

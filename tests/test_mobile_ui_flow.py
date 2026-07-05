@@ -132,7 +132,7 @@ def test_mode_switch_syncs_mobile_and_unified_mode():
 
 
 def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
-    source = Path("TranslationUI.py").read_text()
+    source = Path("TranslationUI.py").read_text(encoding="utf-8")
 
     assert "document.getElementById('status_label')" not in source
     assert "document.getElementById('debug_info')" not in source
@@ -147,7 +147,7 @@ def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
 
 
 def test_transcript_fallback_js_handler_is_defined_and_exported():
-    source = Path("TranslationUI.py").read_text()
+    source = Path("TranslationUI.py").read_text(encoding="utf-8")
 
     assert "async function translateTranscriptFallback()" in source
     assert "window.translateTranscriptFallback = translateTranscriptFallback;" in source
@@ -155,14 +155,14 @@ def test_transcript_fallback_js_handler_is_defined_and_exported():
 
 
 def test_voice_ui_decodes_percent_encoded_translation_headers():
-    source = Path("TranslationUI.py").read_text()
+    source = Path("TranslationUI.py").read_text(encoding="utf-8")
 
     assert "decodeURIComponent(value)" in source
     assert "const transHeader = resp.headers.get('X-Translated-Text')" in source
 
 
 def test_workspace_text_mode_js_has_debounce_and_auto_translation_trigger():
-    source = Path("TranslationUI.py").read_text()
+    source = Path("TranslationUI.py").read_text(encoding="utf-8")
 
     assert "const DEBOUNCE_MS = 350;" in source
     assert "source.addEventListener('input', scheduleDebouncedTranslation);" in source
@@ -171,7 +171,7 @@ def test_workspace_text_mode_js_has_debounce_and_auto_translation_trigger():
 
 
 def test_workspace_text_mode_js_discards_stale_responses():
-    source = Path("TranslationUI.py").read_text()
+    source = Path("TranslationUI.py").read_text(encoding="utf-8")
 
     assert "let activeRequestToken = 0;" in source
     assert "const token = ++activeRequestToken;" in source
