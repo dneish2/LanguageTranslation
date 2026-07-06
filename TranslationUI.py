@@ -150,6 +150,7 @@ class TranslationUI:
             port=int(os.getenv("PORT", "8080")),
             title="Passage",
             favicon=str(Path(__file__).resolve().parent / "static" / "favicon.svg"),
+            reload=False,
         )
 
     def _inject_theme(self) -> None:

@@ -1,169 +1,75 @@
-# Language Translation Tool
+# Passage
 
-![Cover](Multilingual.png)
+A translation workspace. Paste text, drop a document, snap an image, or speak —
+Passage translates it, shows its work segment by segment, and keeps humans in the
+loop for review and refinement.
 
-## Overview
+Formerly "LanguageTranslation"; being rebuilt as Passage. The plan of record —
+locked decisions, roadmap, current state — lives in [PASSAGE_PLAN.md](PASSAGE_PLAN.md).
+Read that first if you're picking up development.
 
-This tool makes it easy to translate full documents like DOCX, PDF, and PPTX while keeping the original formatting and structure intact. It uses a flexible logic layer to understand what should be translated and how, working alongside language models to produce clean, editable outputs ready for use or refinement.
+## Run it locally
 
-By automating repetitive tasks, this tool shifts the role of a manual translator to that of a **quality assurance specialist**, enabling **power users** to focus on refining outputs rather than starting from scratch. This approach significantly enhances both productivity and accuracy, making it possible to handle larger volumes of work with greater confidence.
+Requires Python 3.12. The project uses a `uv` virtual environment at `.venv`.
 
-At its core, the design is centered on two principles:
-1. **Customizable Translation Logic**: A customizable system prompt governs how the tool handles names, technical terms, and domain-specific phrases. This flexibility ensures accurate and context-aware output to match nuanced need. 
-2. **Human-Centered Document Interaction**: Instead of managing files through code or digging through folders, documents are surfaced directly in the interface. You can preview, translate, and export with just a few clicks.
+```bash
+git clone https://github.com/dneish2/LanguageTranslation.git
+cd LanguageTranslation
 
-### Key Components
+# create/sync the venv (or use an existing .venv)
+uv venv && uv pip install -r requirements.txt
 
-## Docs Translation Workflow
-Consier this basic workflow for a document translator in which you loop through pargraphs of text, extract text, send it to inference to an LLM and replace the original text with the translated text.
+# provide your OpenAI key (a .env file in the repo root also works)
+# PowerShell:  $env:OPENAI_API_KEY = "sk-..."
+# bash:        export OPENAI_API_KEY=sk-...
 
-![Workflow](workflow.png)
+.venv/Scripts/python.exe TranslationUI.py   # Windows
+# .venv/bin/python TranslationUI.py         # macOS/Linux
+```
 
-**What it does:**  
-Runner → File Loader → Translation Backend → DOCX Parser → `translate_text()` (OpenAI) → Segment Map → Output Stream → Translated `.docx` (with Progress/Logs along the way).
+Open http://localhost:8080. Without an API key the app still boots and serves the
+UI; translation calls fail with a clear error until a provider is configured.
 
-**Formatting vs. styles:**
-- ✅ Preserves **paragraph formatting**: headings, alignment, list structure (set on the paragraph).
-- ⚠️ Drops **inline/run styles**: bold/italic/links, mixed fonts inside a sentence (runs are replaced).
-- If you need inline styles preserved:
-  1) *Quick but lossy:* translate each **run** separately (keeps styles; may hurt translation quality).
-  2) *Best practice:* translate the **whole paragraph once**, then **diff/map** the result back to the original runs, copying their styles.
- 
-### Voice Translation Service
+## Pages
 
-**Purpose:**  
-Demonstrate live voice translation by taking a short mic recording, turning it into text, translating it, then having a text to speech model speak the translation back as an MP3.
+| Route | What it is |
+|-------|------------|
+| `/` | The workspace: Text / Document / Image modes via the header tabs, language bar, facing source/translation panels, segment review for documents, Recent Threads drawer |
+| `/voice` | Voice translation: record (or paste a transcript), hear the translation spoken back |
+| `/mobile` | Mobile layout (being folded into one responsive layout) |
 
-**Entry Point:**  
-`POST /api/voice_translate` (multipart/form-data)  
-- `file`: recorded audio blob (e.g., `audio/webm;codecs=opus`)  
-- `language`: target language code (e.g., `es`, `fr`, `de`, `zh`, …)
+## Environment variables
 
-**Core Components:**  
-- `TranslationBackend.translate_audio(bytes, target_language) -> (translated_text: str, mp3_bytes: bytes)`  
-  1) **ASR (Whisper):** `whisper-1` transcribes the uploaded audio → `source_text`  
-  2) **MT (GPT):** `translate_text()` → translates `source_text` to `target_language`  
-  3) **TTS:** `tts-1` (voice=`nova`) synthesizes translated text → MP3 bytes  
-- **HTTP layer (NiceGUI/FastAPI):** wraps the pipeline, returns MP3 with helpful headers.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OPENAI_API_KEY` | — | Provider key for translation, Whisper, and TTS |
+| `PORT` | `8080` | Listen port (Cloud Run injects this) |
+| `PASSAGE_PUBLIC_API` | off | Set `1` to disable the API session-token gate (local dev) |
+| `PASSAGE_API_RATE_LIMIT` | `30` | Requests per minute per IP on `/api/*` |
+| `PASSAGE_MAX_TEXT_CHARS` | `8000` | Max characters per text translation |
+| `PASSAGE_MAX_UPLOAD_BYTES` | `8388608` | Max upload size (8 MB) |
+| `LIVE_TEXT_STREAMING` | `false` | Enable SSE streaming for long text translations |
 
-**Response:**  
-- **Body:** MP3 audio (translated speech)  
-- **Headers:**  
-  - `X-Original-Text`: short preview/safe snippet of transcription  
-  - `X-Translated-Text`: label like “Translated to Spanish”  
-  - `X-Target-Language`: target language code  
-  - `Content-Length`: MP3 size in bytes
+## API
 
-**Happy Path Flow:**  
-1. Browser **MediaRecorder** captures audio → sends blob to `/api/voice_translate` with `language`.  
-2. Backend calls `translate_audio()` → Whisper (ASR) → GPT translate → TTS MP3.  
-3. Returns MP3; frontend sets `<audio src>` and displays original/translated text labels.
+The `/api/*` endpoints (`text_translate`, `text_translate_stream`, `voice_translate`,
+`image_translate`) are used by the app's own pages and are gated by a short-lived
+session token that those pages embed (`X-Passage-Token` header) plus a per-IP rate
+limit. They are not a public API; real accounts land later (see the plan, Phase 4).
 
-**Voice UX Contract (desktop + mobile voice entry points):**
-1. **Record audio OR paste transcript** (transcript is the explicit fallback when recording is unavailable).
-2. **Translate** using the same action semantics across views.
-3. **Play/show output** (desktop plays audio + shows text; mobile voice flow shows translated text).
+## Tests
 
-Both voice views share the same status/debug progression language (`Ready`, `Requesting microphone access`, `Recording`, `Stopping`, `Processing`, `Translating transcript`, `Complete`) so behavior is intentional and consistent.
+```bash
+.venv/Scripts/python.exe -m pytest tests/
+```
 
-**Error Handling (high level):**  
-- Empty upload → `400` with `X-Error`.  
-- Any pipeline failure → `500` with `X-Error` message.  
-- Backend logs at each stage (`[Backend]`, `[API]`) for diagnosis.
+The suite gates deployment: pushes to `main` run tests in CI and, on green, build
+and deploy to Cloud Run (`.github/workflows/deploy.yml`). Secrets (`OPENAI_API_KEY`,
+`GCP_SA_KEY`) live in GitHub Actions secrets — never in the repo.
 
-1. **TranslationBackend**
-   - **Role**: Processes and translates text from the input documents.
-   - **Features**:
-     - Structured to handle multi-format inputs while preserving document integrity (e.g., layouts, fonts, tables).
-     - Implements advanced parsing to isolate translatable elements while leaving non-essential elements untouched (e.g., URLs, metadata).
-     - Context adaptation through fine-tuned language models ensures dialect-appropriate outputs.
+## Design
 
-2. **TranslationUI**
-   - **Role**: Provides a clean, interactive interface for managing uploads, tracking progress, and reviewing translated outputs.
-   - **Features**:
-     - Tracks translation stages to provide transparency into the process.
-     - Supports real-time feedback and correction workflows, allowing users to refine results with minimal friction.
-     - Designed for accessibility and scalability across use cases.
-
-### Unified UX Contract (default workflow page)
-
-The default experience is now a **single workspace** used across desktop and mobile so upcoming realtime/OCR work does not fragment the UI.
-
-1. **One primary layout**
-   - Source panel on the left (or top on mobile).
-   - Translated output panel on the right (or bottom on mobile).
-   - Compact control bar with:
-     - language direction + swap
-     - one `Input Mode` selector
-     - one primary translation action button
-
-2. **Single Input Mode selector**
-   - `Text`
-   - `Document`
-   - `Image/Camera` (shared UI path now; OCR/camera internals can plug in later)
-   - All modes feed the same output/status/result area to preserve interaction consistency.
-
-3. **Shallow navigation**
-   - Keep specialized pages (e.g., advanced segment editing or voice page) where needed.
-   - Most users stay on the default unified workflow page.
-
-4. **Consistency standards (desktop + mobile)**
-   - Shared button system (primary/secondary visual language).
-   - Consistent spacing scale and card rhythm.
-   - Standardized status/loading/success/error banners.
-   - Reuse the same action/result semantics across input modes.
-
-5. **Regression safety**
-   - UI tests lock mode-switching semantics and translation entry behavior before realtime/OCR logic expands.
-
-### Job Queue, Recovery, and Ops Metrics
-
-- **Bounded concurrency:** translation jobs run through a worker pool with a configurable max worker count.
-- **Queue execution policy:** queueing supports FIFO/LIFO plus overload policies such as `reject_new` and `drop_oldest`.
-- **Durable metadata storage:** each job's lifecycle metadata and result reference are persisted in SQLite for reconnect/restart recovery.
-- **Dashboard-ready alerts:** the metrics dashboard exposes alert signals for error rate, p95 duration, retry spikes, and queue depth thresholds.
-
-Here’s the full Usage section in markdown for you to copy directly into your README.md:
-
-## Usage
-
-Follow these steps to set up and run the application:
-
-1. **Clone the Repository**
-   Clone the project to your local machine:
-   ```bash
-   git clone https://github.com/dneish2/LanguageTranslation.git
-   cd LanguageTranslation
-   ```
-
-2. **Install Dependencies**
-   Use the requirements.txt file to install the necessary Python modules:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Set Up Environment Variables**
-   Ensure you have an .env file in the project root with your OpenAI API key:
-   ```bash
-   OPENAI_API_KEY=your-api-key-here
-   ```
-
-4. **Run the Application**
-   Start the application by running the main script:
-   ```bash
-   python TranslationUI.py
-   ```
-
-5. **Access the Interface**
-   Once the server starts, open your browser and navigate to:
-   http://127.0.0.1:8080
-This will load the NiceGUI-based user interface, where you can upload documents, select target languages, and manage translations.
-
-### Experimental Voice Translation
-An additional page provides one-way voice translation using OpenAI's realtime API.
-Click **Voice Translation (Exp)** in the top bar to access it. Record speech in any language and hear the translated output in your selected language.
-
-### Prerequisites
-- **Python Version**: Ensure Python 3.8 or higher is installed.
-- **Dependencies**: Install all required packages listed in `requirements.txt`.
-- **Environment Variables**: Add your OpenAI API key in a `.env` file located in the project root:
+The visual identity ("Press": warm paper, letterpress ink, burgundy accent;
+Palatino display over Georgia body; monospace reserved for data) is defined in
+`static/passage.css` and mirrored in `theme.py`. All UI styling flows through
+those tokens — no ad-hoc color classes.
