@@ -32,6 +32,14 @@ class DummyLabel:
         self.text = ""
 
 
+class DummyButton:
+    def __init__(self):
+        self.enabled = True
+
+    def set_enabled(self, value):
+        self.enabled = value
+
+
 def _build_mobile_ui() -> TranslationUI:
     ui_app = TranslationUI()
     ui_app.mobile_mode = True
@@ -188,6 +196,66 @@ def test_record_thread_keeps_distinct_languages_for_the_same_text_separate():
     ui_app._record_chat_thread("Hello", "Bonjour", "French")
 
     assert len(ui_app.recent_threads) == 2
+
+
+def test_set_translate_button_busy_toggles_enabled_state():
+    ui_app = _build_mobile_ui()
+    ui_app.translate_button = DummyButton()
+
+    ui_app._set_translate_button_busy(True)
+    assert ui_app.translate_button.enabled is False
+
+    ui_app._set_translate_button_busy(False)
+    assert ui_app.translate_button.enabled is True
+
+
+def test_set_translate_button_busy_is_a_noop_before_first_render():
+    ui_app = _build_mobile_ui()
+    assert ui_app.translate_button is None
+
+    ui_app._set_translate_button_busy(True)  # must not raise
+
+
+def test_mobile_voice_translation_failure_offers_retry_via_start_mobile_translation():
+    ui_app = _build_mobile_ui()
+    captured = {}
+    ui_app.show_error = lambda error, retry=None: captured.update(error=error, retry=retry)
+    ui_app.backend.translate_text = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+
+    ui_app._run_mobile_voice_translation("hello", "German", DummyProgress(), DummyLabel())
+
+    assert "boom" in str(captured["error"])
+    assert captured["retry"] == ui_app.start_mobile_translation
+
+
+def test_mobile_image_translation_failure_offers_retry_via_start_mobile_translation():
+    ui_app = _build_mobile_ui()
+    ui_app.image_upload_bytes = b"fake-bytes"
+    ui_app.image_upload_name = "sign.png"
+    captured = {}
+    ui_app.show_error = lambda error, retry=None: captured.update(error=error, retry=retry)
+    ui_app.backend.translate_image_text_blocks = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ocr failed"))
+
+    ui_app._run_mobile_image_translation("French", DummyProgress(), DummyLabel())
+
+    assert "ocr failed" in str(captured["error"])
+    assert captured["retry"] == ui_app.start_mobile_translation
+
+
+def test_mobile_image_translation_success_updates_progress_and_renders_result():
+    ui_app = _build_mobile_ui()
+    ui_app.image_upload_bytes = b"fake-bytes"
+    ui_app.image_upload_name = "sign.png"
+    ui_app.backend.translate_image_text_blocks = lambda *a, **k: {"translated_blocks": [], "confidence_metadata": {}}
+    rendered = []
+    ui_app.show_mobile_image_result = lambda language: rendered.append(language)
+    progress, label = DummyProgress(), DummyLabel()
+
+    ui_app._run_mobile_image_translation("French", progress, label)
+
+    assert progress.values == [40, 100]
+    assert label.text == "Translation complete."
+    assert rendered == ["French"]
 
 
 def test_mode_switch_syncs_mobile_and_unified_mode():

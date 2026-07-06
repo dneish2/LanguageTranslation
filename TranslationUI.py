@@ -8,7 +8,7 @@ from collections import deque
 from io import BytesIO
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 from nicegui import ui, app
@@ -48,6 +48,7 @@ class TranslationUI(VoicePageMixin):
         self.overlay_preview_visible = True
         self.current_correlation_id: str | None = None
         self.cancel_button = None
+        self.translate_button = None
         self.active_job_id: str | None = None
         self.job_poll_timer = None
 
@@ -274,6 +275,28 @@ class TranslationUI(VoicePageMixin):
         with container:
             ui.label(message).classes(self.banner_classes.get(kind, self.banner_classes["info"]))
 
+    def _set_translate_button_busy(self, busy: bool) -> None:
+        """Disable Translate while a request is in flight — re-enabled from
+        every terminal path (show_error, show_result, show_mobile_*_result)."""
+        if self.translate_button is not None:
+            self.translate_button.set_enabled(not busy)
+
+    def _render_progress_ui(self, message: str, *, show_cancel: bool = False):
+        """Shared loading surface for Text/Image/Document translation: clears
+        progress/result/stats, renders one circular-progress + status label
+        (+ optional Cancel), returns (progress_ui, label_ui)."""
+        self.progress_container.clear()
+        self.result_container.clear()
+        self.stats_container.clear()
+        with self.progress_container:
+            progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
+                .classes("mx-auto mt-4")
+            label_ui = ui.label(message).classes("text-center mt-2")
+            if show_cancel:
+                self.cancel_button = ui.button("Cancel Translation", on_click=self.cancel_translation)\
+                    .classes(f"{theme.BTN_DANGER} mt-2")
+        return progress_ui, label_ui
+
     def swap_languages(self):
         source = self.source_language_input.value if self.source_language_input else self.current_source_language
         target = self.target_language_input.value if self.target_language_input else self.current_target_language
@@ -393,8 +416,8 @@ class TranslationUI(VoicePageMixin):
                         placeholder="Target language",
                         autocomplete=LANGUAGES,
                     ).bind_value(self, "current_target_language").classes("min-w-[120px] flex-1")
-                    translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
-                    translate_button.props(f"id={self.text_status_scope}_manual_translate")
+                    self.translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
+                    self.translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
                 # Facing pages: source sits on paper, translation on panel;
                 # stacks to one column on narrow viewports.
@@ -483,6 +506,7 @@ class TranslationUI(VoicePageMixin):
             if not self.uploaded_file:
                 self.show_error("Please upload a file before translating.")
                 return
+            self._set_translate_button_busy(True)
             self.handle_translation(language)
             return
 
@@ -490,18 +514,13 @@ class TranslationUI(VoicePageMixin):
             if not self.image_upload_bytes or not self.image_upload_name:
                 self.show_error("Please upload or capture an image before translating.")
                 return
-            self.progress_container.clear()
-            self.result_container.clear()
-            self.stats_container.clear()
-            try:
-                self.image_translation_result = self.backend.translate_image_text_blocks(
-                    self.image_upload_bytes,
-                    self.image_upload_name,
-                    language,
-                )
-                self.show_mobile_image_result(language)
-            except Exception as ex:
-                self.show_error(str(ex))
+            self._set_translate_button_busy(True)
+            progress_ui, label_ui = self._render_progress_ui("Reading image text...")
+
+            def image_task():
+                self._run_mobile_image_translation(language, progress_ui, label_ui)
+
+            Thread(target=image_task).start()
             return
 
         source_text = (self.text_source_input.value or "").strip() if self.text_source_input else ""
@@ -509,13 +528,8 @@ class TranslationUI(VoicePageMixin):
             self.show_error("Please provide source text before translating.")
             return
 
-        self.progress_container.clear()
-        self.result_container.clear()
-        self.stats_container.clear()
-
-        with self.progress_container:
-            progress_ui = ui.circular_progress(value=0, max=100, show_value=True).classes("mt-3")
-            label_ui = ui.label("Translating text...").classes("text-sm p-muted-text")
+        self._set_translate_button_busy(True)
+        progress_ui, label_ui = self._render_progress_ui("Translating text...")
 
         def voice_task():
             self._run_mobile_voice_translation(source_text, language, progress_ui, label_ui)
@@ -534,7 +548,23 @@ class TranslationUI(VoicePageMixin):
             self.show_mobile_voice_result(voice_text, translated, language)
         except Exception as ex:
             logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
-            self.show_error(ex)
+            self.show_error(ex, retry=self.start_mobile_translation)
+
+    def _run_mobile_image_translation(self, language, progress_ui, label_ui):
+        try:
+            progress_ui.set_value(40)
+            label_ui.text = "Reading and translating image text..."
+            self.image_translation_result = self.backend.translate_image_text_blocks(
+                self.image_upload_bytes,
+                self.image_upload_name,
+                language,
+            )
+            progress_ui.set_value(100)
+            label_ui.text = "Translation complete."
+            self.show_mobile_image_result(language)
+        except Exception as ex:
+            logging.error("[UI] Mobile image translation error: %s", ex, exc_info=True)
+            self.show_error(ex, retry=self.start_mobile_translation)
 
     async def handle_mobile_image_upload(self, event):
         self.image_upload_name = event.file.name
@@ -543,6 +573,8 @@ class TranslationUI(VoicePageMixin):
         self.refresh_upload_ui()
 
     def show_mobile_image_result(self, language: str) -> None:
+        self._set_translate_button_busy(False)
+        self.progress_container.clear()
         self.result_container.clear()
         result = self.image_translation_result or {}
         blocks = result.get("translated_blocks", [])
@@ -564,6 +596,8 @@ class TranslationUI(VoicePageMixin):
                             ui.label(block.get("translated_text", "")).classes(f"text-sm {theme.PANEL_TARGET} p-2")
 
     def show_mobile_voice_result(self, original_text, translated_text, language):
+        self._set_translate_button_busy(False)
+        self.progress_container.clear()
         self.result_container.clear()
         self.stats_container.clear()
         with self.result_container:
@@ -599,18 +633,7 @@ class TranslationUI(VoicePageMixin):
         )
         logging.info(f"[UI] Translating '{self.uploaded_file_name}' → {target_language}")
 
-        # clear old UI
-        self.progress_container.clear()
-        self.result_container.clear()
-        self.stats_container.clear()
-
-        with self.progress_container:
-            progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
-                .classes("mx-auto mt-4")
-            label_ui = ui.label("Preparing translation...")\
-                .classes("text-center mt-2")
-            self.cancel_button = ui.button("Cancel Translation", on_click=self.cancel_translation)\
-                .classes(f"{theme.BTN_DANGER} mt-2")
+        progress_ui, label_ui = self._render_progress_ui("Preparing translation...", show_cancel=True)
 
         self._start_job_and_poll(
             progress_ui=progress_ui,
@@ -683,13 +706,13 @@ class TranslationUI(VoicePageMixin):
 
             if job.state == "failed":
                 _log_event(failed_event, correlation_id=correlation_id, error=job.error or "unknown")
-                self.show_error(job.error or "Translation failed")
+                self.show_error(job.error or "Translation failed", retry=self.start_mobile_translation)
                 return
 
             result = self.backend.get_job_result(job.result_handle) if job.result_handle else None
             if not result:
                 _log_event(failed_event, correlation_id=correlation_id, error="missing_result_handle")
-                self.show_error("Translation failed: missing result payload.")
+                self.show_error("Translation failed: missing result payload.", retry=self.start_mobile_translation)
                 return
 
             count = result["count"]
@@ -738,6 +761,7 @@ class TranslationUI(VoicePageMixin):
 
     def show_result(self):
         logging.info(f"[UI] Rendering results – advanced={self.advanced_mode}, segments={len(self.original_segments_map)}")
+        self._set_translate_button_busy(False)
         self.progress_container.clear()
         self.result_container.clear()
         self.stats_container.clear()
@@ -985,26 +1009,32 @@ class TranslationUI(VoicePageMixin):
             marker in detail for marker in ("Error code", "Traceback", "Exception", "HTTP/")
         )
 
-    def show_error(self, error):
+    def show_error(self, error, *, retry: Callable[[], None] | None = None):
         """Single error surface: short guidance in the banner; raw provider/
-        stack detail tucked into an expansion instead of dumped on the page."""
+        stack detail tucked into an expansion instead of dumped on the page.
+        Every failure path funnels here, so it's also where the in-flight
+        Translate button gets re-enabled and any stuck progress spinner
+        (rendered by _render_progress_ui before the failure) is cleared."""
+        self._set_translate_button_busy(False)
+        self.progress_container.clear()
+        self.cancel_button = None
         self.result_container.clear()
         self.stats_container.clear()
         detail = str(error).strip() or "Unknown error."
         if not self._is_technical_error(detail):
             self._show_banner(self.result_container, f"Error: {detail}", "negative")
-            return
-        self._show_banner(
-            self.result_container,
-            "The translation service hit an error and nothing was changed. Please try again.",
-            "negative",
-        )
-        with self.result_container:
-            with ui.expansion("Technical detail").classes(f"w-full {theme.WELL}"):
-                ui.label(detail).classes(f"{theme.DATA} text-xs break-all")
-
-    # ─────────────────────────────── VOICE TRANSLATION PAGE ─────────────────────────────────
-
+        else:
+            self._show_banner(
+                self.result_container,
+                "The translation service hit an error and nothing was changed. Please try again.",
+                "negative",
+            )
+            with self.result_container:
+                with ui.expansion("Technical detail").classes(f"w-full {theme.WELL}"):
+                    ui.label(detail).classes(f"{theme.DATA} text-xs break-all")
+        if retry is not None:
+            with self.result_container:
+                ui.button("Try again", on_click=lambda: retry()).classes(f"{theme.BTN_SECONDARY_SM} mt-2")
 
     # ─────────────────────────── VOICE TRANSLATION API ────────────────────────────────────
 

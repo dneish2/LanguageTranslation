@@ -194,10 +194,22 @@ looks properly good; keep committing to this branch):
 2. [x] One design system: buttons/banners from theme constants; zero raw Tailwind color classes
        remain anywhere in `TranslationUI.py` (verified 2026-07-06). Segment approve/reject/delete
        use `ui.icon`; most other buttons are short text labels by design, not icon candidates.
-3. [ ] Unified error + loading model: `show_error`'s banner+detail split shipped (commit `2dd7330`).
-       Still open: a single `notify_error()`/request-lifecycle helper, retry affordance, buttons
-       disabled in flight, one shared skeleton/progress pattern instead of ad-hoc
-       `circular_progress` blocks per mode.
+3. [x] Unified error + loading model — **done 2026-07-06**: `_render_progress_ui(message,
+       show_cancel=)` is the one shared loading surface (Text/Image/Document all use it instead
+       of ad-hoc `circular_progress` blocks); `self.translate_button` disables the instant
+       Translate is clicked and re-enables from every terminal path (`show_error`, `show_result`,
+       `show_mobile_image_result`, `show_mobile_voice_result`); `show_error(error, retry=...)`
+       renders a "Try again" button that re-invokes the failed action (wired into the Text/Image
+       translate-thread failures and Document job-poll failures) and now also clears
+       `progress_container` — a real bug caught live: the spinner+label used to stay stuck on
+       screen behind the error banner because `show_error` never cleared that container. Image
+       mode gained real progress feedback for the first time (it used to block silently with a
+       frozen UI during OCR+translate). Verified: 76/76 pytest (5 new), live browser — button
+       disables/re-enables, image OCR failure shows the retry button, spinner clears on error.
+       Known debt spotted while verifying, not fixed here (pre-existing, out of this task's
+       scope): `show_mobile_voice_result`/`show_mobile_image_result` render inside a raw
+       `ui.card()` with no Passage classes — floats as a stock white Quasar card instead of
+       paper/panel; fold into the theme sweep next time either is touched.
 4. [x] Merge the two segment editors into ONE segment review surface — done (commit `f36ea9e`,
        "Merge the segment editors"); no separate Document Editor dialog remains.
 5. [x] Responsive layout instead of the `/mobile` UA-redirect; retire `/mobile` — done (commit
