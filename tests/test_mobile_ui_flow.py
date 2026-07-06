@@ -165,9 +165,63 @@ def test_workspace_text_mode_js_has_debounce_and_auto_translation_trigger():
     source = Path("TranslationUI.py").read_text(encoding="utf-8")
 
     assert "const DEBOUNCE_MS = 350;" in source
-    assert "source.addEventListener('input', scheduleDebouncedTranslation);" in source
+    # Bindings are delegated on `document` so they survive workspace re-renders.
+    assert "document.addEventListener('input', (e) => {" in source
+    assert "scheduleDebouncedTranslation();" in source
     assert "window.setTimeout(requestTranslation, DEBOUNCE_MS);" in source
     assert "fetch('/api/text_translate'" in source
+
+
+def test_workspace_text_js_is_injected_once_at_page_build_not_on_rerender():
+    """Re-injecting on refresh_upload_ui crashed with 'parent slot deleted'
+    when triggered from an element inside the cleared container (swap ⇄)."""
+    source = Path("TranslationUI.py").read_text(encoding="utf-8")
+
+    injection_calls = source.count("self._inject_workspace_text_live_translation_js()")
+    assert injection_calls == 1
+    main_page_body = source.split("def main_page(self):")[1].split("def _render_mode_tabs")[0]
+    assert "_inject_workspace_text_live_translation_js" in main_page_body
+
+
+def _make_upload_event(name: str, data: bytes):
+    class FakeFile:
+        def __init__(self):
+            self.name = name
+
+        async def read(self):
+            return data
+
+    class FakeEvent:
+        file = FakeFile()
+
+    return FakeEvent()
+
+
+def test_document_upload_reads_nicegui_3x_file_payload(monkeypatch):
+    import asyncio
+
+    ui_app = _build_mobile_ui()
+    monkeypatch.setattr("TranslationUI.ui.notify", lambda *a, **k: None)
+    ui_app.refresh_upload_ui = lambda: None
+
+    asyncio.run(ui_app.handle_mobile_upload(_make_upload_event("report.pdf", b"%PDF-1.7")))
+
+    assert ui_app.uploaded_file_name == "report.pdf"
+    assert ui_app.uploaded_file_extension == "pdf"
+    assert ui_app.uploaded_file.getvalue() == b"%PDF-1.7"
+
+
+def test_image_upload_reads_nicegui_3x_file_payload(monkeypatch):
+    import asyncio
+
+    ui_app = _build_mobile_ui()
+    monkeypatch.setattr("TranslationUI.ui.notify", lambda *a, **k: None)
+    ui_app.refresh_upload_ui = lambda: None
+
+    asyncio.run(ui_app.handle_mobile_image_upload(_make_upload_event("sign.png", b"\x89PNG")))
+
+    assert ui_app.image_upload_name == "sign.png"
+    assert ui_app.image_upload_bytes == b"\x89PNG"
 
 
 def test_workspace_text_mode_js_discards_stale_responses():

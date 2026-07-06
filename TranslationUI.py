@@ -223,6 +223,10 @@ window.voiceUx = window.voiceUx || (() => {
             .props(f"id={scope}_debug")
 
     def _inject_workspace_text_live_translation_js(self) -> None:
+        # Injected ONCE per page build (main_page). Bindings are delegated on
+        # `document`, so workspace re-renders (swap ⇄, mode tabs) need no
+        # re-injection — calling add_body_html from a handler whose element was
+        # just cleared crashes with "parent slot deleted".
         ui.add_body_html("""
 <script>
 (() => {
@@ -273,22 +277,15 @@ window.voiceUx = window.voiceUx || (() => {
         if (debounceTimer) window.clearTimeout(debounceTimer);
         debounceTimer = window.setTimeout(requestTranslation, DEBOUNCE_MS);
     }
-    function init() {
-        const source = sourceEl();
-        const manualBtn = byId(`${scope}_manual_translate`);
-        if (source && !source.dataset.liveTranslateBound) {
-            source.dataset.liveTranslateBound = '1';
-            source.addEventListener('input', scheduleDebouncedTranslation);
-        }
-        if (manualBtn && !manualBtn.dataset.liveTranslateBound) {
-            manualBtn.dataset.liveTranslateBound = '1';
-            manualBtn.addEventListener('click', requestTranslation);
-        }
-        setStatus(stateLabels.READY);
-    }
-    window.workspaceTextLiveTranslation = { init, requestTranslation };
-    window.addEventListener('load', init);
-    window.setTimeout(init, 0);
+    // Delegated bindings: the workspace DOM is torn down and rebuilt on every
+    // language swap / mode change, so listeners must live on `document`.
+    document.addEventListener('input', (e) => {
+        if (e.target && e.target.id === `${scope}_source`) scheduleDebouncedTranslation();
+    });
+    document.addEventListener('click', (e) => {
+        if (e.target && e.target.closest && e.target.closest(`#${scope}_manual_translate`)) requestTranslation();
+    });
+    window.workspaceTextLiveTranslation = { requestTranslation };
 })();
 </script>
         """)
@@ -298,6 +295,7 @@ window.voiceUx = window.voiceUx || (() => {
     def main_page(self):
         self._inject_theme()
         self._inject_api_token()
+        self._inject_workspace_text_live_translation_js()
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
@@ -484,8 +482,6 @@ window.voiceUx = window.voiceUx || (() => {
                             ).props(f"id={self.text_status_scope}_output")
                         else:
                             self._show_banner(self.progress_container, "Status: Ready to translate.", "info")
-        if self.input_mode == "Text":
-            self._inject_workspace_text_live_translation_js()
 
     def _render_source_input_panel(self):
         if self.input_mode == "Text":
@@ -525,10 +521,11 @@ window.voiceUx = window.voiceUx || (() => {
         self.input_mode = mode
         self.refresh_upload_ui()
 
-    def handle_mobile_upload(self, event):
-        self.uploaded_file_name = event.name
+    async def handle_mobile_upload(self, event):
+        # NiceGUI 3.x: the payload lives on event.file (FileUpload) and reads async.
+        self.uploaded_file_name = event.file.name
         self.uploaded_file_extension = self.uploaded_file_name.split(".")[-1].lower()
-        self.uploaded_file = BytesIO(event.content.read())
+        self.uploaded_file = BytesIO(await event.file.read())
         ui.notify(f"Selected '{self.uploaded_file_name}'", type="positive")
         self.refresh_upload_ui()
 
@@ -596,9 +593,9 @@ window.voiceUx = window.voiceUx || (() => {
             logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
             self.show_error(ex)
 
-    def handle_mobile_image_upload(self, event):
-        self.image_upload_name = event.name
-        self.image_upload_bytes = event.content.read()
+    async def handle_mobile_image_upload(self, event):
+        self.image_upload_name = event.file.name
+        self.image_upload_bytes = await event.file.read()
         ui.notify(f"Selected image '{self.image_upload_name}'", type="positive")
         self.refresh_upload_ui()
 

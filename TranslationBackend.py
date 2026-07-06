@@ -34,6 +34,28 @@ LOGGER = logging.getLogger("translation.backend")
 WHITE = (1, 1, 1)  # RGB white for PDF overwrite
 MODEL_COST_PER_1K_TOKENS = 0.002
 
+# Model roster (upgraded 2026-07-06): env-overridable until Phase 3's provider
+# profiles land. GPT-5-family models reject `max_tokens` (use
+# `max_completion_tokens`) and default to slow reasoning, so translation calls
+# pin reasoning_effort="none" — see _completion_limit_kwargs.
+TEXT_MODEL = os.getenv("PASSAGE_TEXT_MODEL", "gpt-5.4-nano")
+VISION_MODEL = os.getenv("PASSAGE_VISION_MODEL", "gpt-5.4-mini")
+TRANSCRIBE_MODEL = os.getenv("PASSAGE_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+TTS_MODEL = os.getenv("PASSAGE_TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("PASSAGE_TTS_VOICE", "nova")
+
+
+def _completion_limit_kwargs(model: str, max_tokens: int) -> dict[str, Any]:
+    """Per-model completion kwargs: GPT-5 family vs legacy chat models.
+
+    reasoning_effort="none" (5.4-family spelling; older 5.x called it
+    "minimal") keeps translation latency flat — we want raw generation,
+    not deliberation, and reasoning tokens bill as output.
+    """
+    if model.startswith("gpt-5"):
+        return {"max_completion_tokens": max_tokens, "reasoning_effort": "none"}
+    return {"max_tokens": max_tokens}
+
 
 JOB_STATE_QUEUED = "queued"
 JOB_STATE_RUNNING = "running"
@@ -62,19 +84,19 @@ class OpenAITranslationProvider(BaseTranslationProvider):
 
     def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
         return self.client.chat.completions.create(
-            model="gpt-4.1-nano",
+            model=TEXT_MODEL,
             messages=messages,
-            max_tokens=max_tokens,
+            **_completion_limit_kwargs(TEXT_MODEL, max_tokens),
         )
 
     def transcribe_audio(self, *, audio_file: BytesIO) -> str:
-        transcription = self.client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        transcription = self.client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=audio_file)
         return transcription.text
 
     def synthesize_speech(self, *, text: str) -> bytes:
         tts_resp = self.client.audio.speech.create(
-            model="tts-1",
-            voice="nova",
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
             input=text,
             response_format="mp3",
         )
@@ -615,17 +637,17 @@ class TranslationBackend:
     # ──────────────────────── VOICE (WHISPER + TTS) ────────────────────── #
     def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, str, bytes]:
         """
-        1. Transcribe `audio_bytes` with Whisper.  
-        2. Translate resulting text.  
+        1. Transcribe `audio_bytes` (TRANSCRIBE_MODEL).
+        2. Translate resulting text.
         3. Return TTS MP3 bytes of the translation.
         """
         try:
             logging.info("[Backend] Voice pipeline start → %s (%d bytes)", target_language, len(audio_bytes))
             audio_file = BytesIO(audio_bytes)
-            audio_file.name = "speech.webm"  # Whisper needs a filename
+            audio_file.name = "speech.webm"  # the transcription API needs a filename
 
             source_text = self._require_provider().transcribe_audio(audio_file=audio_file)
-            logging.info("[Backend] Whisper transcription: %s", source_text[:60] + "…")
+            logging.info("[Backend] Transcription: %s", source_text[:60] + "…")
 
             translated_text = self.translate_text(source_text, target_language)
             audio_mp3 = self._require_provider().synthesize_speech(text=translated_text)
@@ -659,9 +681,10 @@ class TranslationBackend:
             ]},
         ]
         completion = self._require_provider().client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=VISION_MODEL,
             messages=messages,
-            max_tokens=1200,
+            response_format={"type": "json_object"},
+            **_completion_limit_kwargs(VISION_MODEL, 1200),
         )
         raw = completion.choices[0].message.content.strip()
         payload = json.loads(raw)
@@ -702,7 +725,10 @@ class TranslationBackend:
 
     # ─────────────────────────── TOKEN COUNTS ─────────────────────────── #
     def calculate_tokens(self, total_text: str) -> int:
-        encoding = tiktoken.encoding_for_model("gpt-4o-mini")
+        try:
+            encoding = tiktoken.encoding_for_model(TEXT_MODEL)
+        except KeyError:  # tiktoken doesn't know newest model names
+            encoding = tiktoken.get_encoding("o200k_base")
         return len(encoding.encode(total_text))
 
     # ──────────────────────── SMALL PDF HELPER ────────────────────────── #

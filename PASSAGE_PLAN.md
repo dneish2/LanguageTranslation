@@ -4,7 +4,7 @@
 Any session (human or agent) resuming this work starts here: read "Current state", pick up the
 first unchecked item, and update this file as work lands. Keep it committed to git.
 
-Last updated: 2026-07-05.
+Last updated: 2026-07-06.
 
 ## What Passage is
 
@@ -25,7 +25,9 @@ machine translation and human edit.
 - **Models: provider-agnostic** via OpenAI-compatible `base_url` + `key` + `model` profiles.
   Local default = TranslateGemma via Ollama on David's 5090 — he wants to try **4b and smaller,
   not just 12b**; 27b only as a quality toggle. TranslateGemma has ~2K-token input context →
-  segment chunking must cap segment size. Hosted tier stays `gpt-4.1-nano` for now.
+  segment chunking must cap segment size. Hosted tier upgraded 2026-07-06 (David):
+  `gpt-5.4-nano` text, `gpt-5.4-mini` vision OCR, `gpt-4o-mini-transcribe` STT,
+  `gpt-4o-mini-tts` TTS — all env-overridable (`PASSAGE_TEXT_MODEL` etc.).
 - **Flagship: PDF-first** — a finplatform print-to-PDF report dropped into Passage → layout-preserved
   translated PDF via pdf2zh/BabelDOC as an async job. Live HTML/article translation deferred, seams kept ready.
 - **Traces: Langfuse-shaped JSONL/tables** (trace = document run, generation = segment,
@@ -57,7 +59,18 @@ machine translation and human edit.
   a failed state. Tests updated (`test_translate_text_raises_after_max_attempts`,
   `test_translate_raises_on_openai_exception`). Plus two mobile fixes: NiceGUI
   `on_value_change` for the mode selector, progress widgets created inside their container.
-- **Suite green**: 57/57 passing locally.
+- **Suite green**: 61/61 passing locally.
+- **Model roster upgraded + 2 crashes fixed (2026-07-06, on `design/press-tokens`)**:
+  text `gpt-5.4-nano` + vision `gpt-5.4-mini` (both with `max_completion_tokens` +
+  `reasoning_effort="none"` — GPT-5-family rejects `max_tokens`; "none" is the 5.4 spelling
+  of "minimal"), STT `whisper-1`→`gpt-4o-mini-transcribe`, TTS `tts-1`→`gpt-4o-mini-tts`.
+  All four env-overridable; OCR call also gained `response_format=json_object`. Live-verified:
+  all four models + full PDF pipeline + booted `/api/text_translate`. Crashes: NiceGUI 3.x
+  upload events (`event.file` + async read, was `event.name`/`event.content`) broke ALL
+  document/image uploads; live-translation JS re-injection on workspace re-render died with
+  "parent slot deleted" (swap ⇄) — now injected once per page, bindings delegated on `document`.
+  True realtime voice (`gpt-realtime-translate`, $0.034/min, WebSocket Realtime API) deliberately
+  NOT adopted — the /voice clip flow is REST; live streaming voice is a Phase-5-adjacent feature.
 - **Interim API hardening shipped** (branch `security/api-hardening`): the four public `/api/*`
   endpoints were fully open — anyone with the URL could burn the OpenAI key. Now gated by a
   short-lived signed session token (`api_security.py`) that only app-served pages embed
@@ -134,7 +147,7 @@ looks properly good; keep committing to this branch):
        30–120s), non-streaming fallback.
 3. [ ] Local default: TranslateGemma via Ollama (`http://host:11434/v1`) — model tag freely
        selectable (4b/smaller experiments; 27b toggle). **Cap segment size for ~2K-token context.**
-4. [ ] Hosted tier: keep `gpt-4.1-nano`, credit-gate via finplatform metering pattern later.
+4. [ ] Hosted tier: `gpt-5.4-nano` (done 2026-07-06), credit-gate via finplatform metering pattern later.
 5. [ ] Consolidate the model zoo (nano vs mini vs tiktoken's gpt-4o-mini) into one config surface.
 
 ### Phase 4 — Accounts + workspace (shared finplatform Supabase)
@@ -163,6 +176,12 @@ looks properly good; keep committing to this branch):
 5. [ ] **LLM-as-judge annotations (David, 2026-07-05)**: an advanced mode where a second model
        annotates translation quality per segment (fluency/accuracy/terminology flags). Rides on
        the trace/score model — a judge annotation is just another score row with model attribution.
+6. [ ] **Per-user preference dataset (David, 2026-07-06)**: the old Default/Advanced toggle was
+       removed in Phase 2 (segment review always renders now), but its successor is an "advanced
+       mode" built on Phases 4+5: each user's `segment_map` runs — machine output + their edits +
+       judge scores — accumulate as a per-user preference dataset (terminology choices, tone,
+       edit patterns) that can seed per-user glossaries/style prompts and later fine-tuning.
+       No new storage needed: it's a read view over `passage_segments` + `passage_traces` keyed by uid.
 
 ## Sequencing & scope
 
