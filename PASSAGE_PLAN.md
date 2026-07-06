@@ -222,16 +222,34 @@ looks properly good; keep committing to this branch):
 
 ### Phase 3 — Model optionality
 
-1. [ ] Generalize provider to `ChatCompletionsProvider` (`base_url`+`api_key`+`model`;
-       the `openai` SDK supports this natively). Nothing outside the provider references OpenAI by name.
-2. [ ] Provider profiles + settings UI: named profiles stored per-user (Supabase jsonb; local
-       JSON signed-out). "Test connection" = `GET /v1/models` (soft) + 1-token completion (hard).
-       Model field = free-text + dropdown from `/v1/models`. Generous timeouts (local cold start
-       30–120s), non-streaming fallback.
-3. [ ] Local default: TranslateGemma via Ollama (`http://host:11434/v1`) — model tag freely
-       selectable (4b/smaller experiments; 27b toggle). **Cap segment size for ~2K-token context.**
-4. [ ] Hosted tier: `gpt-5.4-nano` (done 2026-07-06), credit-gate via finplatform metering pattern later.
-5. [ ] Consolidate the model zoo (nano vs mini vs tiktoken's gpt-4o-mini) into one config surface.
+1. [x] Generalize provider to `ChatCompletionsProvider` — **done 2026-07-06**:
+       `base_url`+`api_key`+`text_model`, the `openai` SDK's native custom-`base_url` support.
+       `OpenAITranslationProvider` kept as an alias (not a rename-in-place) for anything that
+       still greps for the old name. `_require_openai_hosted()` makes voice (transcribe/
+       synthesize) raise a clear `NotImplementedError` on a non-OpenAI profile instead of
+       failing deep inside an SDK call for a capability the target server never had.
+2. [ ] Provider profiles + settings UI: **not built** — real scope (per-user Supabase-backed
+       profiles, a "Test connection" flow, a picker) that the plan itself sequences alongside
+       Phase 4's accounts work. Today, switching providers is an env var
+       (`TRANSLATION_PROVIDER=ollama`) — real and tested, just not exposed in the UI yet.
+3. [~] Local default: TranslateGemma via Ollama — **provider layer done and live-verified**
+       2026-07-06 against a real local Ollama instance (`http://localhost:11434/v1`, verified
+       reachable on this machine): `TRANSLATION_PROVIDER=ollama` boots the backend with **no
+       `OPENAI_API_KEY` required** (the old gate incorrectly demanded one for every provider —
+       fixed), targets `PASSAGE_OLLAMA_MODEL` (default `gemma3:1b` — a real tag confirmed pulled
+       here; NOT "TranslateGemma" specifically, which isn't pulled on this machine — override
+       once David confirms his actual tag), and a real translation round-tripped correctly
+       ("Good morning, where is the nearest pharmacy?" → "Buenos días, ¿sabe dónde hay una
+       farmacia cerca?"). **Still open**: model-tag picker UI (see item 2); **segment-size
+       capping for ~2K-token local context is NOT implemented** — no oversized-segment splitting
+       exists anywhere in the pipeline today (every provider gets one chat-completion call per
+       parsed document segment regardless of length), and building that well needs a real design
+       pass (per-provider context limits, a splitting strategy that doesn't break mid-sentence,
+       re-stitching) rather than a rushed pass — flagged, not attempted, this round.
+4. [x] Hosted tier: `gpt-5.4-nano` (done 2026-07-06), credit-gate via finplatform metering pattern later.
+5. [x] Consolidate the model zoo — **done**: verified zero hardcoded model-name literals remain
+       outside the roster constants block (`TEXT_MODEL`/`VISION_MODEL`/`TRANSCRIBE_MODEL`/
+       `TRANSCRIBE_REST_MODEL`/`TTS_MODEL`/`OLLAMA_MODEL`), all env-overridable.
 
 ### Phase 4 — Accounts + workspace (shared finplatform Supabase)
 

@@ -108,3 +108,70 @@ def test_non_wav_audio_transcribes_via_rest_fallback(monkeypatch):
 
     assert provider.transcribe_audio(audio_file=clip) == "hello"
     assert captured["model"] == tb.TRANSCRIBE_REST_MODEL
+
+
+def test_build_translation_provider_ollama_targets_local_base_url_and_model():
+    provider = tb.build_translation_provider("ollama", api_key="")
+
+    assert provider.is_openai_hosted is False
+    assert provider.base_url == tb.OLLAMA_BASE_URL
+    assert provider.text_model == tb.OLLAMA_MODEL
+
+
+def test_build_translation_provider_openai_is_hosted_with_configured_text_model():
+    provider = tb.build_translation_provider("openai", api_key="test-key")
+
+    assert provider.is_openai_hosted is True
+    assert provider.text_model == tb.TEXT_MODEL
+
+
+def test_build_translation_provider_rejects_unknown_name():
+    try:
+        tb.build_translation_provider("made-up-provider", api_key="x")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "made-up-provider" in str(e)
+
+
+def test_non_openai_provider_uses_plain_max_tokens_not_gpt5_kwargs():
+    provider, captured = _capturing_provider()
+    provider.base_url = "http://localhost:11434/v1"
+    provider.is_openai_hosted = False
+    provider.text_model = "gemma3:1b"
+
+    provider.create_chat_completion(messages=[{"role": "user", "content": "hi"}], max_tokens=4000)
+
+    assert captured == {"model": "gemma3:1b", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4000}
+
+
+def test_non_openai_provider_refuses_voice_capabilities_with_a_clear_error():
+    provider = tb.ChatCompletionsProvider(api_key="unused", base_url="http://localhost:11434/v1")
+
+    for capability_call in (
+        lambda: provider.transcribe_audio(audio_file=None),
+        lambda: provider.synthesize_speech(text="hi"),
+    ):
+        try:
+            capability_call()
+            assert False, "expected NotImplementedError"
+        except NotImplementedError as e:
+            assert "localhost:11434" in str(e)
+
+
+def test_backend_boots_ollama_provider_without_an_openai_api_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "ollama")
+
+    backend = tb.TranslationBackend()
+
+    assert backend.provider is not None
+    assert backend.provider.is_openai_hosted is False
+
+
+def test_backend_stays_providerless_without_key_when_provider_is_openai(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TRANSLATION_PROVIDER", "openai")
+
+    backend = tb.TranslationBackend()
+
+    assert backend.provider is None

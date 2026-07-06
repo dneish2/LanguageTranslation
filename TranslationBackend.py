@@ -53,6 +53,15 @@ TTS_MODEL = os.getenv("PASSAGE_TTS_MODEL", "gpt-audio-mini")
 TTS_VOICE = os.getenv("PASSAGE_TTS_VOICE", "nova")
 REALTIME_STT_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_REALTIME_STT_TIMEOUT", "45"))
 
+# Phase 3 model optionality: local/BYO endpoints speak the same
+# OpenAI-compatible /chat/completions surface (Ollama, vLLM, ...), so one
+# provider class handles both — only the base_url/model differ. Voice and
+# vision stay OpenAI-only (see ChatCompletionsProvider.is_openai_hosted).
+# "gemma3:1b" is a real tag verified pulled on this machine (2026-07-06) —
+# a placeholder for David's actual TranslateGemma tag, not a fixed choice.
+OLLAMA_BASE_URL = os.getenv("PASSAGE_OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MODEL = os.getenv("PASSAGE_OLLAMA_MODEL", "gemma3:1b")
+
 
 def _guess_audio_filename(data: bytes) -> str:
     """The REST transcription API infers the container from the filename."""
@@ -120,18 +129,47 @@ class BaseTranslationProvider(ABC):
         raise NotImplementedError
 
 
-class OpenAITranslationProvider(BaseTranslationProvider):
-    def __init__(self, api_key: str) -> None:
-        self.client = openai.OpenAI(api_key=api_key)
+class ChatCompletionsProvider(BaseTranslationProvider):
+    """OpenAI-compatible chat-completions provider: works against the real
+    OpenAI API or any base_url speaking the same surface (Ollama, vLLM, a
+    BYO endpoint). Voice (transcribe/synthesize) only works against the
+    real OpenAI API today — a non-OpenAI profile raises a clear
+    NotImplementedError instead of failing deep inside an SDK call for a
+    capability the target server never had.
+    """
+
+    def __init__(self, *, api_key: str, base_url: str | None = None, text_model: str | None = None) -> None:
+        # Resolved inside __init__, not as a keyword default, so it reads
+        # TEXT_MODEL at construction time — a mutable-global default would
+        # bind whatever TEXT_MODEL was when this method was first defined.
+        self.base_url = base_url
+        self.text_model = text_model if text_model is not None else TEXT_MODEL
+        self.is_openai_hosted = base_url is None
+        client_kwargs: dict[str, Any] = {"api_key": api_key or "not-needed"}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.client = openai.OpenAI(**client_kwargs)
+
+    def _require_openai_hosted(self, capability: str) -> None:
+        if not self.is_openai_hosted:
+            raise NotImplementedError(
+                f"{capability} needs the OpenAI hosted tier; this profile talks to {self.base_url}."
+            )
 
     def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
+        limit_kwargs = (
+            _completion_limit_kwargs(self.text_model, max_tokens)
+            if self.is_openai_hosted
+            else {"max_tokens": max_tokens}
+        )
         return self.client.chat.completions.create(
-            model=TEXT_MODEL,
+            model=self.text_model,
             messages=messages,
-            **_completion_limit_kwargs(TEXT_MODEL, max_tokens),
+            **limit_kwargs,
         )
 
     def transcribe_audio(self, *, audio_file: BytesIO) -> str:
+        self._require_openai_hosted("Voice transcription")
         data = audio_file.read()
         name = getattr(audio_file, "name", "speech.wav")
         if TRANSCRIBE_MODEL.startswith("gpt-realtime"):
@@ -201,6 +239,7 @@ class OpenAITranslationProvider(BaseTranslationProvider):
             return text
 
     def synthesize_speech(self, *, text: str) -> bytes:
+        self._require_openai_hosted("Text-to-speech")
         if TTS_MODEL.startswith("gpt-audio"):
             completion = self.client.chat.completions.create(
                 model=TTS_MODEL,
@@ -228,10 +267,21 @@ class OpenAITranslationProvider(BaseTranslationProvider):
         return tts_resp.content if hasattr(tts_resp, "content") else tts_resp
 
 
+# Kept as a deliberate alias, not a rename-in-place: any external code (or
+# a fresh session's grep) that still says "OpenAI provider" finds it here.
+OpenAITranslationProvider = ChatCompletionsProvider
+
+
 def build_translation_provider(provider_name: str, api_key: str) -> BaseTranslationProvider:
     name = (provider_name or "openai").strip().lower()
     if name == "openai":
-        return OpenAITranslationProvider(api_key)
+        return ChatCompletionsProvider(api_key=api_key, text_model=TEXT_MODEL)
+    if name == "ollama":
+        # Ollama's OpenAI-compatible endpoint ignores the API key, but the
+        # SDK requires a non-empty string.
+        return ChatCompletionsProvider(
+            api_key=api_key or "ollama", base_url=OLLAMA_BASE_URL, text_model=OLLAMA_MODEL,
+        )
     raise ValueError(f"Unsupported translation provider: {provider_name}")
 
 
@@ -274,7 +324,9 @@ class TranslationBackend:
     def __init__(self) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY")
         provider_name = os.getenv("TRANSLATION_PROVIDER", "openai")
-        if self.api_key:
+        # Ollama's local endpoint needs no API key — only the "openai"
+        # profile is gated on OPENAI_API_KEY being set.
+        if provider_name.strip().lower() == "ollama" or self.api_key:
             self.provider: BaseTranslationProvider | None = build_translation_provider(provider_name, self.api_key)
         else:
             # Boot without a provider so the UI can still serve (Cloud Run
