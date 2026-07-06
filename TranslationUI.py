@@ -850,40 +850,6 @@ window.voiceUx = window.voiceUx || (() => {
                     ).classes(theme.BTN_PRIMARY_XL)
                     ui.button("Start Over", on_click=self.refresh_upload_ui).classes(theme.BTN_SECONDARY_XL)
 
-    def handle_upload(self, event):
-        # file picked → ask for language & PPTX options
-        self.uploaded_file_name = event.name
-        self.uploaded_file_extension = self.uploaded_file_name.split(".")[-1].lower()
-        self.uploaded_file = BytesIO(event.content.read())
-        logging.info(f"[UI] Uploaded '{self.uploaded_file_name}'")
-
-        self.upload_container.clear()
-        with self.upload_container:
-            ui.label(f"File '{self.uploaded_file_name}' uploaded successfully!")\
-                .style("font-size: 18px; color: #333; margin-bottom: 6px; text-align: center;")
-            ui.label("Select a target language for translation:")\
-                .style("font-size: 16px; color: #555; margin-bottom: 8px; text-align: center;")
-
-            self.lang_input = ui.input(label="Target Language", placeholder="e.g., Spanish")
-            font_size_input = None
-            autofit_checkbox = None
-            if self.uploaded_file_extension == 'pptx':
-                font_size_input = ui.number(
-                    label="Max font size (pt)",
-                    value=18,
-                    min=1
-                ).classes("mb-2")
-                autofit_checkbox = ui.checkbox("Enable auto-fit").classes("mb-4")
-
-            ui.button(
-                "Translate",
-                on_click=lambda: self.handle_translation(
-                    self.lang_input.value,
-                    int(font_size_input.value) if font_size_input else None,
-                    autofit_checkbox.value if autofit_checkbox else False
-                )
-            ).classes(f"{theme.BTN_PRIMARY} mt-2")
-
     def handle_translation(self, target_language, font_size=None, autofit=False):
         if not target_language:
             self.show_error("Please enter a valid target language.")

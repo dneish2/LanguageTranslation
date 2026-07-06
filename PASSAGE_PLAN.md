@@ -38,7 +38,10 @@ machine translation and human edit.
   (`segment_map`, `_translate_segment_text`, `update_segment`).
 - **pytest IS correct in this repo** (finplatform's no-pytest rule does not apply):
   `.venv\Scripts\python.exe -m pytest tests/` — uv venv, Python 3.12.
-- `job_queue.py` and `translation_metrics.py` are dead code — wire in for the PDF job phase or delete.
+- Dead code CLEANED 2026-07-05: `job_queue.py` deleted (the backend's own `TranslationJob` system
+  is the live pattern; Phase 5's pdf2zh job gets designed deliberately). `translation_metrics.py`
+  is LIVE (backend imports `MetricsCollector`/`TranslationMetrics`) — the old "dead" note was wrong.
+  Legacy PPTX `handle_upload` flow deleted.
 - CI: `.github/workflows/deploy.yml` — tests gate the deploy; the deploy step reads
   `OPENAI_API_KEY` from a GitHub Actions secret.
 
