@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from io import BytesIO
+from pathlib import Path
 from threading import Thread
 from typing import Any
 from urllib.parse import quote
@@ -14,6 +15,7 @@ from nicegui import ui, app
 from fastapi import Request, UploadFile, File, Form
 from starlette.responses import Response, JSONResponse, StreamingResponse
 
+import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
 from TranslationBackend import TranslationBackend
 
@@ -89,15 +91,10 @@ class TranslationUI:
         self.current_source_language = "English"
         self.current_target_language = "Spanish"
 
-        # ── UI CONSISTENCY STANDARDS ───────────────────────────────────
-        self.button_primary_classes = "bg-blue-600 text-white px-4 py-2 rounded-lg shadow-sm"
-        self.button_secondary_classes = "bg-gray-200 text-gray-700 px-4 py-2 rounded-lg"
-        self.banner_classes = {
-            "info": "w-full rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-700",
-            "positive": "w-full rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700",
-            "negative": "w-full rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700",
-            "warning": "w-full rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700",
-        }
+        # ── UI CONSISTENCY STANDARDS (Passage "Press" tokens, theme.py) ──
+        self.button_primary_classes = theme.BTN_PRIMARY
+        self.button_secondary_classes = theme.BTN_SECONDARY
+        self.banner_classes = theme.BANNER
 
         # ── USAGE STATS ─────────────────────────────────────────────────
         self.current_count = 0
@@ -131,8 +128,17 @@ class TranslationUI:
         ui.page("/")(self.main_page)
         ui.page("/voice")(self.voice_translation_page)
         ui.page("/mobile")(self.mobile_page)
+        app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))
         # run on single port; Cloud Run injects PORT
-        ui.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+        ui.run(
+            host="0.0.0.0",
+            port=int(os.getenv("PORT", "8080")),
+            title="Passage",
+            favicon=str(Path(__file__).resolve().parent / "static" / "favicon.svg"),
+        )
+
+    def _inject_theme(self) -> None:
+        ui.add_head_html(theme.HEAD_HTML)
 
     def _inject_auto_device_routing(self, page: str) -> None:
         ui.add_body_html(f"""
@@ -296,12 +302,13 @@ window.voiceUx = window.voiceUx || (() => {
 
     def main_page(self):
         self.mobile_mode = False
+        self._inject_theme()
         self._inject_api_token()
         self._inject_auto_device_routing("desktop")
         # Header with shallow navigation
-        with ui.header().classes("items-center justify-between bg-gray-100 px-3 py-2"):
+        with ui.header().classes(f"items-center justify-between {theme.HEADER} px-3 py-2"):
             with ui.row().classes("w-full justify-between items-center"):
-                ui.label("Translation App").classes("text-lg font-bold text-black")
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')
                 with ui.row().classes("items-center gap-2"):
                     self.top_mode_control = ui.toggle(
                         {"standard": "Default", "advanced": "Advanced"},
@@ -311,7 +318,7 @@ window.voiceUx = window.voiceUx || (() => {
                     ui.button("Voice", on_click=lambda: ui.navigate.to("/voice")).classes(self.button_secondary_classes)
 
         # Drawer for recent docs
-        self.drawer = ui.drawer(side='left').classes("bg-gray-50")
+        self.drawer = ui.drawer(side='left').classes(theme.DRAWER)
         with self.drawer:
             self.show_document_list()
 
@@ -376,14 +383,14 @@ window.voiceUx = window.voiceUx || (() => {
                 ui.label("Review every translated segment in a continuous document layout.")\
                     .classes("text-sm text-gray-600 mb-2")
 
-                with ui.scroll_area().classes("w-full flex-1 border rounded p-3 pb-28 md:pb-6 bg-white"):
+                with ui.scroll_area().classes(f"w-full flex-1 {theme.WELL} p-3 pb-28 md:pb-6"):
                     self.document_editor_container = ui.column().classes("space-y-4")
 
                 with ui.row().classes("justify-end space-x-2 mt-4"):
                     ui.button("Cancel", on_click=self.request_close_document_editor)\
-                        .classes("bg-gray-200 text-gray-700 px-3 py-1 rounded")
+                        .classes(theme.BTN_SECONDARY_SM)
                     ui.button("Save Changes", on_click=self.save_document_editor)\
-                        .classes("bg-blue-600 text-white px-3 py-1 rounded")
+                        .classes(theme.BTN_PRIMARY_SM)
 
     def _describe_segment_for_editor(self, index: int, seg_info: dict) -> str:
         location = seg_info.get("location")
@@ -432,13 +439,13 @@ window.voiceUx = window.voiceUx || (() => {
                 self.document_editor_original_values[seg_id] = translated_value or ""
 
                 with ui.expansion(f"Step {index}/{segment_count} — {header}", value=index == 1)\
-                        .classes("w-full bg-gray-50 border rounded-lg"):
+                        .classes(f"w-full {theme.WELL}"):
                     with ui.column().classes("space-y-2 p-2 pb-16 md:pb-4"):
                         ui.label("Edit translation below (mobile-safe layout).")\
                             .classes("text-xs text-gray-500")
                         textarea = ui.textarea(value=translated_value or "")\
                             .props("autogrow rows=3")\
-                            .classes("w-full text-base border rounded p-2 bg-white")
+                            .classes(f"w-full text-base {theme.PANEL_TARGET} p-2")
                         textarea.segment_id = seg_id
                         self.document_editor_inputs[seg_id] = textarea
 
@@ -465,14 +472,14 @@ window.voiceUx = window.voiceUx || (() => {
                 ui.label(message).classes("text-sm text-gray-600")
                 with ui.row().classes("justify-end space-x-2 mt-4"):
                     ui.button("Cancel", on_click=dialog.close)\
-                        .classes("bg-gray-200 text-gray-700 px-3 py-1 rounded")
+                        .classes(theme.BTN_SECONDARY_SM)
 
                     def confirm_and_close():
                         dialog.close()
                         on_confirm()
 
                     ui.button(confirm_label, on_click=confirm_and_close)\
-                        .classes("bg-red-500 text-white px-3 py-1 rounded")
+                        .classes(theme.BTN_DANGER_SM)
         dialog.open()
 
     def _document_editor_has_unsaved_changes(self):
@@ -581,7 +588,7 @@ window.voiceUx = window.voiceUx || (() => {
                     "Realtime/OCR internals are plugged in next."
                 ).classes("text-sm text-gray-600")
 
-                with ui.row().classes("w-full items-end gap-2 flex-wrap rounded-lg border bg-white p-3"):
+                with ui.row().classes(f"w-full items-end gap-2 flex-wrap {theme.WELL} p-3"):
                     self.source_language_input = ui.input(
                         label="From",
                         value=self.current_source_language or "English",
@@ -612,7 +619,7 @@ window.voiceUx = window.voiceUx || (() => {
                             ui.label("Ready").classes(self.banner_classes["info"]).props(
                                 f"id={self.text_status_scope}_status"
                             )
-                            ui.label("").classes("w-full min-h-[140px] rounded border bg-blue-50 p-3 text-base").props(
+                            ui.label("").classes(f"w-full min-h-[140px] {theme.PANEL_TARGET} p-3 text-base").props(
                                 f"id={self.text_status_scope}_output"
                             )
                         else:
@@ -656,11 +663,12 @@ window.voiceUx = window.voiceUx || (() => {
 
     def mobile_page(self):
         self.mobile_mode = True
+        self._inject_theme()
         self._inject_api_token()
         self._inject_auto_device_routing("mobile")
-        with ui.header().classes("items-center bg-white p-3 border-b"):
+        with ui.header().classes(f"items-center {theme.HEADER} p-3"):
             with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Mobile Translation").classes("text-base font-semibold")
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')
                 ui.button("Desktop", on_click=lambda: ui.navigate.to("/")).classes(self.button_secondary_classes)
 
         with ui.column().classes("w-full items-center p-3"):
@@ -768,10 +776,10 @@ window.voiceUx = window.voiceUx || (() => {
                     with ui.grid(columns=2).classes("w-full gap-2 border rounded p-2"):
                         with ui.column().classes("w-full"):
                             ui.label(f"Extracted #{idx}").classes("text-xs font-semibold text-gray-600")
-                            ui.label(block.get("source_text", "")).classes("text-sm bg-gray-50 border rounded p-2")
+                            ui.label(block.get("source_text", "")).classes(f"text-sm {theme.PANEL_SOURCE} p-2")
                         with ui.column().classes("w-full"):
                             ui.label(f"Translated #{idx}").classes("text-xs font-semibold text-gray-600")
-                            ui.label(block.get("translated_text", "")).classes("text-sm bg-blue-50 border rounded p-2")
+                            ui.label(block.get("translated_text", "")).classes(f"text-sm {theme.PANEL_TARGET} p-2")
 
     def show_mobile_voice_result(self, original_text, translated_text, language):
         self.result_container.clear()
@@ -780,9 +788,9 @@ window.voiceUx = window.voiceUx || (() => {
             with ui.card().classes("w-full p-4 space-y-3"):
                 ui.label(f"Voice translation → {language}").classes("text-lg font-semibold")
                 ui.label("Original").classes("text-xs font-semibold text-gray-600")
-                ui.label(original_text).classes("w-full p-3 rounded border bg-gray-50 text-base")
+                ui.label(original_text).classes(f"w-full p-3 {theme.PANEL_SOURCE} text-base")
                 ui.label("Translated").classes("text-xs font-semibold text-gray-600")
-                ui.label(translated_text).classes("w-full p-3 rounded border bg-blue-50 text-base")
+                ui.label(translated_text).classes(f"w-full p-3 {theme.PANEL_TARGET} text-base")
 
                 with ui.column().classes("w-full gap-2"):
                     ui.button(
@@ -790,8 +798,8 @@ window.voiceUx = window.voiceUx || (() => {
                         on_click=lambda: ui.run_javascript(
                             f"navigator.clipboard.writeText({json.dumps(translated_text)})"
                         )
-                    ).classes("w-full bg-blue-600 text-white py-3 text-base rounded-lg")
-                    ui.button("Start Over", on_click=self.refresh_upload_ui).classes("w-full bg-gray-500 text-white py-3 text-base rounded-lg")
+                    ).classes(theme.BTN_PRIMARY_XL)
+                    ui.button("Start Over", on_click=self.refresh_upload_ui).classes(theme.BTN_SECONDARY_XL)
 
     def handle_upload(self, event):
         # file picked → ask for language & PPTX options
@@ -825,7 +833,7 @@ window.voiceUx = window.voiceUx || (() => {
                     int(font_size_input.value) if font_size_input else None,
                     autofit_checkbox.value if autofit_checkbox else False
                 )
-            ).classes("bg-blue-600 text-white px-4 py-2 rounded shadow mt-2")
+            ).classes(f"{theme.BTN_PRIMARY} mt-2")
 
     def handle_translation(self, target_language, font_size=None, autofit=False):
         if not target_language:
@@ -853,7 +861,7 @@ window.voiceUx = window.voiceUx || (() => {
         label_ui = ui.label("Preparing translation...")\
             .classes("text-center text-gray-700 mt-2")
         self.cancel_button = ui.button("Cancel Translation", on_click=self.cancel_translation)\
-            .classes("bg-red-500 text-white px-4 py-2 rounded shadow mt-2")
+            .classes(f"{theme.BTN_DANGER} mt-2")
 
         with self.progress_container:
             progress_ui
@@ -892,7 +900,7 @@ window.voiceUx = window.voiceUx || (() => {
         label_ui = ui.label("Loading processed document...")\
             .classes("text-center text-gray-700 mt-2")
         self.cancel_button = ui.button("Cancel", on_click=self.cancel_translation)\
-            .classes("bg-red-500 text-white px-4 py-2 rounded shadow mt-2")
+            .classes(f"{theme.BTN_DANGER} mt-2")
 
         with self.progress_container:
             progress_ui
@@ -1037,16 +1045,16 @@ window.voiceUx = window.voiceUx || (() => {
 
                     with ui.row().classes("space-x-2 mb-2"):
                         ui.button("Open Document Editor", on_click=self.open_document_editor)\
-                          .classes("bg-purple-600 text-white px-3 py-1")
+                          .classes(theme.BTN_SECONDARY_SM)
                         ui.label("Launch a single-page editor with every segment ready to edit.")\
                           .classes("text-xs text-gray-600")
 
                     # bulk actions
                     with ui.row().classes("space-x-2 mb-4"):
                         ui.button("Approve All", on_click=self.approve_all_segments)\
-                          .classes("bg-green-500 text-white px-3 py-1")
+                          .classes(theme.BTN_OK_SM)
                         ui.button("Save All Edits", on_click=self.save_all_edits)\
-                          .classes("bg-blue-500 text-white px-3 py-1")
+                          .classes(theme.BTN_PRIMARY_SM)
 
                     # per-segment UI
                     for i, seg_id in enumerate(list(self.original_segments_map.keys())):
@@ -1056,7 +1064,7 @@ window.voiceUx = window.voiceUx || (() => {
                         location = seg_info.get("location", f"segment_{i+1}")
 
                         with ui.expansion(f"Step {i+1}: {location}", value=i == 0)\
-                                .classes("w-full mb-2 border rounded-lg bg-white"):
+                                .classes(f"w-full mb-2 {theme.WELL}"):
                             with ui.column().classes("p-3 pb-16 md:pb-4 gap-3"):
                                 with ui.row().classes("justify-between items-center"):
                                     ui.label(f"#{i+1}: {location}")\
@@ -1073,7 +1081,7 @@ window.voiceUx = window.voiceUx || (() => {
                                     ui.label("Original:")\
                                       .classes("text-xs font-semibold text-gray-600")
                                     ui.html(
-                                        f'<div class="text-sm p-2 bg-gray-50 border rounded '
+                                        f'<div class="text-sm p-2 p-panel-source '
                                         f'max-h-20 overflow-y-auto">{orig[:300]}'
                                         f'{"..." if len(orig)>300 else ""}</div>'
                                     )
@@ -1083,7 +1091,7 @@ window.voiceUx = window.voiceUx || (() => {
                                       .classes("text-xs font-semibold text-gray-600")
                                     textarea = ui.textarea(value=trans)\
                                       .props("autogrow rows=3")\
-                                      .classes("w-full text-sm bg-white")
+                                      .classes(f"w-full text-sm {theme.PANEL_TARGET}")
                                     textarea.segment_id = seg_id
 
                                 with ui.row().classes("w-full items-center gap-2"):
@@ -1106,7 +1114,7 @@ window.voiceUx = window.voiceUx || (() => {
                         ui.input("Font family", value=self.overlay_font_family, on_change=lambda e: setattr(self, "overlay_font_family", e.value)).classes("w-48")
                         ui.switch("Show original overlay", value=self.overlay_show_original, on_change=lambda e: setattr(self, "overlay_show_original", bool(e.value)))
                         ui.switch("Preview visible", value=self.overlay_preview_visible, on_change=lambda e: setattr(self, "overlay_preview_visible", bool(e.value)) or self.show_result())
-                        ui.button("Refresh overlay", on_click=self.refresh_image_overlay).classes("bg-indigo-600 text-white px-3 py-1")
+                        ui.button("Refresh overlay", on_click=self.refresh_image_overlay).classes(theme.BTN_SECONDARY_SM)
                     if self.overlay_preview_visible and self.backend.output_stream is not None:
                         import base64
                         self.backend.output_stream.seek(0)
@@ -1117,17 +1125,17 @@ window.voiceUx = window.voiceUx || (() => {
                 ui.separator().classes("my-4")
                 with ui.row().classes("justify-center space-x-4 mt-6 flex-wrap"):
                     ui.button("Download Translated File", on_click=self.download_file)\
-                      .classes("bg-blue-600 text-white px-6 py-2 rounded shadow")
+                      .classes(theme.BTN_PRIMARY)
                     ui.button("Upload Another File", on_click=self.request_refresh_upload_ui)\
-                      .classes("bg-gray-500 text-white px-6 py-2 rounded shadow")
+                      .classes(theme.BTN_SECONDARY)
 
         # stats footer
         with self.stats_container:
-            ui.label(f"Elements translated: {self.current_count}")\
-              .classes("text-base text-gray-700")
+            ui.label(f"elements translated: {self.current_count}")\
+              .classes(theme.DATA)
             if self.current_tokens > 0:
-                ui.label(f"Tokens used: {self.current_tokens:,}")\
-                  .classes("text-sm text-gray-600")
+                ui.label(f"tokens used: {self.current_tokens:,}")\
+                  .classes(theme.DATA)
 
     def refresh_image_overlay(self):
         try:
@@ -1274,6 +1282,7 @@ window.voiceUx = window.voiceUx || (() => {
     # ─────────────────────────────── VOICE TRANSLATION PAGE ─────────────────────────────────
 
     def voice_translation_page(self):
+        self._inject_theme()
         self._inject_api_token()
         self._inject_voice_frontend_helpers()
         ui.label("Live Voice Translation").classes("text-2xl mb-4")
@@ -1281,7 +1290,7 @@ window.voiceUx = window.voiceUx || (() => {
         with ui.row().classes("items-center space-x-2 mb-4"):
             ui.label("Target language:").classes("font-medium")
             ui.html('''
-                <select id="language_select" class="px-3 py-2 border rounded bg-white">
+                <select id="language_select" class="px-3 py-2 p-well">
                     <option value="en">English</option>
                     <option value="es" selected>Spanish</option>
                     <option value="fr">French</option>
@@ -1293,12 +1302,12 @@ window.voiceUx = window.voiceUx || (() => {
         self._render_voice_status_block("desktop_voice")
 
         with ui.row().classes("space-x-4 mb-4"):
-            ui.html('<button id="desktop_voice_start_recording" class="bg-green-500 text-white px-4 py-2 rounded" '
+            ui.html('<button id="desktop_voice_start_recording" class="p-btn p-btn-ok px-4 py-2" '
                     'onclick="startRecording()">🎤 Start Recording</button>')
-            ui.html('<button id="desktop_voice_stop_recording" class="bg-red-500 text-white px-4 py-2 rounded" '
+            ui.html('<button id="desktop_voice_stop_recording" class="p-btn p-btn-danger px-4 py-2" '
                     'onclick="stopRecording()" disabled>⏹️ Stop Recording</button>')
             ui.button("← Back", on_click=lambda: ui.navigate.to("/"))\
-              .classes("bg-gray-500 text-white px-4 py-2 rounded")
+              .classes(theme.BTN_SECONDARY)
 
         ui.label("Transcript fallback (when recording is unavailable)").classes("text-sm font-semibold text-gray-700 mt-2")
         ui.textarea(
@@ -1306,18 +1315,18 @@ window.voiceUx = window.voiceUx || (() => {
             placeholder="Paste text if your browser cannot record audio.",
         ).props("id=desktop_voice_transcript autogrow").classes("w-full")
         ui.button("Translate", on_click=lambda: ui.run_javascript("translateTranscriptFallback()"))\
-            .classes("bg-blue-600 text-white px-4 py-2 rounded mt-2")
+            .classes(f"{theme.BTN_PRIMARY} mt-2")
 
         ui.audio(src="data:audio/wav;base64,")\
           .props("id=out_audio controls")\
           .classes("w-full")
 
         ui.label("Original:").classes("font-bold mt-4")
-        ui.label("").classes("p-2 border rounded bg-gray-50 min-h-[40px]")\
+        ui.label("").classes(f"p-2 {theme.PANEL_SOURCE} min-h-[40px]")\
           .props("id=original_text")
 
         ui.label("Translation:").classes("font-bold mt-2")
-        ui.label("").classes("p-2 border rounded bg-blue-50 min-h-[40px]")\
+        ui.label("").classes(f"p-2 {theme.PANEL_TARGET} min-h-[40px]")\
           .props("id=translated_text")
 
         ui.add_head_html("""

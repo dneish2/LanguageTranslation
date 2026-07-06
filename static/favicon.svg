@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="10" fill="#F6F0E3"/>
+  <rect x="2" y="2" width="60" height="60" rx="8" fill="none" stroke="#DCD2BE" stroke-width="2"/>
+  <text x="32" y="46" text-anchor="middle" font-family="Palatino Linotype, Palatino, Georgia, serif" font-size="42" fill="#802F3D">P</text>
+</svg>

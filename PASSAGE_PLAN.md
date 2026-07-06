@@ -89,10 +89,13 @@ machine translation and human edit.
 
 1. [x] 2–3 static HTML mockups (Artifact) — done: Press / Gallery / Ledger, interactive comp.
 2. [x] David picked: **Press palette + Ledger's mono data accents (sparingly, not buttons);
-       motion synced to real data transfer.** Next: extract into design tokens:
-       `static/passage.css` (CSS variables) + `theme.py` (token constants for NiceGUI classes).
-       Kill ad-hoc Tailwind color strings.
-3. [ ] Brand assets: favicon, page title, `ui.run(favicon=...)`, OG meta, replace `Multilingual.png`.
+       motion synced to real data transfer.** Tokens shipped: `static/passage.css` (CSS
+       variables + p-btn/p-banner/p-panel/p-well/p-data classes) + `theme.py` (constants).
+       ALL ad-hoc Tailwind color strings replaced (blue/purple/indigo/green/red/gray buttons →
+       4 semantic button styles; bg-white/gray-50/blue-50 surfaces → paper/panel/well).
+3. [x] Brand assets: `static/favicon.svg` (burgundy P on paper), `ui.run(title="Passage",
+       favicon=...)`, Passage wordmark in both headers. Still open: OG meta, replace
+       `Multilingual.png` hero (do during Phase 2 restructure).
 
 ### Phase 2 — UI/UX rehaul (NiceGUI, on the chosen tokens)
 
