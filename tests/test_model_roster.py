@@ -175,3 +175,84 @@ def test_backend_stays_providerless_without_key_when_provider_is_openai(monkeypa
     backend = tb.TranslationBackend()
 
     assert backend.provider is None
+
+
+def test_ollama_provider_carries_the_input_char_cap():
+    provider = tb.build_translation_provider("ollama", api_key="")
+    assert provider.max_input_chars == tb.OLLAMA_MAX_INPUT_CHARS
+
+
+def test_openai_provider_has_no_input_cap():
+    provider = tb.build_translation_provider("openai", api_key="test-key")
+    assert provider.max_input_chars is None
+
+
+def test_split_into_chunks_respects_the_cap_and_preserves_all_text():
+    text = (
+        "The library opens at nine in the morning. It closes at six on weekdays. "
+        "On Sundays it closes early at three. Please bring your card to check out books."
+    )
+    chunks = tb._split_into_chunks(text, 40)
+    assert all(len(c) <= 40 for c in chunks)
+    assert len(chunks) > 1
+    # every sentence's distinctive words survive somewhere in some chunk
+    for word in ("library", "Sundays", "card"):
+        assert any(word in c for c in chunks)
+
+
+def test_split_into_chunks_never_splits_mid_sentence_when_it_fits():
+    text = "Short one. Another short one."
+    chunks = tb._split_into_chunks(text, 100)
+    assert chunks == ["Short one. Another short one."]
+
+
+def test_split_into_chunks_hard_splits_a_single_oversized_sentence():
+    long_sentence = "word " * 30  # no punctuation, one giant "sentence"
+    chunks = tb._split_into_chunks(long_sentence.strip(), 20)
+    assert len(chunks) > 1
+    assert all(len(c) <= 20 for c in chunks)
+
+
+def test_translate_text_splits_oversized_text_for_a_capped_provider(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    backend.provider.max_input_chars = 30
+    calls = []
+
+    def fake_chunk(text, target_language):
+        calls.append(text)
+        return f"[{target_language}:{text}]"
+
+    monkeypatch.setattr(backend, "_translate_chunk", fake_chunk)
+
+    long_text = "First sentence here. Second sentence here. Third sentence here."
+    result = backend.translate_text(long_text, "French")
+
+    assert len(calls) > 1, "expected the oversized text to be split into multiple model calls"
+    assert all(len(c) <= 30 for c in calls)
+    assert result == " ".join(f"[French:{c}]" for c in calls)
+
+
+def test_translate_text_does_not_split_under_the_cap(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    backend.provider.max_input_chars = 1000
+    calls = []
+    monkeypatch.setattr(backend, "_translate_chunk", lambda t, lang: calls.append(t) or "translated")
+
+    backend.translate_text("A short sentence.", "German")
+
+    assert calls == ["A short sentence."]
+
+
+def test_translate_text_uncapped_provider_never_splits(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    assert backend.provider.max_input_chars is None
+    calls = []
+    monkeypatch.setattr(backend, "_translate_chunk", lambda t, lang: calls.append(t) or "translated")
+
+    long_text = "Sentence. " * 500  # far past any reasonable local-model cap
+    backend.translate_text(long_text, "German")
+
+    assert calls == [long_text.replace("\t", " ").strip()]

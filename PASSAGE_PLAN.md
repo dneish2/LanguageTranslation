@@ -264,12 +264,18 @@ looks properly good; keep committing to this branch):
        here; NOT "TranslateGemma" specifically, which isn't pulled on this machine — override
        once David confirms his actual tag), and a real translation round-tripped correctly
        ("Good morning, where is the nearest pharmacy?" → "Buenos días, ¿sabe dónde hay una
-       farmacia cerca?"). **Still open**: model-tag picker UI (see item 2); **segment-size
-       capping for ~2K-token local context is NOT implemented** — no oversized-segment splitting
-       exists anywhere in the pipeline today (every provider gets one chat-completion call per
-       parsed document segment regardless of length), and building that well needs a real design
-       pass (per-provider context limits, a splitting strategy that doesn't break mid-sentence,
-       re-stitching) rather than a rushed pass — flagged, not attempted, this round.
+       farmacia cerca?"). **Still open**: model-tag picker UI (see item 2).
+       **Segment-size capping — done 2026-07-06**: `ChatCompletionsProvider.max_input_chars`
+       (`None` = uncapped for OpenAI-hosted; `OLLAMA_MAX_INPUT_CHARS`/`PASSAGE_LOCAL_MAX_INPUT_CHARS`,
+       default 3200 chars, for Ollama). `translate_text` splits oversized text on sentence
+       boundaries (`_split_into_chunks` — hard-splits on whitespace only if a single sentence
+       itself exceeds the cap), translates each chunk, joins with spaces, caches the joined
+       result under the original key. Live-verified against the real local Ollama instance with
+       a forced small cap: a 512-char, 7-sentence paragraph split into 4 chunks and translated
+       coherently end to end (sentence order preserved, nothing dropped or duplicated); a
+       parallel live check confirmed the OpenAI-hosted path takes the same long text in one
+       call, no chunking log line, `max_input_chars is None`. 103/103 pytest (8 new: splitter
+       edge cases, capped-vs-uncapped provider behavior, the hard-split path).
 4. [x] Hosted tier: `gpt-5.4-nano` (done 2026-07-06), credit-gate via finplatform metering pattern later.
 5. [x] Consolidate the model zoo — **done**: verified zero hardcoded model-name literals remain
        outside the roster constants block (`TEXT_MODEL`/`VISION_MODEL`/`TRANSCRIBE_MODEL`/
