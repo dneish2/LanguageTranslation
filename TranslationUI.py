@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import glob
 import json
 import time
 import uuid
@@ -81,10 +80,6 @@ class TranslationUI:
         self.recent_threads = deque(maxlen=20)
         self.mode_tab_row = None
         self.text_output_label = None
-        self.document_editor_dialog = None
-        self.document_editor_container = None
-        self.document_editor_inputs: dict[str, Any] = {}
-        self.document_editor_original_values: dict[str, str] = {}
 
         # ── MOBILE FLOW ────────────────────────────────────────────────
         self.input_mode = "Document"
@@ -312,10 +307,9 @@ window.voiceUx = window.voiceUx || (() => {
                 self.mode_tab_row = ui.row().classes("items-center gap-0")
                 self._render_mode_tabs()
 
-        # Drawer for recent docs
+        # Recent Threads drawer (renders itself into self.drawer)
         self.drawer = ui.drawer(side='left').classes(theme.DRAWER)
-        with self.drawer:
-            self.show_document_list()
+        self.show_document_list()
 
         # Default workspace page
         with ui.column().classes("w-full h-full items-center justify-start p-4"):
@@ -325,7 +319,6 @@ window.voiceUx = window.voiceUx || (() => {
             self.stats_container = ui.column().classes("w-full max-w-6xl")
             self.refresh_upload_ui()
 
-        self.build_document_editor_dialog()
 
     def _render_mode_tabs(self) -> None:
         if self.mode_tab_row is None:
@@ -357,27 +350,6 @@ window.voiceUx = window.voiceUx || (() => {
         self.current_source_language, self.current_target_language = target, source
         self.refresh_upload_ui()
 
-    def build_document_editor_dialog(self):
-        if self.document_editor_dialog is not None:
-            return
-
-        with ui.dialog() as dialog:
-            self.document_editor_dialog = dialog
-            with ui.card().classes("w-[900px] max-w-full max-h-[80vh] flex flex-col"):
-                ui.label("Editable Document View")\
-                    .classes("text-xl font-semibold text-gray-800")
-                ui.label("Review every translated segment in a continuous document layout.")\
-                    .classes("text-sm text-gray-600 mb-2")
-
-                with ui.scroll_area().classes(f"w-full flex-1 {theme.WELL} p-3 pb-28 md:pb-6"):
-                    self.document_editor_container = ui.column().classes("space-y-4")
-
-                with ui.row().classes("justify-end space-x-2 mt-4"):
-                    ui.button("Cancel", on_click=self.request_close_document_editor)\
-                        .classes(theme.BTN_SECONDARY_SM)
-                    ui.button("Save Changes", on_click=self.save_document_editor)\
-                        .classes(theme.BTN_PRIMARY_SM)
-
     def _describe_segment_for_editor(self, index: int, seg_info: dict) -> str:
         location = seg_info.get("location")
         if location:
@@ -389,67 +361,6 @@ window.voiceUx = window.voiceUx || (() => {
             if page_idx is not None:
                 return f"{index}. PDF page {page_idx + 1}"
         return f"{index}. {seg_type.title()}"
-
-    def populate_document_editor(self):
-        if not self.document_editor_container:
-            return
-
-        self.document_editor_container.clear()
-        self.document_editor_inputs.clear()
-        self.document_editor_original_values.clear()
-
-        segments = list(self.backend.segment_map.items())
-        if not segments:
-            with self.document_editor_container:
-                ui.label("No segments available yet. Translate a document first.")\
-                    .classes("text-sm text-gray-600")
-            return
-
-        current_page = None
-        with self.document_editor_container:
-            segment_count = len(segments)
-            for index, (seg_id, seg_info) in enumerate(segments, start=1):
-                seg_type = seg_info.get("type")
-                if seg_type == "pdf_block":
-                    page_idx = seg_info.get("page_idx")
-                    if page_idx is not None and current_page != page_idx:
-                        current_page = page_idx
-                        ui.label(f"Page {page_idx + 1}")\
-                            .classes("text-sm font-semibold text-gray-700 mt-2")
-
-                header = self._describe_segment_for_editor(index, seg_info)
-                translated_value = self.translated_segments_map.get(
-                    seg_id,
-                    seg_info.get("translated", "")
-                )
-                self.document_editor_original_values[seg_id] = translated_value or ""
-
-                with ui.expansion(f"Step {index}/{segment_count} — {header}", value=index == 1)\
-                        .classes(f"w-full {theme.WELL}"):
-                    with ui.column().classes("space-y-2 p-2 pb-16 md:pb-4"):
-                        ui.label("Edit translation below (mobile-safe layout).")\
-                            .classes("text-xs text-gray-500")
-                        textarea = ui.textarea(value=translated_value or "")\
-                            .props("autogrow rows=3")\
-                            .classes(f"w-full text-base {theme.PANEL_TARGET} p-2")
-                        textarea.segment_id = seg_id
-                        self.document_editor_inputs[seg_id] = textarea
-
-    def open_document_editor(self):
-        if not self.document_editor_dialog:
-            ui.notify("Document editor not initialised yet.", type="warning")
-            return
-        self.populate_document_editor()
-        if not self.document_editor_inputs:
-            ui.notify("No segments available to edit yet.", type="warning")
-            return
-        self.document_editor_dialog.open()
-
-    def close_document_editor(self):
-        if self.document_editor_dialog:
-            self.document_editor_dialog.close()
-        self.document_editor_inputs.clear()
-        self.document_editor_original_values.clear()
 
     def _request_confirmation(self, title, message, on_confirm, confirm_label="Confirm"):
         with ui.dialog() as dialog:
@@ -468,102 +379,43 @@ window.voiceUx = window.voiceUx || (() => {
                         .classes(theme.BTN_DANGER_SM)
         dialog.open()
 
-    def _document_editor_has_unsaved_changes(self):
-        for seg_id, textarea in self.document_editor_inputs.items():
-            current = textarea.value or ""
-            original = self.document_editor_original_values.get(seg_id, "")
-            if current != original:
-                return True
-        return False
-
-    def request_close_document_editor(self):
-        if not self.document_editor_inputs:
-            self.close_document_editor()
-            return
-
-        if not self._document_editor_has_unsaved_changes():
-            self.close_document_editor()
-            return
-
-        self._request_confirmation(
-            "Discard unsaved edits?",
-            "You have unsaved document editor changes. Close anyway and discard them?",
-            self.close_document_editor,
-            confirm_label="Discard Changes"
-        )
-
-    def save_document_editor(self):
-        if not self.document_editor_inputs:
-            self.close_document_editor()
-            return
-
-        try:
-            changed = 0
-            for seg_id, textarea in self.document_editor_inputs.items():
-                new_text = textarea.value or ""
-                if new_text != self.translated_segments_map.get(seg_id, ""):
-                    self.backend.update_segment(
-                        seg_id,
-                        new_text,
-                        self.current_target_language or "",
-                        regenerate=False
-                    )
-                    self.translated_segments_map[seg_id] = new_text
-                    changed += 1
-
-            if changed:
-                self.backend.regenerate_output_stream()
-                ui.notify(
-                    f"Saved {changed} segment{'s' if changed != 1 else ''} from the document editor.",
-                    type="positive"
-                )
-            else:
-                ui.notify("No changes detected in the document editor.", type="warning")
-        except Exception as ex:
-            logging.error(f"[UI] Error saving document editor changes: {ex}", exc_info=True)
-            ui.notify(f"Failed to save document edits: {ex}", type="negative")
-        finally:
-            self.close_document_editor()
-            if self.advanced_mode and self.original_segments_map:
-                self.show_result()
-
     def show_document_list(self):
-        # Threads = chats (text translations, in-memory) + translated documents
-        # (files, until per-user storage lands in Phase 4), newest first.
-        self.drawer.clear()
-        with ui.row().classes("w-full items-center justify-between mb-1"):
-            ui.label("Recent Threads").classes("p-display text-lg")
-            ui.button(icon="refresh", on_click=self.show_document_list)\
-                .props("flat round size=sm")\
-                .classes("p-mode-tab")
-
-        threads: list[dict] = []
-        for chat in self.recent_threads:
-            threads.append(chat)
-        for fn in sorted(glob.glob("translated_*"), key=os.path.getmtime, reverse=True)[:20]:
-            threads.append({
-                "kind": "document",
-                "label": fn,
-                "when": os.path.getmtime(fn),
-                "file": fn,
-            })
-        threads.sort(key=lambda t: t.get("when", 0), reverse=True)
-
-        if not threads:
-            ui.label("Nothing here yet — translations you run will appear as threads.")\
-                .classes("text-sm text-gray-600")
+        # Threads = chats (text translations) + documents translated this
+        # session, newest first. In-memory until per-user storage (Phase 4).
+        if self.drawer is None:
             return
-        for t in threads[:20]:
-            if t["kind"] == "chat":
-                handler = lambda _, thread=t: self._open_chat_thread(thread)
-                kind_label = f"chat · {t.get('language', '')}"
-            else:
-                handler = lambda _, f=t["file"]: self.load_processed_document(f)
-                kind_label = "document"
-            with ui.button(on_click=handler).classes("p-thread-item"):
-                with ui.column().classes("gap-0 items-start"):
-                    ui.label(t["label"][:44]).classes("text-sm")
-                    ui.label(kind_label).classes("p-thread-kind")
+        self.drawer.clear()
+        with self.drawer:
+            with ui.row().classes("w-full items-center justify-between mb-1"):
+                ui.label("Recent Threads").classes("p-display text-lg")
+                ui.button(icon="refresh", on_click=self.show_document_list)\
+                    .props("flat round size=sm")\
+                    .classes("p-mode-tab")
+
+            threads = sorted(self.recent_threads, key=lambda t: t.get("when", 0), reverse=True)
+            if not threads:
+                ui.label("No threads yet.").classes("text-sm text-gray-600")
+                return
+            for t in threads[:20]:
+                if t["kind"] == "chat":
+                    handler = lambda _, thread=t: self._open_chat_thread(thread)
+                    kind_label = f"chat · {t.get('language', '')}"
+                else:
+                    handler = lambda _, thread=t: self._open_document_thread(thread)
+                    kind_label = f"document · {t.get('language', '')}"
+                with ui.button(on_click=handler).classes("p-thread-item"):
+                    with ui.column().classes("gap-0 items-start"):
+                        ui.label(t["label"][:44]).classes("text-sm")
+                        ui.label(kind_label).classes("p-thread-kind")
+
+    def _open_document_thread(self, thread: dict) -> None:
+        if thread.get("label") == self.uploaded_file_name and self.original_segments_map:
+            self.show_result()
+        else:
+            ui.notify(
+                "Re-upload this file to open it again — saved documents arrive with accounts.",
+                type="info",
+            )
 
     def _open_chat_thread(self, thread: dict) -> None:
         """Reload a text translation into the workspace."""
@@ -579,21 +431,6 @@ window.voiceUx = window.voiceUx || (() => {
         if self.text_output_label is not None:
             self.text_output_label.text = thread.get("translated", "")
 
-    def load_processed_document(self, filename):
-        # load a file that was already translated
-        for c in (self.progress_container, self.result_container, self.stats_container):
-            c.clear()
-        if not os.path.exists(filename):
-            ui.notify(f"File {filename} not found.")
-            return
-        with open(filename, 'rb') as f:
-            data = f.read()
-        self.uploaded_file = BytesIO(data)
-        self.uploaded_file_name = filename
-        self.uploaded_file_extension = filename.split(".")[-1].lower()
-        ui.notify(f"Loaded processed file: {filename}")
-        self.handle_translation_processed()
-
     def refresh_upload_ui(self):
         # reset UI + clear segments
         self.upload_container.clear()
@@ -603,6 +440,8 @@ window.voiceUx = window.voiceUx || (() => {
         self.backend.segment_map.clear()
 
         self.render_unified_workspace()
+        # Pick up threads recorded by the API layer since the last render.
+        self.show_document_list()
 
     def render_unified_workspace(self):
         max_width = "max-w-6xl"
@@ -634,7 +473,8 @@ window.voiceUx = window.voiceUx || (() => {
                     with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_TARGET}"):
                         with ui.row().classes("w-full items-baseline justify-between"):
                             ui.label("Translation").classes(theme.DATA)
-                            ui.label(self.current_target_language or "").classes(theme.DATA)
+                            ui.label("").bind_text_from(self.target_language_input, "value")\
+                                .classes(theme.DATA)
                         if self.input_mode == "Text":
                             ui.label("Ready").classes(self.banner_classes["info"]).props(
                                 f"id={self.text_status_scope}_status"
@@ -657,9 +497,12 @@ window.voiceUx = window.voiceUx || (() => {
                 self.target_language_input.props(f"id={self.text_status_scope}_target")
             return
         if self.input_mode == "Document":
+            # auto_upload so picking a file IS the upload — without it the file
+            # sits queued at 0% and Translate says "no file uploaded".
             ui.upload(
                 label="Click or drop DOCX, PPTX, or PDF",
                 multiple=False,
+                auto_upload=True,
                 on_upload=self.handle_mobile_upload,
             ).classes("w-full")
             if self.uploaded_file_name:
@@ -669,7 +512,7 @@ window.voiceUx = window.voiceUx || (() => {
         # One affordance: the file input's accept/capture props let phones
         # offer the camera directly, so no separate fallback uploader.
         ui.upload(
-            label="Click or drop an image (PNG, JPG, WEBP) — on a phone this opens the camera",
+            label="Click or drop an image (PNG, JPG, WEBP)",
             multiple=False,
             auto_upload=True,
             on_upload=self.handle_mobile_image_upload,
@@ -842,41 +685,6 @@ window.voiceUx = window.voiceUx || (() => {
             cancelled_event="ui.translation_cancelled",
         )
 
-    def handle_translation_processed(self):
-        # display a pre-translated file without re-calling openai
-        self.progress_container.clear()
-        self.result_container.clear()
-        self.stats_container.clear()
-
-        correlation_id = str(uuid.uuid4())
-        self.current_correlation_id = correlation_id
-        _log_event(
-            "ui.processed_file_open_requested",
-            correlation_id=correlation_id,
-            file_name=self.uploaded_file_name,
-            file_extension=self.uploaded_file_extension,
-        )
-        with self.progress_container:
-            progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
-                .classes("mx-auto mt-4")
-            label_ui = ui.label("Loading processed document...")\
-                .classes("text-center mt-2")
-            self.cancel_button = ui.button("Cancel", on_click=self.cancel_translation)\
-                .classes(f"{theme.BTN_DANGER} mt-2")
-
-        self._start_job_and_poll(
-            progress_ui=progress_ui,
-            label_ui=label_ui,
-            correlation_id=correlation_id,
-            processed=True,
-            font_size=None,
-            autofit=False,
-            target_language="",
-            complete_event="ui.processed_file_open_complete",
-            failed_event="ui.processed_file_open_failed",
-            cancelled_event="ui.translation_cancelled",
-        )
-
     def cancel_translation(self):
         if self.active_job_id:
             self.backend.cancel_job(self.active_job_id)
@@ -959,6 +767,15 @@ window.voiceUx = window.voiceUx || (() => {
                 self.original_segments_map[seg_id] = seg_info["original"]
                 self.translated_segments_map[seg_id] = seg_info["translated"]
 
+            if not processed and self.uploaded_file_name:
+                self.recent_threads.appendleft({
+                    "kind": "document",
+                    "label": self.uploaded_file_name,
+                    "language": target_language,
+                    "when": time.time(),
+                })
+                self.show_document_list()
+
             _log_event(
                 complete_event,
                 correlation_id=correlation_id,
@@ -995,16 +812,8 @@ window.voiceUx = window.voiceUx || (() => {
                 # ── SEGMENT EDITOR ──────────────────────────────
                 if self.advanced_mode and self.original_segments_map:
                     ui.separator().classes("my-4")
-                    ui.label("Advanced Mode: Segment Editor")\
-                        .classes("text-xl font-bold mb-2")
-                    ui.label(f"Review and edit {len(self.original_segments_map)} segments below:")\
-                        .classes("text-sm text-gray-600 mb-4")
-
-                    with ui.row().classes("space-x-2 mb-2"):
-                        ui.button("Open Document Editor", on_click=self.open_document_editor)\
-                          .classes(theme.BTN_SECONDARY_SM)
-                        ui.label("Launch a single-page editor with every segment ready to edit.")\
-                          .classes("text-xs text-gray-600")
+                    ui.label("Segment review").classes("p-display text-xl mb-2")
+                    ui.label(f"{len(self.original_segments_map)} segments").classes(f"{theme.DATA} mb-4")
 
                     # bulk actions
                     with ui.row().classes("space-x-2 mb-4"):
@@ -1018,14 +827,13 @@ window.voiceUx = window.voiceUx || (() => {
                         orig = self.original_segments_map[seg_id]
                         trans = self.translated_segments_map[seg_id]
                         seg_info = self.backend.segment_map.get(seg_id, {})
-                        location = seg_info.get("location", f"segment_{i+1}")
+                        location = self._describe_segment_for_editor(i + 1, seg_info)
 
-                        with ui.expansion(f"Step {i+1}: {location}", value=i == 0)\
+                        with ui.expansion(location, value=i == 0)\
                                 .classes(f"w-full mb-2 {theme.WELL}"):
                             with ui.column().classes("p-3 pb-16 md:pb-4 gap-3"):
                                 with ui.row().classes("justify-between items-center"):
-                                    ui.label(f"#{i+1}: {location}")\
-                                      .classes("text-sm font-medium text-gray-700")
+                                    ui.label(location).classes(theme.DATA)
                                     with ui.row().classes("space-x-1"):
                                         ui.button("✓", on_click=lambda _, s=seg_id: self.approve_segment_callback(s))\
                                           .props("size=sm color=positive")
