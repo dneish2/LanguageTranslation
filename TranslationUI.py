@@ -5,6 +5,7 @@ import glob
 import json
 import time
 import uuid
+from collections import deque
 from io import BytesIO
 from pathlib import Path
 from threading import Thread
@@ -62,10 +63,14 @@ class TranslationUI:
 
         # ── DRAWER & ADVANCED MODE ──────────────────────────────────────
         self.drawer = None
-        self.advanced_mode = False
-        self.top_mode_control = None
-        self._syncing_mode_control = False
-        self.top_nav_control_classes = "h-8 min-h-0 px-2 rounded-md"
+        # Segment review renders whenever a document has segments; the old
+        # Default/Advanced toggle confused more than it gated.
+        self.advanced_mode = True
+        # Threads: chats (text translations) and documents, newest first.
+        # In-memory until per-user workspaces land (Phase 4).
+        self.recent_threads = deque(maxlen=20)
+        self.mode_tab_row = None
+        self.text_output_label = None
         self.document_editor_dialog = None
         self.document_editor_container = None
         self.document_editor_inputs: dict[str, Any] = {}
@@ -139,6 +144,17 @@ class TranslationUI:
 
     def _inject_theme(self) -> None:
         ui.add_head_html(theme.HEAD_HTML)
+        # Quasar's brand colors would otherwise leak default blue into toggles,
+        # uploads, spinners, and any color=primary props.
+        ui.colors(
+            primary=theme.PALETTE["accent"],
+            secondary=theme.PALETTE["muted"],
+            accent=theme.PALETTE["accent"],
+            positive=theme.PALETTE["ok"],
+            negative=theme.PALETTE["err"],
+            warning=theme.PALETTE["warn"],
+            info=theme.PALETTE["muted"],
+        )
 
     def _inject_auto_device_routing(self, page: str) -> None:
         ui.add_body_html(f"""
@@ -305,17 +321,14 @@ window.voiceUx = window.voiceUx || (() => {
         self._inject_theme()
         self._inject_api_token()
         self._inject_auto_device_routing("desktop")
-        # Header with shallow navigation
-        with ui.header().classes(f"items-center justify-between {theme.HEADER} px-3 py-2"):
-            with ui.row().classes("w-full justify-between items-center"):
-                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')
-                with ui.row().classes("items-center gap-2"):
-                    self.top_mode_control = ui.toggle(
-                        {"standard": "Default", "advanced": "Advanced"},
-                        value=self._current_top_mode()
-                    ).classes(self.top_nav_control_classes)
-                    self.top_mode_control.on_value_change(self.handle_top_mode_change)
-                    ui.button("Voice", on_click=lambda: ui.navigate.to("/voice")).classes(self.button_secondary_classes)
+        # Header: wordmark goes home; the mode tabs are the only navigation.
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                self.mode_tab_row = ui.row().classes("items-center gap-0")
+                self._render_mode_tabs()
 
         # Drawer for recent docs
         self.drawer = ui.drawer(side='left').classes(theme.DRAWER)
@@ -332,34 +345,25 @@ window.voiceUx = window.voiceUx || (() => {
 
         self.build_document_editor_dialog()
 
-    def toggle_advanced_mode(self):
-        self.advanced_mode = not self.advanced_mode
-        if self.advanced_mode:
-            ui.notify("Advanced mode on.", type="positive")
-        else:
-            ui.notify("Advanced mode off.", type="info")
-        self.sync_top_mode_control()
-        if self.original_segments_map:
-            self.show_result()
-
-    def _current_top_mode(self) -> str:
-        return "advanced" if self.advanced_mode else "standard"
-
-    def sync_top_mode_control(self) -> None:
-        if not self.top_mode_control:
+    def _render_mode_tabs(self) -> None:
+        if self.mode_tab_row is None:
             return
-        self._syncing_mode_control = True
-        self.top_mode_control.value = self._current_top_mode()
-        self._syncing_mode_control = False
+        self.mode_tab_row.clear()
+        with self.mode_tab_row:
+            for label, mode in (("Text", "Text"), ("Document", "Document"), ("Image", "Image/Camera")):
+                active = " p-mode-tab-active" if self.input_mode == mode else ""
+                ui.button(label, on_click=lambda _, m=mode: self.set_workspace_mode(m))\
+                    .props("flat no-caps")\
+                    .classes(f"p-mode-tab{active}")
+            ui.button("Voice", on_click=lambda: ui.navigate.to("/voice"))\
+                .props("flat no-caps")\
+                .classes("p-mode-tab")
 
-    def handle_top_mode_change(self, event) -> None:
-        if self._syncing_mode_control:
-            return
-
-        selected_mode = event.value
-        should_enable_advanced = selected_mode == "advanced"
-        if should_enable_advanced != self.advanced_mode:
-            self.toggle_advanced_mode()
+    def set_workspace_mode(self, mode: str) -> None:
+        self.input_mode = mode
+        self.mobile_input_mode = mode
+        self._render_mode_tabs()
+        self.refresh_upload_ui()
 
     def _show_banner(self, container, message: str, kind: str = "info") -> None:
         with container:
@@ -542,16 +546,56 @@ window.voiceUx = window.voiceUx || (() => {
                 self.show_result()
 
     def show_document_list(self):
-        # clear and list up to 20 translated_* files
+        # Threads = chats (text translations, in-memory) + translated documents
+        # (files, until per-user storage lands in Phase 4), newest first.
         self.drawer.clear()
-        ui.label("Recent Documents").classes("font-bold text-lg mb-2")
-        files = sorted(glob.glob("translated_*"), key=os.path.getmtime, reverse=True)[:20]
-        if not files:
-            ui.label("No recent documents.").classes("text-sm text-gray-600")
-        else:
-            for fn in files:
-                ui.button(fn, on_click=lambda _, f=fn: self.load_processed_document(f))\
-                    .classes("w-full text-left mb-1")
+        with ui.row().classes("w-full items-center justify-between mb-1"):
+            ui.label("Recent Threads").classes("p-display text-lg")
+            ui.button(icon="refresh", on_click=self.show_document_list)\
+                .props("flat round size=sm")\
+                .classes("p-mode-tab")
+
+        threads: list[dict] = []
+        for chat in self.recent_threads:
+            threads.append(chat)
+        for fn in sorted(glob.glob("translated_*"), key=os.path.getmtime, reverse=True)[:20]:
+            threads.append({
+                "kind": "document",
+                "label": fn,
+                "when": os.path.getmtime(fn),
+                "file": fn,
+            })
+        threads.sort(key=lambda t: t.get("when", 0), reverse=True)
+
+        if not threads:
+            ui.label("Nothing here yet — translations you run will appear as threads.")\
+                .classes("text-sm text-gray-600")
+            return
+        for t in threads[:20]:
+            if t["kind"] == "chat":
+                handler = lambda _, thread=t: self._open_chat_thread(thread)
+                kind_label = f"chat · {t.get('language', '')}"
+            else:
+                handler = lambda _, f=t["file"]: self.load_processed_document(f)
+                kind_label = "document"
+            with ui.button(on_click=handler).classes("p-thread-item"):
+                with ui.column().classes("gap-0 items-start"):
+                    ui.label(t["label"][:44]).classes("text-sm")
+                    ui.label(kind_label).classes("p-thread-kind")
+
+    def _open_chat_thread(self, thread: dict) -> None:
+        """Reload a text translation into the workspace."""
+        self.current_target_language = thread.get("language") or self.current_target_language
+        self.input_mode = "Text"
+        self.mobile_input_mode = "Text"
+        self._render_mode_tabs()
+        self.refresh_upload_ui()
+        if self.text_source_input is not None:
+            self.text_source_input.value = thread.get("original", "")
+        if self.target_language_input is not None:
+            self.target_language_input.value = self.current_target_language
+        if self.text_output_label is not None:
+            self.text_output_label.text = thread.get("translated", "")
 
     def load_processed_document(self, filename):
         # load a file that was already translated
@@ -582,12 +626,6 @@ window.voiceUx = window.voiceUx || (() => {
         max_width = "max-w-md" if self.mobile_mode else "max-w-6xl"
         with self.upload_container:
             with ui.column().classes(f"w-full {max_width} gap-3"):
-                ui.label("Unified Translation Workspace").classes("text-xl font-semibold text-gray-800")
-                ui.label(
-                    "Use one workflow for text, document, and image/camera inputs. "
-                    "Realtime/OCR internals are plugged in next."
-                ).classes("text-sm text-gray-600")
-
                 with ui.row().classes(f"w-full items-end gap-2 flex-wrap {theme.WELL} p-3"):
                     self.source_language_input = ui.input(
                         label="From",
@@ -600,12 +638,12 @@ window.voiceUx = window.voiceUx || (() => {
                         value=self.current_target_language or "Spanish",
                         placeholder="Target language",
                     ).classes("min-w-[120px] flex-1")
-
-                    mode_selector = ui.toggle(
-                        {"Text": "Text", "Document": "Document", "Image/Camera": "Image/Camera"},
-                        value=self.input_mode,
-                    ).classes("h-10 min-h-0 px-2 rounded-md")
-                    mode_selector.on_value_change(lambda e: self.set_mobile_input_mode(e.value))
+                    if self.mobile_mode:
+                        mode_selector = ui.toggle(
+                            {"Text": "Text", "Document": "Document", "Image/Camera": "Image/Camera"},
+                            value=self.input_mode,
+                        ).classes("h-10 min-h-0 px-2 rounded-md")
+                        mode_selector.on_value_change(lambda e: self.set_mobile_input_mode(e.value))
                     translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
                     translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
@@ -619,9 +657,9 @@ window.voiceUx = window.voiceUx || (() => {
                             ui.label("Ready").classes(self.banner_classes["info"]).props(
                                 f"id={self.text_status_scope}_status"
                             )
-                            ui.label("").classes(f"w-full min-h-[140px] {theme.PANEL_TARGET} p-3 text-base").props(
-                                f"id={self.text_status_scope}_output"
-                            )
+                            self.text_output_label = ui.label("").classes(
+                                f"w-full min-h-[140px] {theme.PANEL_TARGET} p-3 text-base"
+                            ).props(f"id={self.text_status_scope}_output")
                         else:
                             self._show_banner(self.progress_container, "Status: Ready to translate.", "info")
         if self.input_mode == "Text":
@@ -1557,6 +1595,16 @@ window.voiceUx = window.voiceUx || (() => {
 
     # ─────────────────────────── VOICE TRANSLATION API ────────────────────────────────────
 
+    def _record_chat_thread(self, original: str, translated: str, language: str) -> None:
+        self.recent_threads.appendleft({
+            "kind": "chat",
+            "label": original[:48],
+            "original": original,
+            "translated": translated,
+            "language": language,
+            "when": time.time(),
+        })
+
     def _check_api_access(self, request: Request, correlation_id: str) -> JSONResponse | None:
         """Gate /api/* behind the app-issued session token plus a per-IP rate
         limit. Returns an error response to send, or None if allowed."""
@@ -1677,6 +1725,7 @@ window.voiceUx = window.voiceUx || (() => {
                 correlation_id=correlation_id,
                 language=language,
             )
+            self._record_chat_thread(cleaned_text, translated, language)
             return JSONResponse(
                 {
                     "original_text": cleaned_text,
@@ -1724,11 +1773,13 @@ window.voiceUx = window.voiceUx || (() => {
         should_stream = live_streaming_enabled or len(cleaned_text) >= threshold
 
         if not should_stream:
+            translated = await asyncio.to_thread(self.backend.translate_text, cleaned_text, language)
+            self._record_chat_thread(cleaned_text, translated, language)
             return JSONResponse(
                 {
                     "fallback": True,
                     "original_text": cleaned_text,
-                    "translated_text": await asyncio.to_thread(self.backend.translate_text, cleaned_text, language),
+                    "translated_text": translated,
                     "target_language": language,
                 },
                 headers={"X-Correlation-Id": correlation_id},
@@ -1744,6 +1795,7 @@ window.voiceUx = window.voiceUx || (() => {
                 )
                 for partial in partials[:-1]:
                     yield f"event: partial\ndata: {json.dumps({'translated_text': partial})}\n\n"
+                self._record_chat_thread(cleaned_text, final_text, language)
                 yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True})}\n\n"
             except Exception as e:
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"

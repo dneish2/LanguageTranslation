@@ -99,6 +99,16 @@ machine translation and human edit.
 
 ### Phase 2 — UI/UX rehaul (NiceGUI, on the chosen tokens)
 
+Progress (on the `design/press-tokens` branch, PR #37 — David wants NO merge until it
+looks properly good; keep committing to this branch):
+- [x] Quasar brand colors overridden via `ui.colors` (killed the leftover default-blue toggles/props).
+- [x] Header rebuilt: clickable Passage wordmark → `/`, separator, **Text | Document | Image |
+      Voice mode tabs** (the comp's interaction model). Default/Advanced toggle REMOVED —
+      segment review now always renders when a document has segments.
+- [x] Drawer → **Recent Threads**: chats (text translations, recorded in-memory on API success)
+      + translated documents, newest first; chat threads reload into the Text workspace.
+      Becomes per-user/Supabase-backed in Phase 4.
+
 1. [ ] Restructure `TranslationUI.py` (~1,700 lines) into `passage/ui/` package
        (`pages.py`, `workspace.py`, `segments.py`, `theme.py`, `errors.py`).
 2. [ ] One design system: buttons/banners from theme constants, real icons via `ui.icon`.
@@ -147,6 +157,9 @@ machine translation and human edit.
 4. [ ] Traces: JSONL + `passage_traces` (Langfuse data model). Write points = existing
        `record_feedback` + segment editor callbacks. Trace viewer = a tab on the segment
        review surface: per-segment timeline, edit-distance vs machine output, cost per document.
+5. [ ] **LLM-as-judge annotations (David, 2026-07-05)**: an advanced mode where a second model
+       annotates translation quality per segment (fluency/accuracy/terminology flags). Rides on
+       the trace/score model — a judge annotation is just another score row with model attribution.
 
 ## Sequencing & scope
 

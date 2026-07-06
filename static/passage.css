@@ -48,8 +48,64 @@ h1, h2, h3, .p-display {
   font-family: var(--p-display);
   font-size: 1.4rem;
   color: var(--p-ink);
+  cursor: pointer;
 }
 .p-wordmark b { color: var(--p-accent); font-weight: inherit; }
+.p-wordmark:hover b { text-decoration: underline; }
+
+/* header mode tabs — the one place navigation lives */
+.p-header-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--p-rule);
+  margin: 0 0.35rem;
+}
+.p-mode-tab {
+  font-family: var(--p-data) !important;
+  font-size: 0.72rem !important;
+  letter-spacing: 0.08em;
+  text-transform: uppercase !important;
+  color: var(--p-muted) !important;
+  background: none !important;
+  border: none !important;
+  border-bottom: 2px solid transparent !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  padding: 0.45rem 0.7rem !important;
+  min-height: 0 !important;
+}
+.p-mode-tab:hover { color: var(--p-ink) !important; }
+.p-mode-tab-active {
+  color: var(--p-accent) !important;
+  border-bottom-color: var(--p-accent) !important;
+}
+
+/* recent threads drawer */
+.p-thread-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none !important;
+  border: none !important;
+  border-left: 2px solid transparent !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  color: var(--p-ink) !important;
+  padding: 0.45rem 0.6rem !important;
+  text-transform: none !important;
+  font-family: var(--p-body);
+}
+.p-thread-item:hover {
+  border-left-color: var(--p-accent) !important;
+  background: var(--p-rule-soft) !important;
+}
+.p-thread-kind {
+  font-family: var(--p-data);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--p-muted);
+}
 
 /* ── buttons (label face is the utility mono, per the Press comp) ───── */
 .p-btn {
