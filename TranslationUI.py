@@ -905,17 +905,13 @@ window.voiceUx = window.voiceUx || (() => {
         self.result_container.clear()
         self.stats_container.clear()
 
-        progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
-            .classes("mx-auto mt-4").style("color: #ff9800;")
-        label_ui = ui.label("Preparing translation...")\
-            .classes("text-center text-gray-700 mt-2")
-        self.cancel_button = ui.button("Cancel Translation", on_click=self.cancel_translation)\
-            .classes(f"{theme.BTN_DANGER} mt-2")
-
         with self.progress_container:
-            progress_ui
-            label_ui
-            self.cancel_button
+            progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
+                .classes("mx-auto mt-4")
+            label_ui = ui.label("Preparing translation...")\
+                .classes("text-center mt-2")
+            self.cancel_button = ui.button("Cancel Translation", on_click=self.cancel_translation)\
+                .classes(f"{theme.BTN_DANGER} mt-2")
 
         self._start_job_and_poll(
             progress_ui=progress_ui,
@@ -944,17 +940,13 @@ window.voiceUx = window.voiceUx || (() => {
             file_name=self.uploaded_file_name,
             file_extension=self.uploaded_file_extension,
         )
-        progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
-            .classes("mx-auto mt-4").style("color: #ff9800;")
-        label_ui = ui.label("Loading processed document...")\
-            .classes("text-center text-gray-700 mt-2")
-        self.cancel_button = ui.button("Cancel", on_click=self.cancel_translation)\
-            .classes(f"{theme.BTN_DANGER} mt-2")
-
         with self.progress_container:
-            progress_ui
-            label_ui
-            self.cancel_button
+            progress_ui = ui.circular_progress(value=0, max=100, show_value=True)\
+                .classes("mx-auto mt-4")
+            label_ui = ui.label("Loading processed document...")\
+                .classes("text-center mt-2")
+            self.cancel_button = ui.button("Cancel", on_click=self.cancel_translation)\
+                .classes(f"{theme.BTN_DANGER} mt-2")
 
         self._start_job_and_poll(
             progress_ui=progress_ui,
