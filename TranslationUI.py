@@ -325,7 +325,7 @@ class TranslationUI(VoicePageMixin):
 
     def _request_confirmation(self, title, message, on_confirm, confirm_label="Confirm"):
         with ui.dialog() as dialog:
-            with ui.card().classes("w-[420px] max-w-full"):
+            with ui.card().classes(f"w-[420px] max-w-full {theme.WELL}"):
                 ui.label(title).classes("p-display text-lg")
                 ui.label(message).classes("text-sm p-muted-text")
                 with ui.row().classes("justify-end space-x-2 mt-4"):
@@ -588,18 +588,18 @@ class TranslationUI(VoicePageMixin):
         blocks = result.get("translated_blocks", [])
         confidence = result.get("confidence_metadata", {})
         with self.result_container:
-            with ui.card().classes("w-full p-4 space-y-3"):
-                ui.label(f"Image OCR translation → {language}").classes("text-lg font-semibold")
+            with ui.column().classes(f"w-full max-w-3xl mx-auto gap-3 p-4 {theme.WELL}"):
+                ui.label(f"Image OCR translation → {language}").classes("p-display text-lg")
                 ui.label(
                     f"Confidence avg: {confidence.get('average_confidence', 0)} "
                     f"across {confidence.get('block_count', 0)} blocks"
-                ).classes("text-xs p-muted-text")
+                ).classes(theme.DATA)
                 for idx, block in enumerate(blocks, start=1):
-                    with ui.grid(columns=2).classes("w-full gap-2 border rounded p-2"):
-                        with ui.column().classes("w-full"):
+                    with ui.grid(columns=2).classes("w-full gap-2"):
+                        with ui.column().classes("w-full gap-1"):
                             ui.label(f"Extracted #{idx}").classes("p-data")
                             ui.label(block.get("source_text", "")).classes(f"text-sm {theme.PANEL_SOURCE} p-2")
-                        with ui.column().classes("w-full"):
+                        with ui.column().classes("w-full gap-1"):
                             ui.label(f"Translated #{idx}").classes("p-data")
                             ui.label(block.get("translated_text", "")).classes(f"text-sm {theme.PANEL_TARGET} p-2")
 
@@ -609,8 +609,8 @@ class TranslationUI(VoicePageMixin):
         self.result_container.clear()
         self.stats_container.clear()
         with self.result_container:
-            with ui.card().classes("w-full p-4 space-y-3"):
-                ui.label(f"Voice translation → {language}").classes("text-lg font-semibold")
+            with ui.column().classes(f"w-full max-w-3xl mx-auto gap-3 p-4 {theme.WELL}"):
+                ui.label(f"Voice translation → {language}").classes("p-display text-lg")
                 ui.label("Original").classes("p-data")
                 ui.label(original_text).classes(f"w-full p-3 {theme.PANEL_SOURCE} text-base")
                 ui.label("Translated").classes("p-data")
@@ -846,7 +846,7 @@ class TranslationUI(VoicePageMixin):
 
                 if self.uploaded_file_extension in {"png", "jpg", "jpeg", "webp"}:
                     ui.separator().classes("my-3")
-                    ui.label("Image overlay controls").classes("text-lg font-semibold")
+                    ui.label("Image overlay controls").classes("p-display text-lg")
                     with ui.row().classes("items-center gap-2 flex-wrap"):
                         ui.number("Font size", value=self.overlay_font_size, min=8, max=64, step=1, on_change=lambda e: setattr(self, "overlay_font_size", int(e.value))).classes("w-32")
                         ui.input("Font family", value=self.overlay_font_family, on_change=lambda e: setattr(self, "overlay_font_family", e.value)).classes("w-48")

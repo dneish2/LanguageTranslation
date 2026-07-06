@@ -143,13 +143,29 @@ machine translation and human edit.
   movement** (progress reflects actual job/segment state, never decorative spinners) — keeps the
   user in the loop and doubles as debugging/state visibility. Mockup artifact: "Passage — design
   directions" (Press / Gallery / Ledger).
+- **Full aesthetics + feature QA pass (2026-07-06)**, per David's ask for a high bar before
+  reporting back: live-drove Text/Document/Image/Voice with real translate/OCR/transcript
+  round-trips, desktop (1440px) + narrow (390px) viewport, screenshotted every result state
+  (not just empty forms). Fixed the raw-white-card debt noted above. Two suspected new bugs
+  from screenshots (a washed-out "Translate transcript" button, a mismatched header-tab
+  background) both turned out to be **mouse-hover/ripple rendering artifacts from the
+  automation, not real bugs** — confirmed via `getComputedStyle` before touching any code
+  (background-color and opacity were identical to the correct state in both cases). Lesson: a
+  screenshot difference isn't a bug report until the computed style is checked — don't
+  "fix" a hover ghost. 5/5 live checks passed, 0 console errors, 95/95 pytest unaffected.
+  Reconfirmed the known global-state-collision debt is still live and vivid (a fresh mobile
+  session inherits the previous desktop session's mode) — still correctly scoped as a Phase 4
+  fix, not something to patch around here.
 
 ### Blocked on David (do these once, in the browser)
 
-- [ ] Add repo secret: GitHub → Settings → Secrets and variables → Actions → `OPENAI_API_KEY`
-      (deploy fails healthy-boot without it).
-- [ ] Merge PR #34 (`fix/boot-crash-and-ci-gate`) once CI is green, confirm the Cloud Run
-      revision goes healthy.
+- [x] Add repo secret: GitHub → Settings → Secrets and variables → Actions → `OPENAI_API_KEY`
+      — done, Phase 0 shipped and deployed.
+- [x] Merge PR #34 (`fix/boot-crash-and-ci-gate`) — done, Phase 0 shipped and deployed.
+- [ ] **Current ask**: share the real Supabase `SUPABASE_URL` + anon key (both designed to be
+      public — safe to hand over directly, unlike the service-role key) so Phase 4's auth
+      verification (already ported and live-tested against a fake project, see Phase 4 item 1)
+      can be pointed at the real one, and so the sign-in UI (item 2) becomes buildable.
 
 ## Roadmap
 
@@ -210,6 +226,7 @@ looks properly good; keep committing to this branch):
        scope): `show_mobile_voice_result`/`show_mobile_image_result` render inside a raw
        `ui.card()` with no Passage classes — floats as a stock white Quasar card instead of
        paper/panel; fold into the theme sweep next time either is touched.
+       **Resolved 2026-07-06** in the follow-up aesthetics pass below.
 4. [x] Merge the two segment editors into ONE segment review surface — done (commit `f36ea9e`,
        "Merge the segment editors"); no separate Document Editor dialog remains.
 5. [x] Responsive layout instead of the `/mobile` UA-redirect; retire `/mobile` — done (commit
