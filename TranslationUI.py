@@ -82,11 +82,12 @@ class TranslationUI:
         self.text_output_label = None
 
         # ── MOBILE FLOW ────────────────────────────────────────────────
-        self.input_mode = "Document"
+        # Text is the first tab and the lightest way in; Document/Image are a click away.
+        self.input_mode = "Text"
         # DOM id prefix for the Text-mode workspace elements; must match the
         # hardcoded `scope` in _inject_workspace_text_live_translation_js.
         self.text_status_scope = "workspace_text"
-        self.mobile_input_mode = "Document"
+        self.mobile_input_mode = "Text"
         self.source_language_input = None
         self.target_language_input = None
         self.text_source_input = None
@@ -488,9 +489,12 @@ window.voiceUx = window.voiceUx || (() => {
             self.text_source_input = ui.textarea(
                 label="Enter text to translate",
                 placeholder="Type or paste text…",
-            ).props(f"autogrow rows=8 id={self.text_status_scope}_source").classes("w-full")
+            ).props(f"autogrow rows=8 for={self.text_status_scope}_source").classes("w-full")
+            # Quasar's `for` prop sets the id on the NATIVE control; a plain
+            # `id` prop never reaches it in NiceGUI 3, which left the live
+            # translation JS unable to find these fields.
             if self.target_language_input:
-                self.target_language_input.props(f"id={self.text_status_scope}_target")
+                self.target_language_input.props(f"for={self.text_status_scope}_target")
             return
         if self.input_mode == "Document":
             # auto_upload so picking a file IS the upload — without it the file
@@ -798,8 +802,8 @@ window.voiceUx = window.voiceUx || (() => {
         self.progress_container.clear()
         self.result_container.clear()
         self.stats_container.clear()
-        if self.cancel_button:
-            self.cancel_button.visible = False
+        # clearing progress_container above deleted the cancel button with it
+        self.cancel_button = None
 
         with self.result_container:
             with ui.column().classes("max-w-3xl mx-auto w-full space-y-6 mt-4"):
@@ -1098,14 +1102,20 @@ window.voiceUx = window.voiceUx || (() => {
                 with ui.expansion("No microphone? Paste a transcript instead").classes(f"w-full {theme.WELL}"):
                     ui.textarea(
                         placeholder="Paste text here if your browser cannot record audio.",
-                    ).props("id=desktop_voice_transcript autogrow").classes("w-full")
+                    ).props("for=desktop_voice_transcript autogrow").classes("w-full")
                     ui.button("Translate transcript", on_click=lambda: ui.run_javascript("translateTranscriptFallback()"))\
                         .classes(f"{theme.BTN_PRIMARY} mt-2 mb-2")
 
-        ui.add_head_html("""
+        # Raw string: the SSE parser below needs literal \n in the JS —
+        # a plain triple-quote turned it into a real newline, which was a
+        # SyntaxError that silently killed this whole script block.
+        ui.add_head_html(r"""
 <script>
-    let recorder = null, stream = null, chunks = [], isRecording = false;
-    let selectedMimeType = null;
+    // PCM16 WAV capture via Web Audio (24 kHz): feeds the realtime
+    // transcription models directly — no webm container, no transcoding.
+    let audioCtx = null, sourceNode = null, procNode = null, silentGain = null;
+    let stream = null, pcmChunks = [], isRecording = false;
+    const TARGET_SAMPLE_RATE = 24000;
     const DESKTOP_SCOPE = 'desktop_voice';
 
     function updateStatus(msg) {
@@ -1132,14 +1142,33 @@ window.voiceUx = window.voiceUx || (() => {
         if (!enabled) isRecording = false;
     }
 
-    function resolveRecorderMimeType() {
-        if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== 'function') return undefined;
-        const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
-        for (const mime of candidates) {
-            if (MediaRecorder.isTypeSupported(mime)) return mime;
-        }
-        if (MediaRecorder.isTypeSupported('')) return undefined;
-        return null;
+    function encodeWavBlob(chunks, sampleRate) {
+        let total = 0;
+        chunks.forEach(c => { total += c.length; });
+        const pcm = new Int16Array(total);
+        let offset = 0;
+        for (const c of chunks) { pcm.set(c, offset); offset += c.length; }
+        const buf = new ArrayBuffer(44 + pcm.length * 2);
+        const view = new DataView(buf);
+        const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+        writeStr(0, 'RIFF'); view.setUint32(4, 36 + pcm.length * 2, true); writeStr(8, 'WAVE');
+        writeStr(12, 'fmt '); view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);   // PCM
+        view.setUint16(22, 1, true);   // mono
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+        writeStr(36, 'data'); view.setUint32(40, pcm.length * 2, true);
+        new Int16Array(buf, 44).set(pcm);
+        return new Blob([buf], { type: 'audio/wav' });
+    }
+
+    function teardownAudioGraph() {
+        if (procNode) { try { procNode.disconnect(); } catch (_e) {} procNode = null; }
+        if (sourceNode) { try { sourceNode.disconnect(); } catch (_e) {} sourceNode = null; }
+        if (silentGain) { try { silentGain.disconnect(); } catch (_e) {} silentGain = null; }
+        if (audioCtx) { try { audioCtx.close(); } catch (_e) {} audioCtx = null; }
+        if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     }
 
     function mapRecordingError(err) {
@@ -1160,91 +1189,98 @@ window.voiceUx = window.voiceUx || (() => {
         const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
         const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
         const secureOk = window.isSecureContext || isLocalhost;
-        if (!hasGetUserMedia || !secureOk) {
+        const AudioContextImpl = window.AudioContext || window.webkitAudioContext;
+        if (!hasGetUserMedia || !secureOk || !AudioContextImpl) {
             setRecordingControlsEnabled(false);
             updateStatus("Recording unavailable. Use HTTPS or localhost in a supported browser.");
-            updateDebug(`preflight getUserMedia=${hasGetUserMedia} secure=${secureOk}`);
-            return;
-        }
-
-        selectedMimeType = resolveRecorderMimeType();
-        if (selectedMimeType === null) {
-            setRecordingControlsEnabled(false);
-            updateStatus("No supported recording format found. Try a different browser.");
-            updateDebug(`mime=none secure=${secureOk}`);
+            updateDebug(`preflight getUserMedia=${hasGetUserMedia} secure=${secureOk} webAudio=${!!AudioContextImpl}`);
             return;
         }
 
         updateStatus("Requesting mic…");
-        updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=requesting`);
+        updateDebug(`pcm-wav secure=${secureOk} permission=requesting`);
         try {
             const constraints = {
                 audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
             };
             stream = await navigator.mediaDevices.getUserMedia(constraints);
-            updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=granted`);
-            const recorderOptions = selectedMimeType ? { mimeType: selectedMimeType } : undefined;
-            recorder = recorderOptions ? new MediaRecorder(stream, recorderOptions) : new MediaRecorder(stream);
-            chunks = [];
-            recorder.ondataavailable = e => { if(e.data.size>0) { chunks.push(e.data); updateDebug(`Chunks:${chunks.length}`); } };
-            recorder.onstart = () => { updateStatus("🔴 Recording…"); updateButtons(true); };
-            recorder.onerror = e => {
-                updateStatus("Error: " + mapRecordingError(e.error || e));
-                updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=granted`);
-                updateButtons(false);
+            try {
+                audioCtx = new AudioContextImpl({ sampleRate: TARGET_SAMPLE_RATE });
+            } catch (_e) {
+                audioCtx = new AudioContextImpl();
+            }
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+            sourceNode = audioCtx.createMediaStreamSource(stream);
+            procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+            silentGain = audioCtx.createGain();
+            silentGain.gain.value = 0;  // keep the graph alive without echoing the mic
+            pcmChunks = [];
+            procNode.onaudioprocess = (e) => {
+                if (!isRecording) return;
+                const f32 = e.inputBuffer.getChannelData(0);
+                const i16 = new Int16Array(f32.length);
+                for (let i = 0; i < f32.length; i++) {
+                    const s = Math.max(-1, Math.min(1, f32[i]));
+                    i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                pcmChunks.push(i16);
+                const seconds = pcmChunks.length * 4096 / audioCtx.sampleRate;
+                updateDebug(`pcm-wav ${seconds.toFixed(1)}s @ ${audioCtx.sampleRate}Hz`);
             };
-            recorder.start(1000);
+            sourceNode.connect(procNode);
+            procNode.connect(silentGain);
+            silentGain.connect(audioCtx.destination);
+            updateStatus("🔴 Recording…");
+            updateButtons(true);
         } catch (err) {
             const mapped = mapRecordingError(err);
             updateStatus("Error: " + mapped);
-            updateDebug(`mime=${selectedMimeType || 'browser-default'} secure=${secureOk} permission=denied (${err?.name || 'unknown'})`);
-            if(stream) stream.getTracks().forEach(t=>t.stop());
+            updateDebug(`pcm-wav secure=${secureOk} permission=denied (${err?.name || 'unknown'})`);
+            teardownAudioGraph();
         }
     }
 
     async function stopRecording() {
-        if(!recorder || recorder.state!=='recording') {
+        if (!isRecording || !audioCtx) {
             window.voiceUx.setDebug(DESKTOP_SCOPE, 'No active recording session.');
             return;
         }
         window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.STOPPING);
-        window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, false);
-        recorder.onstop = async () => {
-            window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.PROCESSING_AUDIO);
-            const blob = new Blob(chunks, { type: recorder.mimeType });
-            let lang = document.getElementById('language_select')?.value || 'es';
-            let fd = new FormData();
-            fd.append('file', blob, `rec.${blob.type.includes('webm')?'webm':'mp4'}`);
-            fd.append('language', lang);
-            try {
-                const resp = await fetch('/api/voice_translate', { method:'POST', body:fd, headers: { 'X-Passage-Token': window.PASSAGE_TOKEN || '' } });
-                if(!resp.ok) throw new Error(await resp.text());
-                const audio = await resp.blob();
-                const origHeader = resp.headers.get('X-Original-Text') || '';
-                const transHeader = resp.headers.get('X-Translated-Text') || '';
-                const decodeHeader = (value) => {
-                    if (!value) return '';
-                    try { return decodeURIComponent(value); } catch (_err) { return value; }
-                };
-                const orig = decodeHeader(origHeader);
-                const trans = decodeHeader(transHeader);
-                document.getElementById('original_text').textContent   = orig;
-                document.getElementById('translated_text').textContent= trans;
-                if(audio.size>0){
-                    let url = URL.createObjectURL(audio);
-                    let player = document.getElementById('out_audio');
-                    player.src = url; player.play();
-                    window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
-                }
-            } catch(e) {
-                window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
-                window.voiceUx.setDebug(DESKTOP_SCOPE, e.message);
-            } finally {
-                if(stream) stream.getTracks().forEach(t=>t.stop());
-                recorder = null; chunks = [];
+        updateButtons(false);
+        const sampleRate = audioCtx.sampleRate;
+        const captured = pcmChunks;
+        pcmChunks = [];
+        teardownAudioGraph();
+        window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.PROCESSING_AUDIO);
+        const blob = encodeWavBlob(captured, sampleRate);
+        let lang = document.getElementById('language_select')?.value || 'es';
+        let fd = new FormData();
+        fd.append('file', blob, 'rec.wav');
+        fd.append('language', lang);
+        try {
+            const resp = await fetch('/api/voice_translate', { method:'POST', body:fd, headers: { 'X-Passage-Token': window.PASSAGE_TOKEN || '' } });
+            if(!resp.ok) throw new Error(await resp.text());
+            const audio = await resp.blob();
+            const origHeader = resp.headers.get('X-Original-Text') || '';
+            const transHeader = resp.headers.get('X-Translated-Text') || '';
+            const decodeHeader = (value) => {
+                if (!value) return '';
+                try { return decodeURIComponent(value); } catch (_err) { return value; }
+            };
+            const orig = decodeHeader(origHeader);
+            const trans = decodeHeader(transHeader);
+            document.getElementById('original_text').textContent   = orig;
+            document.getElementById('translated_text').textContent= trans;
+            if(audio.size>0){
+                let url = URL.createObjectURL(audio);
+                let player = document.getElementById('out_audio');
+                player.src = url; player.play();
+                window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
             }
-        };
-        recorder.stop();
+        } catch(e) {
+            window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
+            window.voiceUx.setDebug(DESKTOP_SCOPE, e.message);
+        }
     }
 
     async function translateTranscriptFallback() {
@@ -1313,17 +1349,15 @@ window.voiceUx = window.voiceUx || (() => {
         const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
         const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
         const secureOk = window.isSecureContext || isLocalhost;
-        selectedMimeType = resolveRecorderMimeType();
-        const canRecord = hasGetUserMedia && secureOk && selectedMimeType !== null;
+        const hasWebAudio = !!(window.AudioContext || window.webkitAudioContext);
+        const canRecord = hasGetUserMedia && secureOk && hasWebAudio;
         setRecordingControlsEnabled(canRecord);
-        if (!hasGetUserMedia || !secureOk) {
+        if (!canRecord) {
             updateStatus("Recording unavailable. Use HTTPS or localhost in a supported browser.");
-        } else if (selectedMimeType === null) {
-            updateStatus("No supported recording format found. Try a different browser.");
         } else {
             updateStatus("Ready to record");
         }
-        updateDebug(`mime=${selectedMimeType === null ? 'none' : (selectedMimeType || 'browser-default')} secure=${secureOk} getUserMedia=${hasGetUserMedia}`);
+        updateDebug(`pcm-wav secure=${secureOk} getUserMedia=${hasGetUserMedia} webAudio=${hasWebAudio}`);
     });
 </script>
         """)

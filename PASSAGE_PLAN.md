@@ -63,14 +63,40 @@ machine translation and human edit.
 - **Model roster upgraded + 2 crashes fixed (2026-07-06, on `design/press-tokens`)**:
   text `gpt-5.4-nano` + vision `gpt-5.4-mini` (both with `max_completion_tokens` +
   `reasoning_effort="none"` — GPT-5-family rejects `max_tokens`; "none" is the 5.4 spelling
-  of "minimal"), STT `whisper-1`→`gpt-4o-mini-transcribe`, TTS `tts-1`→`gpt-4o-mini-tts`.
-  All four env-overridable; OCR call also gained `response_format=json_object`. Live-verified:
-  all four models + full PDF pipeline + booted `/api/text_translate`. Crashes: NiceGUI 3.x
-  upload events (`event.file` + async read, was `event.name`/`event.content`) broke ALL
-  document/image uploads; live-translation JS re-injection on workspace re-render died with
-  "parent slot deleted" (swap ⇄) — now injected once per page, bindings delegated on `document`.
-  True realtime voice (`gpt-realtime-translate`, $0.034/min, WebSocket Realtime API) deliberately
-  NOT adopted — the /voice clip flow is REST; live streaming voice is a Phase-5-adjacent feature.
+  of "minimal"); OCR call also gained `response_format=json_object`. Voice moved to the current
+  families per David: STT `gpt-realtime-whisper` over a transcription-intent websocket
+  (`intent=transcription`, `turn_detection: None` — the model has no server VAD; PCM16 only,
+  so the /voice recorder now captures **24 kHz mono PCM16 WAV via Web Audio** instead of
+  MediaRecorder webm), TTS `gpt-audio-mini` via the chat-completions audio modality
+  (voice `nova`; TTS-engine system prompt). Non-PCM payloads fall back to REST
+  `gpt-4o-mini-transcribe` with magic-byte filename sniffing. All env-overridable
+  (`PASSAGE_TEXT_MODEL`/`_VISION_`/`_TRANSCRIBE_`/`_TRANSCRIBE_REST_`/`_TTS_MODEL`/`_TTS_VOICE`).
+  **`gpt-realtime-translate` (speech→translated speech, $0.034/min) is listed in /v1/models but
+  unusable on this account as of 2026-07-06**: realtime sessions fail with
+  `inference_not_found_error`, transcription sessions reject the model id — re-probe later; the
+  provider seam is ready for it. Live-verified: text/vision/STT/TTS + full voice loop (~7s clip
+  round-trip) + REST fallback + full PDF pipeline + booted `/api/text_translate`.
+  Crashes fixed: NiceGUI 3.x upload events (`event.file` + async read, was
+  `event.name`/`event.content`) broke ALL document/image uploads; live-translation JS
+  re-injection on workspace re-render died with "parent slot deleted" (swap ⇄) — now injected
+  once per page, bindings delegated on `document`.
+- **Browser-verified pass (2026-07-06, Playwright vs the running app, 6/6 features, 0 console
+  errors)** — found and fixed three more latent bugs:
+  1. `.props("id=…")` on NiceGUI inputs/textareas never reaches the native control in NiceGUI 3
+     (buttons/labels are fine) → the Text-mode live-translate JS had NO source/target elements
+     and was silently dead; Quasar's **`for=`** prop is the correct way (also fixed the /voice
+     transcript textarea).
+  2. The /voice head script had `buffer.split('\n')` inside a non-raw Python triple-quote → a
+     literal newline inside a JS string literal → SyntaxError that killed the ENTIRE script
+     block (recorder, transcript fallback, streaming SSE parser). Now a raw string.
+  3. `show_result` touched the already-deleted Cancel button (cleared with progress_container).
+  Also: default workspace mode is now **Text** (was Document; Text is the first tab).
+  UX debt observed while testing, not yet fixed: (a) the **global-state collision is vivid** —
+  a second browser session inherits the first session's mode/languages/uploaded filename
+  (Phase 4 fixes this properly); (b) source language == target language silently "succeeds"
+  with an identity translation; (c) /voice shows a developer Debug line; (d) Recent Threads
+  can show duplicate entries for repeated identical translations; (e) segment-editor icon
+  buttons (✓/✗/copy) render as cramped glyphs — restyle during Phase 2 item 4.
 - **Interim API hardening shipped** (branch `security/api-hardening`): the four public `/api/*`
   endpoints were fully open — anyone with the URL could burn the OpenAI key. Now gated by a
   short-lived signed session token (`api_security.py`) that only app-served pages embed

@@ -6,9 +6,10 @@ import time
 import uuid
 import json
 import random
+import wave
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from threading import Lock, Thread
+from threading import Lock, Thread, Timer
 from html import escape
 from io import BytesIO
 from typing import Any, Callable, Optional, Tuple
@@ -38,11 +39,52 @@ MODEL_COST_PER_1K_TOKENS = 0.002
 # profiles land. GPT-5-family models reject `max_tokens` (use
 # `max_completion_tokens`) and default to slow reasoning, so translation calls
 # pin reasoning_effort="none" — see _completion_limit_kwargs.
+# Voice uses the current families: gpt-realtime-whisper runs over a
+# transcription-intent websocket (PCM16 only — the /voice recorder produces
+# 24 kHz WAV), with a REST fallback for non-PCM payloads; gpt-audio-* models
+# speak via the chat-completions audio modality. gpt-realtime-translate
+# (speech→translated speech in one hop) is exposed in /v1/models but rejected
+# by every session type on this account as of 2026-07-06 — adopt when it opens.
 TEXT_MODEL = os.getenv("PASSAGE_TEXT_MODEL", "gpt-5.4-nano")
 VISION_MODEL = os.getenv("PASSAGE_VISION_MODEL", "gpt-5.4-mini")
-TRANSCRIBE_MODEL = os.getenv("PASSAGE_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-TTS_MODEL = os.getenv("PASSAGE_TTS_MODEL", "gpt-4o-mini-tts")
+TRANSCRIBE_MODEL = os.getenv("PASSAGE_TRANSCRIBE_MODEL", "gpt-realtime-whisper")
+TRANSCRIBE_REST_MODEL = os.getenv("PASSAGE_TRANSCRIBE_REST_MODEL", "gpt-4o-mini-transcribe")
+TTS_MODEL = os.getenv("PASSAGE_TTS_MODEL", "gpt-audio-mini")
 TTS_VOICE = os.getenv("PASSAGE_TTS_VOICE", "nova")
+REALTIME_STT_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_REALTIME_STT_TIMEOUT", "45"))
+
+
+def _guess_audio_filename(data: bytes) -> str:
+    """The REST transcription API infers the container from the filename."""
+    if data[:4] == b"RIFF":
+        return "speech.wav"
+    if data[:4] == b"\x1aE\xdf\xa3":
+        return "speech.webm"
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2", b"\xff\xfa"):
+        return "speech.mp3"
+    if data[4:8] == b"ftyp":
+        return "speech.mp4"
+    if data[:4] == b"OggS":
+        return "speech.ogg"
+    return "speech.webm"
+
+
+def _read_pcm16_wav(data: bytes) -> tuple[bytes, int] | None:
+    """Return (mono PCM16 frames, sample rate) if `data` is a PCM16 WAV, else None."""
+    try:
+        with wave.open(BytesIO(data), "rb") as wav:
+            if wav.getsampwidth() != 2 or wav.getcomptype() != "NONE":
+                return None
+            channels = wav.getnchannels()
+            rate = wav.getframerate()
+            frames = wav.readframes(wav.getnframes())
+    except (wave.Error, EOFError):
+        return None
+    if channels == 2:  # keep the left channel
+        frames = b"".join(frames[i:i + 2] for i in range(0, len(frames), 4))
+    elif channels != 1:
+        return None
+    return frames, rate
 
 
 def _completion_limit_kwargs(model: str, max_tokens: int) -> dict[str, Any]:
@@ -90,10 +132,93 @@ class OpenAITranslationProvider(BaseTranslationProvider):
         )
 
     def transcribe_audio(self, *, audio_file: BytesIO) -> str:
-        transcription = self.client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=audio_file)
+        data = audio_file.read()
+        name = getattr(audio_file, "name", "speech.wav")
+        if TRANSCRIBE_MODEL.startswith("gpt-realtime"):
+            pcm_wav = _read_pcm16_wav(data)
+            if pcm_wav is not None:
+                return self._transcribe_realtime(*pcm_wav)
+            logging.warning(
+                "[Backend] %s takes PCM16 WAV only; %r falls back to REST %s",
+                TRANSCRIBE_MODEL, name, TRANSCRIBE_REST_MODEL,
+            )
+        rest_model = (
+            TRANSCRIBE_REST_MODEL if TRANSCRIBE_MODEL.startswith("gpt-realtime") else TRANSCRIBE_MODEL
+        )
+        rest_file = BytesIO(data)
+        rest_file.name = name
+        transcription = self.client.audio.transcriptions.create(model=rest_model, file=rest_file)
         return transcription.text
 
+    def _transcribe_realtime(self, pcm: bytes, rate: int) -> str:
+        """One-shot clip transcription over a transcription-intent websocket.
+
+        The realtime transcription models have no server VAD ("Turn detection
+        is not supported"), so the flow is: append the whole clip, commit,
+        collect deltas until `...input_audio_transcription.completed`.
+        """
+        with self.client.realtime.connect(extra_query={"intent": "transcription"}) as conn:
+            conn.session.update(session={
+                "type": "transcription",
+                "audio": {"input": {
+                    "format": {"type": "audio/pcm", "rate": rate},
+                    "transcription": {"model": TRANSCRIBE_MODEL},
+                    "turn_detection": None,
+                }},
+            })
+            chunk = max(rate // 5 * 2, 2)  # ~200 ms of mono int16
+            for i in range(0, len(pcm), chunk):
+                conn.input_audio_buffer.append(
+                    audio=base64.b64encode(pcm[i:i + chunk]).decode("ascii")
+                )
+            conn.input_audio_buffer.commit()
+
+            watchdog = Timer(REALTIME_STT_TIMEOUT_SECONDS, conn.close)
+            watchdog.start()
+            parts: list[str] = []
+            final: str | None = None
+            error: str | None = None
+            try:
+                for event in conn:
+                    event_type = event.type
+                    if event_type == "error":
+                        error = str(getattr(event, "error", "unknown realtime error"))
+                        break
+                    if event_type.endswith("input_audio_transcription.delta"):
+                        parts.append(event.delta)
+                    elif event_type.endswith("input_audio_transcription.completed"):
+                        final = event.transcript
+                        break
+            except Exception as socket_end:  # watchdog close ends iteration
+                logging.warning("[Backend] realtime STT socket closed: %s", socket_end)
+            finally:
+                watchdog.cancel()
+            if error:
+                raise RuntimeError(f"Realtime transcription failed: {error}")
+            text = final if final is not None else "".join(parts)
+            if not text.strip():
+                raise ValueError("The transcription model returned no text.")
+            return text
+
     def synthesize_speech(self, *, text: str) -> bytes:
+        if TTS_MODEL.startswith("gpt-audio"):
+            completion = self.client.chat.completions.create(
+                model=TTS_MODEL,
+                modalities=["text", "audio"],
+                audio={"voice": TTS_VOICE, "format": "mp3"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a text-to-speech engine. Say the user's message "
+                            "exactly as written, in the language it is written in. "
+                            "Never translate, answer, add, or omit anything."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+            )
+            return base64.b64decode(completion.choices[0].message.audio.data)
         tts_resp = self.client.audio.speech.create(
             model=TTS_MODEL,
             voice=TTS_VOICE,
@@ -644,7 +769,7 @@ class TranslationBackend:
         try:
             logging.info("[Backend] Voice pipeline start → %s (%d bytes)", target_language, len(audio_bytes))
             audio_file = BytesIO(audio_bytes)
-            audio_file.name = "speech.webm"  # the transcription API needs a filename
+            audio_file.name = _guess_audio_filename(audio_bytes)
 
             source_text = self._require_provider().transcribe_audio(audio_file=audio_file)
             logging.info("[Backend] Transcription: %s", source_text[:60] + "…")

@@ -54,3 +54,57 @@ def test_calculate_tokens_survives_model_names_unknown_to_tiktoken(monkeypatch):
     backend = tb.TranslationBackend()
 
     assert backend.calculate_tokens("hello world") > 0
+
+
+def _wav_bytes(rate=24000, channels=1, frames=b"\x01\x00\x02\x00\x03\x00\x04\x00"):
+    import wave
+    from io import BytesIO
+
+    buf = BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(frames)
+    return buf.getvalue()
+
+
+def test_read_pcm16_wav_parses_mono_and_downmixes_stereo():
+    pcm, rate = tb._read_pcm16_wav(_wav_bytes())
+    assert (pcm, rate) == (b"\x01\x00\x02\x00\x03\x00\x04\x00", 24000)
+
+    stereo_pcm, _ = tb._read_pcm16_wav(_wav_bytes(channels=2))
+    assert stereo_pcm == b"\x01\x00\x03\x00"  # left channel only
+
+    assert tb._read_pcm16_wav(b"\x1aE\xdf\xa3 not a wav") is None
+
+
+def test_guess_audio_filename_by_magic_bytes():
+    assert tb._guess_audio_filename(_wav_bytes()) == "speech.wav"
+    assert tb._guess_audio_filename(b"\x1aE\xdf\xa3...") == "speech.webm"
+    assert tb._guess_audio_filename(b"ID3\x04...") == "speech.mp3"
+    assert tb._guess_audio_filename(b"\x00\x00\x00 ftypisom") == "speech.mp4"
+
+
+def test_non_wav_audio_transcribes_via_rest_fallback(monkeypatch):
+    """gpt-realtime-* models take PCM only; other payloads must hit the REST
+    endpoint with the fallback model, never the websocket."""
+    from io import BytesIO
+
+    monkeypatch.setattr(tb, "TRANSCRIBE_MODEL", "gpt-realtime-whisper")
+    provider = tb.OpenAITranslationProvider(api_key="test-key")
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(text="hello")
+
+    provider.client = SimpleNamespace(
+        audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create)),
+        realtime=None,  # touching the websocket would blow up
+    )
+    clip = BytesIO(b"\x1aE\xdf\xa3 fake webm")
+    clip.name = "speech.webm"
+
+    assert provider.transcribe_audio(audio_file=clip) == "hello"
+    assert captured["model"] == tb.TRANSCRIBE_REST_MODEL
