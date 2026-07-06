@@ -647,18 +647,21 @@ window.voiceUx = window.voiceUx || (() => {
                     translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
                     translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
+                # Facing pages: source sits on paper, translation on panel.
                 with ui.grid(columns=1 if self.mobile_mode else 2).classes("w-full gap-3"):
-                    with ui.card().classes("w-full p-4 space-y-3"):
-                        ui.label("Source").classes("text-base font-semibold text-gray-700")
+                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_SOURCE}"):
+                        ui.label("Source").classes(theme.DATA)
                         self._render_source_input_panel()
-                    with ui.card().classes("w-full p-4 space-y-2"):
-                        ui.label("Translated output").classes("text-base font-semibold text-gray-700")
+                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_TARGET}"):
+                        with ui.row().classes("w-full items-baseline justify-between"):
+                            ui.label("Translation").classes(theme.DATA)
+                            ui.label(self.current_target_language or "").classes(theme.DATA)
                         if self.input_mode == "Text":
                             ui.label("Ready").classes(self.banner_classes["info"]).props(
                                 f"id={self.text_status_scope}_status"
                             )
                             self.text_output_label = ui.label("").classes(
-                                f"w-full min-h-[140px] {theme.PANEL_TARGET} p-3 text-base"
+                                "w-full min-h-[140px] p-1 text-base"
                             ).props(f"id={self.text_status_scope}_output")
                         else:
                             self._show_banner(self.progress_container, "Status: Ready to translate.", "info")
