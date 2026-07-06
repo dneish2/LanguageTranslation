@@ -6,3 +6,4 @@ openai>=1.25.0
 tiktoken>=0.5.1
 python-dotenv>=1.0.1
 Pillow>=10.0.0
+PyJWT[crypto]>=2.8    # Verify Supabase asymmetric (ES256/RS256) access tokens via JWKS (Phase 4 auth).

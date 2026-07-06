@@ -19,6 +19,7 @@ import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
 from TranslationBackend import TranslationBackend
 from passage.ui.common import LANGUAGES, log_event as _log_event
+from passage.auth.jwt_verify import identity_from_auth_header
 from passage.ui.voice_page import VoicePageMixin
 
 logging.basicConfig(level=logging.INFO)
@@ -117,6 +118,13 @@ class TranslationUI(VoicePageMixin):
             "/api/image_translate",
             self.api_image_translate,
             methods=["POST"],
+        )
+        # Phase 4 (accounts): identity-only, not gated by the paid-API token —
+        # degrades to anonymous with zero config until SUPABASE_URL is set.
+        app.add_api_route(
+            "/api/me",
+            self.api_me,
+            methods=["GET"],
         )
 
     def start_ui(self):
@@ -1249,6 +1257,15 @@ class TranslationUI(VoicePageMixin):
                 status_code=500,
                 headers={"X-Correlation-Id": correlation_id},
             )
+
+    async def api_me(self, request: Request) -> JSONResponse:
+        """Identity from the Authorization header, or anonymous. Not gated
+        by the paid-API session token — this costs nothing and a client
+        may need it before it has a page-issued PASSAGE_TOKEN."""
+        user_id, email = identity_from_auth_header(request.headers.get("authorization"))
+        if user_id is None:
+            return JSONResponse({"authenticated": False, "user_id": None, "email": None})
+        return JSONResponse({"authenticated": True, "user_id": user_id, "email": email})
 
 
 if __name__ in {"__main__", "__mp_main__"}:

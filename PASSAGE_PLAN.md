@@ -253,10 +253,33 @@ looks properly good; keep committing to this branch):
 
 ### Phase 4 — Accounts + workspace (shared finplatform Supabase)
 
-1. [ ] Port `finplatform/auth/jwt_verify.py` (**the ES256/JWKS version**) into `passage/auth/`.
-       Degrade to anon/no-op without keys (zero-config local dev).
+1. [x] Port `finplatform/auth/jwt_verify.py` (**the ES256/JWKS version**) into `passage/auth/` —
+       **done 2026-07-06**: ported verbatim (the verification logic is generic, not
+       finplatform-specific); `claims_to_identity` simplified to `(user_id, email)` since
+       Passage has no Role/credits concept yet. Added `PyJWT[crypto]` to requirements.txt (was
+       missing — without it the ES256/JWKS path, the CURRENT Supabase signing scheme per
+       finplatform's CLAUDE.md, would silently no-op to anonymous even with a valid token and a
+       configured `SUPABASE_URL`; confirmed the install pulls only `cryptography`/`cffi`/
+       `pycparser`, no conflicts). New `/api/me` route resolves identity from the
+       `Authorization` header, ungated (costs nothing, unlike the OpenAI-backed endpoints).
+       **Live-verified end-to-end, twice**: (a) a real ES256 token against a real JWKS endpoint
+       (self-generated EC keypair + a throwaway local HTTP server serving the JWKS document —
+       proves the asymmetric path isn't just falling through to the "no SUPABASE_URL" None
+       case) — verified, tamper rejected too; (b) the real `/api/me` HTTP route with a real
+       HS256 token, both signed-in and anonymous. 12 offline unit tests ported from
+       finplatform's `test_auth_jwt.py` (throwaway secret, no network). Zero-config confirmed:
+       with no `SUPABASE_URL`/`SUPABASE_JWT_SECRET` set, every request resolves anonymous.
+       **Genuinely blocked on David** (not attempted, and correctly so): this is real code
+       against a placeholder project — I don't have and should not fabricate finplatform's
+       actual `SUPABASE_URL`/anon key. The project ref IS known (`wjukgtxlczldgjtcgljv`, from
+       finplatform's `CLAUDE.md`) and `SUPABASE_URL`/the anon key are DESIGNED to be public
+       (shipped in every Supabase browser bundle) — safe to hand over directly, unlike the
+       service-role key which must stay in secret storage. Once David sets those two values,
+       real Supabase-issued tokens should verify with no further code change.
 2. [ ] Sign-in UI: magic-link + Google via GoTrue REST (mirror finplatform's SDK-less flow).
-       Header account chip; signed-out users keep full local use.
+       Header account chip; signed-out users keep full local use. **Blocked on the anon key**
+       above — the verification half (item 1) doesn't need it, but issuing a real magic-link
+       request does.
 3. [ ] Per-user workspace: `passage_documents`, `passage_segments` tables + `passage-files`
        Storage bucket, RLS by uid. "Recent Documents" reads user rows, not the server
        filesystem — also fixes the global-state collision (scope run state per session/user).
