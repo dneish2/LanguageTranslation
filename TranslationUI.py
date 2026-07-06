@@ -244,13 +244,13 @@ window.voiceUx = window.voiceUx || (() => {
         """)
 
     def _render_voice_status_block(self, scope: str) -> None:
-        ui.label("Status").classes("text-sm font-semibold text-gray-700 mt-3")
+        ui.label("Status").classes(f"{theme.DATA} mt-3")
         ui.label("")\
-            .classes("text-base text-gray-800")\
+            .classes("text-base")\
             .props(f"id={scope}_status")
-        ui.label("Debug").classes("text-xs font-semibold text-gray-600 mt-1")
+        ui.label("Debug").classes(f"{theme.DATA} mt-1")
         ui.label("")\
-            .classes("text-xs text-gray-500 min-h-[20px]")\
+            .classes(f"{theme.DATA} min-h-[20px]")\
             .props(f"id={scope}_debug")
 
     def _inject_workspace_text_live_translation_js(self) -> None:
@@ -1322,50 +1322,64 @@ window.voiceUx = window.voiceUx || (() => {
 
     # ─────────────────────────────── VOICE TRANSLATION PAGE ─────────────────────────────────
 
+    def _go_workspace(self, mode: str) -> None:
+        self.input_mode = mode
+        self.mobile_input_mode = mode
+        ui.navigate.to("/")
+
     def voice_translation_page(self):
         self._inject_theme()
         self._inject_api_token()
         self._inject_voice_frontend_helpers()
-        ui.label("Live Voice Translation").classes("text-2xl mb-4")
 
-        with ui.row().classes("items-center space-x-2 mb-4"):
-            ui.label("Target language:").classes("font-medium")
-            options = "".join(f'<option value="{lang}"></option>' for lang in LANGUAGES)
-            ui.html(
-                f'<input id="language_select" list="passage_languages" value="Spanish" '
-                f'placeholder="Type a language…" class="px-3 py-2 p-well">'
-                f'<datalist id="passage_languages">{options}</datalist>'
-            )
+        # Same header as the workspace; Voice is the active tab.
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                with ui.row().classes("items-center gap-0"):
+                    for label, mode in (("Text", "Text"), ("Document", "Document"), ("Image", "Image/Camera")):
+                        ui.button(label, on_click=lambda _, m=mode: self._go_workspace(m))\
+                            .props("flat no-caps").classes("p-mode-tab")
+                    ui.button("Voice").props("flat no-caps").classes("p-mode-tab p-mode-tab-active")
 
-        self._render_voice_status_block("desktop_voice")
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-3xl gap-3"):
+                with ui.row().classes(f"w-full items-center gap-3 flex-wrap {theme.WELL} p-3"):
+                    ui.label("To").classes(theme.DATA)
+                    options = "".join(f'<option value="{lang}"></option>' for lang in LANGUAGES)
+                    ui.html(
+                        f'<input id="language_select" list="passage_languages" value="Spanish" '
+                        f'placeholder="Type a language…" class="px-3 py-2 p-well">'
+                        f'<datalist id="passage_languages">{options}</datalist>'
+                    )
+                    ui.element("div").classes("flex-grow")
+                    ui.html('<button id="desktop_voice_start_recording" class="p-btn p-btn-ok px-4 py-2" '
+                            'onclick="startRecording()">● Record</button>')
+                    ui.html('<button id="desktop_voice_stop_recording" class="p-btn p-btn-danger px-4 py-2" '
+                            'onclick="stopRecording()" disabled>■ Stop</button>')
 
-        with ui.row().classes("space-x-4 mb-4"):
-            ui.html('<button id="desktop_voice_start_recording" class="p-btn p-btn-ok px-4 py-2" '
-                    'onclick="startRecording()">🎤 Start Recording</button>')
-            ui.html('<button id="desktop_voice_stop_recording" class="p-btn p-btn-danger px-4 py-2" '
-                    'onclick="stopRecording()" disabled>⏹️ Stop Recording</button>')
-            ui.button("← Back", on_click=lambda: ui.navigate.to("/"))\
-              .classes(theme.BTN_SECONDARY)
+                self._render_voice_status_block("desktop_voice")
 
-        ui.label("Transcript fallback (when recording is unavailable)").classes("text-sm font-semibold text-gray-700 mt-2")
-        ui.textarea(
-            label="Transcript (fallback)",
-            placeholder="Paste text if your browser cannot record audio.",
-        ).props("id=desktop_voice_transcript autogrow").classes("w-full")
-        ui.button("Translate", on_click=lambda: ui.run_javascript("translateTranscriptFallback()"))\
-            .classes(f"{theme.BTN_PRIMARY} mt-2")
+                with ui.grid(columns=2).classes("w-full gap-3"):
+                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_SOURCE}"):
+                        ui.label("Original").classes(theme.DATA)
+                        ui.label("").classes("min-h-[60px]").props("id=original_text")
+                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_TARGET}"):
+                        ui.label("Translation").classes(theme.DATA)
+                        ui.label("").classes("min-h-[60px]").props("id=translated_text")
 
-        ui.audio(src="data:audio/wav;base64,")\
-          .props("id=out_audio controls")\
-          .classes("w-full")
+                ui.audio(src="data:audio/wav;base64,")\
+                  .props("id=out_audio controls")\
+                  .classes("w-full")
 
-        ui.label("Original:").classes("font-bold mt-4")
-        ui.label("").classes(f"p-2 {theme.PANEL_SOURCE} min-h-[40px]")\
-          .props("id=original_text")
-
-        ui.label("Translation:").classes("font-bold mt-2")
-        ui.label("").classes(f"p-2 {theme.PANEL_TARGET} min-h-[40px]")\
-          .props("id=translated_text")
+                with ui.expansion("No microphone? Paste a transcript instead").classes(f"w-full {theme.WELL}"):
+                    ui.textarea(
+                        placeholder="Paste text here if your browser cannot record audio.",
+                    ).props("id=desktop_voice_transcript autogrow").classes("w-full")
+                    ui.button("Translate transcript", on_click=lambda: ui.run_javascript("translateTranscriptFallback()"))\
+                        .classes(f"{theme.BTN_PRIMARY} mt-2 mb-2")
 
         ui.add_head_html("""
 <script>
