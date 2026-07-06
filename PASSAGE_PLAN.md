@@ -249,6 +249,13 @@ looks properly good; keep committing to this branch):
        profiles, a "Test connection" flow, a picker) that the plan itself sequences alongside
        Phase 4's accounts work. Today, switching providers is an env var
        (`TRANSLATION_PROVIDER=ollama`) — real and tested, just not exposed in the UI yet.
+       **Considered building a "local-only, no Supabase needed" slice of this 2026-07-06 and
+       deliberately didn't**: `TranslationBackend` is one instance shared across every connected
+       client (the same global-state collision flagged elsewhere in this doc), so a provider
+       *picker* right now would be a process-wide toggle affecting every open session, not a
+       per-user setting — that's new debt in the same shape as the debt already being tracked
+       for Phase 4 to fix, not a step toward the real design. Wait for Phase 4's per-session/
+       per-user scoping; revisit then.
 3. [~] Local default: TranslateGemma via Ollama — **provider layer done and live-verified**
        2026-07-06 against a real local Ollama instance (`http://localhost:11434/v1`, verified
        reachable on this machine): `TRANSLATION_PROVIDER=ollama` boots the backend with **no
