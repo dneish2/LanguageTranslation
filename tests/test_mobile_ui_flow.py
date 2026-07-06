@@ -119,6 +119,77 @@ def test_text_mode_error_path_requires_text():
     assert errors == ["Please provide source text before translating."]
 
 
+def test_text_mode_rejects_identical_source_and_target_language():
+    ui_app = _build_mobile_ui()
+    ui_app.input_mode = "Text"
+    ui_app.source_language_input = DummyInput("Spanish")
+    ui_app.target_language_input = DummyInput("spanish")  # case-insensitive match
+    ui_app.text_source_input = DummyInput("Hola, ¿qué tal?")
+
+    errors = []
+    ui_app.show_error = lambda message: errors.append(str(message))
+    translated = []
+    ui_app.backend.translate_text = lambda *a, **k: translated.append(1)
+
+    ui_app.start_mobile_translation()
+
+    assert errors == ["From and To are the same language — swap ⇄ or pick a different target."]
+    assert not translated
+
+
+def test_document_mode_rejects_identical_source_and_target_language():
+    ui_app = _build_mobile_ui()
+    ui_app.input_mode = "Document"
+    ui_app.mobile_input_mode = "Document"
+    ui_app.source_language_input = DummyInput("French")
+    ui_app.target_language_input = DummyInput("French")
+    ui_app.uploaded_file = BytesIO(b"doc")
+
+    errors = []
+    ui_app.show_error = lambda message: errors.append(str(message))
+    ui_app.handle_translation = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run"))
+
+    ui_app.start_mobile_translation()
+
+    assert errors == ["From and To are the same language — swap ⇄ or pick a different target."]
+
+
+def test_show_error_classifies_short_message_as_direct_banner():
+    assert TranslationUI._is_technical_error("Please upload a file before translating.") is False
+
+
+def test_show_error_classifies_provider_exception_as_technical():
+    long_openai_error = (
+        "Error code: 400 - {'error': {'message': 'Audio file might be corrupted', "
+        "'type': 'invalid_request_error'}}"
+    )
+    assert TranslationUI._is_technical_error(long_openai_error) is True
+
+
+def test_show_error_classifies_long_message_as_technical_even_without_markers():
+    assert TranslationUI._is_technical_error("x" * 141) is True
+    assert TranslationUI._is_technical_error("x" * 140) is False
+
+
+def test_record_thread_dedupes_repeated_chat_by_moving_it_to_the_top():
+    ui_app = _build_mobile_ui()
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+    ui_app._record_chat_thread("Goodbye", "Adiós", "Spanish")
+    ui_app._record_chat_thread("Hello", "Hola de nuevo", "Spanish")  # repeat of the first
+
+    labels = [t["label"] for t in ui_app.recent_threads]
+    assert labels == ["Hello", "Goodbye"]
+    assert ui_app.recent_threads[0]["translated"] == "Hola de nuevo"
+
+
+def test_record_thread_keeps_distinct_languages_for_the_same_text_separate():
+    ui_app = _build_mobile_ui()
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+    ui_app._record_chat_thread("Hello", "Bonjour", "French")
+
+    assert len(ui_app.recent_threads) == 2
+
+
 def test_mode_switch_syncs_mobile_and_unified_mode():
     ui_app = _build_mobile_ui()
     refresh_calls = {"count": 0}

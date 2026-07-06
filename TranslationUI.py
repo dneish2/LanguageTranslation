@@ -208,6 +208,13 @@ window.voiceUx = window.voiceUx || (() => {
         setRecordingButtons(scope, false);
     }
 
+    // Developer readout: reveal the hidden Debug block only with ?debug=1.
+    window.addEventListener('load', () => {
+        if (new URLSearchParams(window.location.search).has('debug')) {
+            document.querySelectorAll('.p-debug-block').forEach(el => el.classList.remove('hidden'));
+        }
+    });
+
     return { states, init, setStatus, setDebug, setRecordingButtons };
 })();
 </script>
@@ -218,9 +225,11 @@ window.voiceUx = window.voiceUx || (() => {
         ui.label("")\
             .classes("text-base")\
             .props(f"id={scope}_status")
-        ui.label("Debug").classes(f"{theme.DATA} mt-1")
+        # Developer readout — hidden unless the page is opened with ?debug=1
+        # (voiceUx.init reveals .p-debug-block); updateDebug still writes to it.
+        ui.label("Debug").classes(f"{theme.DATA} mt-1 hidden p-debug-block")
         ui.label("")\
-            .classes(f"{theme.DATA} min-h-[20px]")\
+            .classes(f"{theme.DATA} min-h-[20px] hidden p-debug-block")\
             .props(f"id={scope}_debug")
 
     def _inject_workspace_text_live_translation_js(self) -> None:
@@ -238,6 +247,7 @@ window.voiceUx = window.voiceUx || (() => {
     let activeRequestToken = 0;
     const byId = (id) => document.getElementById(id);
     const sourceEl = () => byId(`${scope}_source`);
+    const sourceLangEl = () => byId(`${scope}_source_lang`);
     const targetEl = () => byId(`${scope}_target`);
     const outputEl = () => byId(`${scope}_output`);
     const statusEl = () => byId(`${scope}_status`);
@@ -255,6 +265,11 @@ window.voiceUx = window.voiceUx || (() => {
         if (!text) {
             output.textContent = '';
             setStatus(stateLabels.READY);
+            return;
+        }
+        const fromLanguage = (sourceLangEl()?.value || '').trim();
+        if (fromLanguage && fromLanguage.toLowerCase() === language.toLowerCase()) {
+            setStatus('From and To are the same language — swap ⇄ or pick a different target.');
             return;
         }
         const token = ++activeRequestToken;
@@ -364,8 +379,8 @@ window.voiceUx = window.voiceUx || (() => {
     def _request_confirmation(self, title, message, on_confirm, confirm_label="Confirm"):
         with ui.dialog() as dialog:
             with ui.card().classes("w-[420px] max-w-full"):
-                ui.label(title).classes("text-lg font-semibold text-gray-800")
-                ui.label(message).classes("text-sm text-gray-600")
+                ui.label(title).classes("p-display text-lg")
+                ui.label(message).classes("text-sm p-muted-text")
                 with ui.row().classes("justify-end space-x-2 mt-4"):
                     ui.button("Cancel", on_click=dialog.close)\
                         .classes(theme.BTN_SECONDARY_SM)
@@ -393,7 +408,7 @@ window.voiceUx = window.voiceUx || (() => {
 
             threads = sorted(self.recent_threads, key=lambda t: t.get("when", 0), reverse=True)
             if not threads:
-                ui.label("No threads yet.").classes("text-sm text-gray-600")
+                ui.label("No threads yet.").classes("text-sm p-muted-text")
                 return
             for t in threads[:20]:
                 if t["kind"] == "chat":
@@ -447,19 +462,21 @@ window.voiceUx = window.voiceUx || (() => {
         with self.upload_container:
             with ui.column().classes(f"w-full {max_width} gap-3"):
                 with ui.row().classes(f"w-full items-end gap-2 flex-wrap {theme.WELL} p-3"):
+                    # bind_value: language edits must survive workspace
+                    # re-renders (mode tabs) — an unbound input's value was
+                    # silently reset to the last committed language.
                     self.source_language_input = ui.input(
                         label="From",
-                        value=self.current_source_language or "English",
                         placeholder="Source language",
                         autocomplete=LANGUAGES,
-                    ).classes("min-w-[120px] flex-1")
+                    ).bind_value(self, "current_source_language")\
+                     .props(f"for={self.text_status_scope}_source_lang").classes("min-w-[120px] flex-1")
                     ui.button("⇄", on_click=self.swap_languages).classes(self.button_secondary_classes)
                     self.target_language_input = ui.input(
                         label="To",
-                        value=self.current_target_language or "Spanish",
                         placeholder="Target language",
                         autocomplete=LANGUAGES,
-                    ).classes("min-w-[120px] flex-1")
+                    ).bind_value(self, "current_target_language").classes("min-w-[120px] flex-1")
                     translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
                     translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
@@ -506,7 +523,7 @@ window.voiceUx = window.voiceUx || (() => {
                 on_upload=self.handle_mobile_upload,
             ).classes("w-full")
             if self.uploaded_file_name:
-                ui.label(f"Selected file: {self.uploaded_file_name}").classes("text-sm text-gray-600")
+                ui.label(f"Selected file: {self.uploaded_file_name}").classes("text-sm p-muted-text")
             return
 
         # One affordance: the file input's accept/capture props let phones
@@ -518,7 +535,7 @@ window.voiceUx = window.voiceUx || (() => {
             on_upload=self.handle_mobile_image_upload,
         ).props("accept=image/* capture=environment").classes("w-full")
         if self.image_upload_name:
-            ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm text-gray-600")
+            ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm p-muted-text")
 
     def set_mobile_input_mode(self, mode):
         self.mobile_input_mode = mode
@@ -538,6 +555,12 @@ window.voiceUx = window.voiceUx || (() => {
         self.current_target_language = language
         if not language:
             self.show_error("Please enter a valid target language.")
+            return
+        source_language = (
+            self.source_language_input.value if self.source_language_input else self.current_source_language
+        ) or ""
+        if source_language.strip().lower() == language.strip().lower():
+            self.show_error("From and To are the same language — swap ⇄ or pick a different target.")
             return
 
         if self.input_mode == "Document":
@@ -576,7 +599,7 @@ window.voiceUx = window.voiceUx || (() => {
 
         with self.progress_container:
             progress_ui = ui.circular_progress(value=0, max=100, show_value=True).classes("mt-3")
-            label_ui = ui.label("Translating text...").classes("text-sm text-gray-700")
+            label_ui = ui.label("Translating text...").classes("text-sm p-muted-text")
 
         def voice_task():
             self._run_mobile_voice_translation(source_text, language, progress_ui, label_ui)
@@ -614,14 +637,14 @@ window.voiceUx = window.voiceUx || (() => {
                 ui.label(
                     f"Confidence avg: {confidence.get('average_confidence', 0)} "
                     f"across {confidence.get('block_count', 0)} blocks"
-                ).classes("text-xs text-gray-600")
+                ).classes("text-xs p-muted-text")
                 for idx, block in enumerate(blocks, start=1):
                     with ui.grid(columns=2).classes("w-full gap-2 border rounded p-2"):
                         with ui.column().classes("w-full"):
-                            ui.label(f"Extracted #{idx}").classes("text-xs font-semibold text-gray-600")
+                            ui.label(f"Extracted #{idx}").classes("p-data")
                             ui.label(block.get("source_text", "")).classes(f"text-sm {theme.PANEL_SOURCE} p-2")
                         with ui.column().classes("w-full"):
-                            ui.label(f"Translated #{idx}").classes("text-xs font-semibold text-gray-600")
+                            ui.label(f"Translated #{idx}").classes("p-data")
                             ui.label(block.get("translated_text", "")).classes(f"text-sm {theme.PANEL_TARGET} p-2")
 
     def show_mobile_voice_result(self, original_text, translated_text, language):
@@ -630,9 +653,9 @@ window.voiceUx = window.voiceUx || (() => {
         with self.result_container:
             with ui.card().classes("w-full p-4 space-y-3"):
                 ui.label(f"Voice translation → {language}").classes("text-lg font-semibold")
-                ui.label("Original").classes("text-xs font-semibold text-gray-600")
+                ui.label("Original").classes("p-data")
                 ui.label(original_text).classes(f"w-full p-3 {theme.PANEL_SOURCE} text-base")
-                ui.label("Translated").classes("text-xs font-semibold text-gray-600")
+                ui.label("Translated").classes("p-data")
                 ui.label(translated_text).classes(f"w-full p-3 {theme.PANEL_TARGET} text-base")
 
                 with ui.column().classes("w-full gap-2"):
@@ -759,8 +782,8 @@ window.voiceUx = window.voiceUx || (() => {
 
             self.current_count = count
             self.current_tokens = 0 if processed else tokens
-            if processed:
-                self.current_target_language = "Processed"
+            # (regenerated runs keep the real target language — writing
+            # "Processed" into it now leaks into the bound To input)
 
             self.original_segments_map.clear()
             self.translated_segments_map.clear()
@@ -769,7 +792,7 @@ window.voiceUx = window.voiceUx || (() => {
                 self.translated_segments_map[seg_id] = seg_info["translated"]
 
             if not processed and self.uploaded_file_name:
-                self.recent_threads.appendleft({
+                self._record_thread({
                     "kind": "document",
                     "label": self.uploaded_file_name,
                     "language": target_language,
@@ -807,8 +830,8 @@ window.voiceUx = window.voiceUx || (() => {
 
         with self.result_container:
             with ui.column().classes("max-w-3xl mx-auto w-full space-y-6 mt-4"):
-                ui.label(f"'{self.uploaded_file_name}' → {self.current_target_language}")\
-                    .classes("text-2xl font-semibold text-gray-800")
+                ui.label(f"{self.uploaded_file_name} → {self.current_target_language}")\
+                    .classes("p-display text-2xl")
 
                 # ── SEGMENT EDITOR ──────────────────────────────
                 if self.advanced_mode and self.original_segments_map:
@@ -833,19 +856,20 @@ window.voiceUx = window.voiceUx || (() => {
                         with ui.expansion(location, value=i == 0)\
                                 .classes(f"w-full mb-2 {theme.WELL}"):
                             with ui.column().classes("p-3 pb-16 md:pb-4 gap-3"):
-                                with ui.row().classes("justify-between items-center"):
-                                    ui.label(location).classes(theme.DATA)
-                                    with ui.row().classes("space-x-1"):
-                                        ui.button("✓", on_click=lambda _, s=seg_id: self.approve_segment_callback(s))\
-                                          .props("size=sm color=positive")
-                                        ui.button("✗", on_click=lambda _, s=seg_id: self.decline_segment_callback(s))\
-                                          .props("size=sm color=negative")
-                                        ui.button("🗑️", on_click=lambda _, s=seg_id: self.delete_segment_callback(s))\
-                                          .props("size=sm color=grey")
+                                with ui.row().classes("w-full justify-end items-center gap-2"):
+                                    with ui.button(icon="check", on_click=lambda _, s=seg_id: self.approve_segment_callback(s))\
+                                            .props("size=sm no-caps").classes(theme.BTN_OK_SM):
+                                        ui.tooltip("Approve this translation")
+                                    with ui.button(icon="close", on_click=lambda _, s=seg_id: self.decline_segment_callback(s))\
+                                            .props("size=sm no-caps").classes(theme.BTN_SECONDARY_SM):
+                                        ui.tooltip("Reject — restore the machine translation")
+                                    with ui.button(icon="delete_outline", on_click=lambda _, s=seg_id: self.delete_segment_callback(s))\
+                                            .props("size=sm no-caps").classes(theme.BTN_DANGER_SM):
+                                        ui.tooltip("Remove this segment from the document")
 
                                 with ui.column().classes("w-full"):
                                     ui.label("Original:")\
-                                      .classes("text-xs font-semibold text-gray-600")
+                                      .classes("p-data")
                                     ui.html(
                                         f'<div class="text-sm p-2 p-panel-source '
                                         f'max-h-20 overflow-y-auto">{orig[:300]}'
@@ -854,7 +878,7 @@ window.voiceUx = window.voiceUx || (() => {
 
                                 with ui.column().classes("w-full"):
                                     ui.label("Translation:")\
-                                      .classes("text-xs font-semibold text-gray-600")
+                                      .classes("p-data")
                                     textarea = ui.textarea(value=trans)\
                                       .props("autogrow rows=3")\
                                       .classes(f"w-full text-sm {theme.PANEL_TARGET}")
@@ -866,11 +890,11 @@ window.voiceUx = window.voiceUx || (() => {
                                     ui.button("Update",
                                               on_click=lambda _, s=seg_id, ta=textarea, ri=refine:
                                                 self.update_segment_callback(s, ta, ri)
-                                             ).props("size=sm color=primary")
+                                             ).props("size=sm no-caps").classes(theme.BTN_PRIMARY_SM)
                                     ui.button("Re-translate",
                                               on_click=lambda _, s=seg_id, ta=textarea:
                                                 self.retranslate_segment_callback(s, ta)
-                                             ).props("size=sm color=secondary")
+                                             ).props("size=sm no-caps").classes(theme.BTN_SECONDARY_SM)
 
                 if self.uploaded_file_extension in {"png", "jpg", "jpeg", "webp"}:
                     ui.separator().classes("my-3")
@@ -897,11 +921,10 @@ window.voiceUx = window.voiceUx || (() => {
 
         # stats footer
         with self.stats_container:
-            ui.label(f"elements translated: {self.current_count}")\
-              .classes(theme.DATA)
-            if self.current_tokens > 0:
-                ui.label(f"tokens used: {self.current_tokens:,}")\
-                  .classes(theme.DATA)
+            with ui.row().classes("w-full max-w-3xl mx-auto gap-4 mt-1"):
+                ui.label(f"{self.current_count} segments translated").classes(theme.DATA)
+                if self.current_tokens > 0:
+                    ui.label(f"{self.current_tokens:,} tokens").classes(theme.DATA)
 
     def refresh_image_overlay(self):
         try:
@@ -1040,10 +1063,29 @@ window.voiceUx = window.voiceUx || (() => {
             logging.error(f"[UI] Error saving edits: {ex}", exc_info=True)
             ui.notify(f"Save failed: {ex}", type="negative")
 
+    @staticmethod
+    def _is_technical_error(detail: str) -> bool:
+        return len(detail) > 140 or any(
+            marker in detail for marker in ("Error code", "Traceback", "Exception", "HTTP/")
+        )
+
     def show_error(self, error):
+        """Single error surface: short guidance in the banner; raw provider/
+        stack detail tucked into an expansion instead of dumped on the page."""
         self.result_container.clear()
         self.stats_container.clear()
-        self._show_banner(self.result_container, f"Error: {error}", "negative")
+        detail = str(error).strip() or "Unknown error."
+        if not self._is_technical_error(detail):
+            self._show_banner(self.result_container, f"Error: {detail}", "negative")
+            return
+        self._show_banner(
+            self.result_container,
+            "The translation service hit an error and nothing was changed. Please try again.",
+            "negative",
+        )
+        with self.result_container:
+            with ui.expansion("Technical detail").classes(f"w-full {theme.WELL}"):
+                ui.label(detail).classes(f"{theme.DATA} text-xs break-all")
 
     # ─────────────────────────────── VOICE TRANSLATION PAGE ─────────────────────────────────
 
@@ -1364,8 +1406,20 @@ window.voiceUx = window.voiceUx || (() => {
 
     # ─────────────────────────── VOICE TRANSLATION API ────────────────────────────────────
 
+    def _record_thread(self, entry: dict) -> None:
+        """Newest-first with dedupe: repeating a translation moves its thread
+        to the top instead of stacking duplicates."""
+        key = (entry.get("kind"), entry.get("label"), entry.get("language"))
+        survivors = [
+            t for t in self.recent_threads
+            if (t.get("kind"), t.get("label"), t.get("language")) != key
+        ]
+        self.recent_threads.clear()
+        self.recent_threads.extend(survivors)
+        self.recent_threads.appendleft(entry)
+
     def _record_chat_thread(self, original: str, translated: str, language: str) -> None:
-        self.recent_threads.appendleft({
+        self._record_thread({
             "kind": "chat",
             "label": original[:48],
             "original": original,

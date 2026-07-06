@@ -92,11 +92,39 @@ machine translation and human edit.
   3. `show_result` touched the already-deleted Cancel button (cleared with progress_container).
   Also: default workspace mode is now **Text** (was Document; Text is the first tab).
   UX debt observed while testing, not yet fixed: (a) the **global-state collision is vivid** —
-  a second browser session inherits the first session's mode/languages/uploaded filename
-  (Phase 4 fixes this properly); (b) source language == target language silently "succeeds"
-  with an identity translation; (c) /voice shows a developer Debug line; (d) Recent Threads
-  can show duplicate entries for repeated identical translations; (e) segment-editor icon
-  buttons (✓/✗/copy) render as cramped glyphs — restyle during Phase 2 item 4.
+  a second browser session inherits the first session's mode/languages/uploaded filename;
+  Phase 4's per-user workspace is the real fix.
+- **Phase 2 quality pass (2026-07-06)**, closing debt items (b)–(d) from the browser-verified
+  pass above, all zero-API-cost (pytest + one no-translate Playwright pass, since this landed
+  mid-loop after OpenAI credits ran low):
+  - **(b) same-language guard**: From==To (case-insensitive) now blocks with "swap ⇄ or pick a
+    different target" instead of silently running an identity translation — enforced both
+    server-side (`start_mobile_translation`) and in the Text-mode live-translate JS.
+  - **(c) Debug line hidden by default**: `/voice`'s developer readout only shows with
+    `?debug=1` (`voiceUx.init` reveals `.p-debug-block` on load); `updateDebug` still writes to
+    it so the flag is loss-free for real debugging.
+  - **(d) Recent Threads dedupe**: `_record_thread` (generalizes `_record_chat_thread`) drops any
+    existing entry with the same (kind, label, language) before prepending, so repeating a
+    translation moves its thread to the top instead of stacking duplicates.
+  - **Unified error surface**: `show_error` now classifies via `_is_technical_error` (long or
+    provider-shaped messages) — short user-facing messages show directly in the banner; raw
+    OpenAI/stack detail collapses into a "Technical detail" expansion instead of dumping on the
+    page. Pure-function classifier is unit tested without touching NiceGUI rendering.
+  - **Segment icon buttons**: approve/reject/delete switched from emoji glyphs to `ui.icon` +
+    tooltips on the theme's OK/secondary/danger classes (still burgundy-only per David's taste
+    call below, but no longer cramped).
+  - **Language input binding**: From/To now `bind_value` to `current_source_language`/
+    `current_target_language` instead of a one-shot `value=` — edits used to reset on every
+    workspace re-render (mode-tab clicks); a stray `current_target_language = "Processed"`
+    write (regenerate-without-retranslate path) was removed since it would have leaked into the
+    bound To field.
+  - **Reverted**: a CSS specificity fix (`.p-btn.p-btn-secondary` double-class selectors) that
+    would have made secondary/danger/ok buttons render outlined/tinted instead of solid burgundy
+    (Quasar's own `bg-primary` was winning the cascade on every `ui.button`). David saw the
+    screenshots first and said he likes the current uniform burgundy — reverted rather than ship
+    an unrequested visual change. The underlying specificity bug is still real if this is
+    revisited later; don't re-fix without asking.
+  - 71/71 pytest (7 new: same-language guard both modes, error classifier, thread dedupe).
 - **Interim API hardening shipped** (branch `security/api-hardening`): the four public `/api/*`
   endpoints were fully open — anyone with the URL could burn the OpenAI key. Now gated by a
   short-lived signed session token (`api_security.py`) that only app-served pages embed

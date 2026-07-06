@@ -182,6 +182,9 @@ h1, h2, h3, .p-display {
   font-variant-numeric: tabular-nums;
 }
 
+/* secondary body text (replaces ad-hoc text-gray-*) */
+.p-muted-text { color: var(--p-muted); }
+
 /* ── form fields: ink on paper, labels in the data face ─────────────── */
 .q-field__native,
 .q-field__input,
