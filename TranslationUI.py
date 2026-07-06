@@ -87,7 +87,6 @@ class TranslationUI:
         self.document_editor_original_values: dict[str, str] = {}
 
         # ── MOBILE FLOW ────────────────────────────────────────────────
-        self.mobile_mode = False
         self.input_mode = "Document"
         # DOM id prefix for the Text-mode workspace elements; must match the
         # hardcoded `scope` in _inject_workspace_text_live_translation_js.
@@ -142,7 +141,8 @@ class TranslationUI:
         # register pages
         ui.page("/")(self.main_page)
         ui.page("/voice")(self.voice_translation_page)
-        ui.page("/mobile")(self.mobile_page)
+        # /mobile is retired — one responsive layout; keep old bookmarks working
+        ui.page("/mobile")(lambda: ui.navigate.to("/"))
         app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))
         # run on single port; Cloud Run injects PORT
         ui.run(
@@ -166,33 +166,6 @@ class TranslationUI:
             warning=theme.PALETTE["warn"],
             info=theme.PALETTE["muted"],
         )
-
-    def _inject_auto_device_routing(self, page: str) -> None:
-        ui.add_body_html(f"""
-<script>
-(() => {{
-    const page = {json.dumps(page)};
-    const currentPath = window.location.pathname;
-    const uaMobile = /Android|iPhone|iPad|iPod|Mobile|Opera Mini|IEMobile/i.test(navigator.userAgent || '');
-    const viewportMobile = window.matchMedia('(max-width: 768px)').matches;
-    const coarsePointer = window.matchMedia('(pointer: coarse)').matches;
-    const isMobile = uaMobile || (viewportMobile && coarsePointer);
-    const targetPath = isMobile ? '/mobile' : '/';
-    const key = 'device_auto_redirect';
-
-    if ((page === 'desktop' && targetPath === '/mobile' && currentPath !== '/mobile')
-        || (page === 'mobile' && targetPath === '/' && currentPath !== '/')) {{
-        const redirected = sessionStorage.getItem(key);
-        if (!redirected) {{
-            sessionStorage.setItem(key, '1');
-            window.location.replace(targetPath);
-            return;
-        }}
-    }}
-    sessionStorage.removeItem(key);
-}})();
-</script>
-        """)
 
     def _inject_voice_frontend_helpers(self) -> None:
         ui.add_head_html("""
@@ -328,10 +301,8 @@ window.voiceUx = window.voiceUx || (() => {
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
     def main_page(self):
-        self.mobile_mode = False
         self._inject_theme()
         self._inject_api_token()
-        self._inject_auto_device_routing("desktop")
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
@@ -553,7 +524,7 @@ window.voiceUx = window.voiceUx || (() => {
             ui.notify(f"Failed to save document edits: {ex}", type="negative")
         finally:
             self.close_document_editor()
-            if self.advanced_mode and self.original_segments_map and not self.mobile_mode:
+            if self.advanced_mode and self.original_segments_map:
                 self.show_result()
 
     def show_document_list(self):
@@ -634,7 +605,7 @@ window.voiceUx = window.voiceUx || (() => {
         self.render_unified_workspace()
 
     def render_unified_workspace(self):
-        max_width = "max-w-md" if self.mobile_mode else "max-w-6xl"
+        max_width = "max-w-6xl"
         with self.upload_container:
             with ui.column().classes(f"w-full {max_width} gap-3"):
                 with ui.row().classes(f"w-full items-end gap-2 flex-wrap {theme.WELL} p-3"):
@@ -651,17 +622,12 @@ window.voiceUx = window.voiceUx || (() => {
                         placeholder="Target language",
                         autocomplete=LANGUAGES,
                     ).classes("min-w-[120px] flex-1")
-                    if self.mobile_mode:
-                        mode_selector = ui.toggle(
-                            {"Text": "Text", "Document": "Document", "Image/Camera": "Image/Camera"},
-                            value=self.input_mode,
-                        ).classes("h-10 min-h-0 px-2 rounded-md")
-                        mode_selector.on_value_change(lambda e: self.set_mobile_input_mode(e.value))
                     translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
                     translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
-                # Facing pages: source sits on paper, translation on panel.
-                with ui.grid(columns=1 if self.mobile_mode else 2).classes("w-full gap-3"):
+                # Facing pages: source sits on paper, translation on panel;
+                # stacks to one column on narrow viewports.
+                with ui.element("div").classes("w-full grid grid-cols-1 md:grid-cols-2 gap-3"):
                     with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_SOURCE}"):
                         ui.label("Source").classes(theme.DATA)
                         self._render_source_input_panel()
@@ -710,23 +676,6 @@ window.voiceUx = window.voiceUx || (() => {
         ).props("accept=image/* capture=environment").classes("w-full")
         if self.image_upload_name:
             ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm text-gray-600")
-
-    def mobile_page(self):
-        self.mobile_mode = True
-        self._inject_theme()
-        self._inject_api_token()
-        self._inject_auto_device_routing("mobile")
-        with ui.header().classes(f"items-center {theme.HEADER} p-3"):
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')
-                ui.button("Desktop", on_click=lambda: ui.navigate.to("/")).classes(self.button_secondary_classes)
-
-        with ui.column().classes("w-full items-center p-3"):
-            self.upload_container = ui.column().classes("w-full max-w-md space-y-3")
-            self.progress_container = ui.column().classes("w-full max-w-md space-y-2")
-            self.result_container = ui.column().classes("w-full max-w-md space-y-3")
-            self.stats_container = ui.column().classes("w-full max-w-md space-y-1")
-            self.refresh_upload_ui()
 
     def set_mobile_input_mode(self, mode):
         self.mobile_input_mode = mode
@@ -1044,7 +993,7 @@ window.voiceUx = window.voiceUx || (() => {
                     .classes("text-2xl font-semibold text-gray-800")
 
                 # ── SEGMENT EDITOR ──────────────────────────────
-                if self.advanced_mode and self.original_segments_map and not self.mobile_mode:
+                if self.advanced_mode and self.original_segments_map:
                     ui.separator().classes("my-4")
                     ui.label("Advanced Mode: Segment Editor")\
                         .classes("text-xl font-bold mb-2")
