@@ -363,3 +363,15 @@ billing unification, TranslateGemma on hosted GPUs.
 - UX: screenshot pass (desktop + narrow) vs the chosen mockup.
 - Flagship: real finplatform print-to-PDF export → Passage → side-by-side layout compare;
   every segment has a trace row; a human edit produces a score/event.
+
+**Cross-version check (2026-07-06)**: local dev runs Python 3.12, but CI (`deploy.yml`) runs
+3.11 — that gap had never actually been exercised against this branch's dozen-plus commits.
+Built an isolated 3.11 venv (`uv venv --python 3.11`), installed `requirements.txt` fresh
+(including the new `PyJWT[crypto]`), and re-ran everything: 103/103 pytest, the full app boots
+and serves `/`, `/voice`, `/api/me`, a real hosted translation, and a real local-Ollama
+translation — all identical to 3.12. No 3.12-only syntax had crept in. Also confirmed
+`deploy.yml`'s Cloud Run `env_vars` (only `OPENAI_API_KEY`) needs no changes: every new env var
+this session added (`TRANSLATION_PROVIDER`, `SUPABASE_URL`, etc.) defaults safely when unset,
+by design. `cryptography` (via `PyJWT[crypto]`) ships prebuilt `manylinux` wheels, so the
+`ubuntu-latest` CI runner shouldn't need a compiler — not exercised on an actual Linux runner
+from here, but a low-risk inference given how widely that wheel matrix is covered.
