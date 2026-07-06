@@ -203,7 +203,7 @@ def test_mode_switch_syncs_mobile_and_unified_mode():
 
 
 def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
-    source = Path("TranslationUI.py").read_text(encoding="utf-8")
+    source = Path("passage/ui/voice_page.py").read_text(encoding="utf-8")
 
     assert "document.getElementById('status_label')" not in source
     assert "document.getElementById('debug_info')" not in source
@@ -218,7 +218,7 @@ def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
 
 
 def test_transcript_fallback_js_handler_is_defined_and_exported():
-    source = Path("TranslationUI.py").read_text(encoding="utf-8")
+    source = Path("passage/ui/voice_page.py").read_text(encoding="utf-8")
 
     assert "async function translateTranscriptFallback()" in source
     assert "window.translateTranscriptFallback = translateTranscriptFallback;" in source
@@ -226,7 +226,7 @@ def test_transcript_fallback_js_handler_is_defined_and_exported():
 
 
 def test_voice_ui_decodes_percent_encoded_translation_headers():
-    source = Path("TranslationUI.py").read_text(encoding="utf-8")
+    source = Path("passage/ui/voice_page.py").read_text(encoding="utf-8")
 
     assert "decodeURIComponent(value)" in source
     assert "const transHeader = resp.headers.get('X-Translated-Text')" in source

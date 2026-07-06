@@ -164,8 +164,9 @@ machine translation and human edit.
        ALL ad-hoc Tailwind color strings replaced (blue/purple/indigo/green/red/gray buttons →
        4 semantic button styles; bg-white/gray-50/blue-50 surfaces → paper/panel/well).
 3. [x] Brand assets: `static/favicon.svg` (burgundy P on paper), `ui.run(title="Passage",
-       favicon=...)`, Passage wordmark in both headers. Still open: OG meta, replace
-       `Multilingual.png` hero (do during Phase 2 restructure).
+       favicon=...)`, Passage wordmark in both headers. Still open: OG meta tags;
+       `Multilingual.png` is an unused stray file in the repo root (not referenced by any
+       code path) — delete during the Phase 2 restructure cleanup pass.
 
 ### Phase 2 — UI/UX rehaul (NiceGUI, on the chosen tokens)
 
@@ -179,17 +180,33 @@ looks properly good; keep committing to this branch):
       + translated documents, newest first; chat threads reload into the Text workspace.
       Becomes per-user/Supabase-backed in Phase 4.
 
-1. [ ] Restructure `TranslationUI.py` (~1,700 lines) into `passage/ui/` package
-       (`pages.py`, `workspace.py`, `segments.py`, `theme.py`, `errors.py`).
-2. [ ] One design system: buttons/banners from theme constants, real icons via `ui.icon`.
-3. [ ] Unified error + loading model: single `notify_error()` path, friendly message +
-       expandable detail, retry affordance, buttons disabled in flight, shared skeleton/progress.
-4. [ ] Merge the two segment editors into ONE segment review surface (inline Advanced editor
-       absorbs the Document Editor dialog) — this surface later doubles as the trace viewer.
-5. [ ] Responsive layout instead of the `/mobile` UA-redirect; retire `/mobile`.
-6. [ ] Restyle `/voice` onto the same system.
-7. [ ] Remove dead UI (legacy PPTX `handle_upload`) and dead modules (`job_queue.py` /
-       `translation_metrics.py`) or wire them in deliberately — default remove.
+1. [~] Restructure `TranslationUI.py` into `passage/ui/` — **started 2026-07-06**: the `/voice`
+       page (recorder UI, its ~450-line head-injected JS, `api_voice_translate`) moved into
+       `passage/ui/voice_page.py` as a `VoicePageMixin` (TranslationUI still inherits it, so
+       shared state — `self.backend`, `_check_api_access`, `_inject_theme` — needs no redesign);
+       `LANGUAGES`/`_log_event` moved to `passage/ui/common.py` to avoid a circular import back
+       to TranslationUI.py. `TranslationUI.py` 1672→1225 lines. Verified: 71/71 pytest (updated
+       3 tests that grep JS source text to point at the new file), live browser 7/7 feature pass
+       incl. the moved voice route, live voice HTTP round-trip. Still monolithic and NOT split
+       further: the workspace/segment-editor methods share heavy `self.*` state and a mixin-only
+       split there is lower value than the remaining phases — deferred, not abandoned; revisit
+       if the file grows past this point again.
+2. [x] One design system: buttons/banners from theme constants; zero raw Tailwind color classes
+       remain anywhere in `TranslationUI.py` (verified 2026-07-06). Segment approve/reject/delete
+       use `ui.icon`; most other buttons are short text labels by design, not icon candidates.
+3. [ ] Unified error + loading model: `show_error`'s banner+detail split shipped (commit `2dd7330`).
+       Still open: a single `notify_error()`/request-lifecycle helper, retry affordance, buttons
+       disabled in flight, one shared skeleton/progress pattern instead of ad-hoc
+       `circular_progress` blocks per mode.
+4. [x] Merge the two segment editors into ONE segment review surface — done (commit `f36ea9e`,
+       "Merge the segment editors"); no separate Document Editor dialog remains.
+5. [x] Responsive layout instead of the `/mobile` UA-redirect; retire `/mobile` — done (commit
+       `1adb288`); `/mobile` is now a one-line redirect to `/`.
+6. [x] Restyle `/voice` onto the same system — done (commit `9bfc5f9`); voice buttons use
+       `p-btn`/theme classes, zero raw colors.
+7. [x] Remove dead UI (legacy PPTX `handle_upload`) and dead modules — done: `job_queue.py`
+       deleted (commit `26c4868`), legacy PPTX upload flow removed, `translation_metrics.py`
+       confirmed live (imported by the backend, not dead).
 
 ### Phase 3 — Model optionality
 
@@ -220,6 +237,15 @@ looks properly good; keep committing to this branch):
 
 1. [ ] Integrate **pdf2zh / BabelDOC** as an async job (wire in or replace `job_queue.py`).
        Output mono + bilingual variants. DOCX stays on python-docx (+ run-merge for bold/italic).
+       **Feasibility check (2026-07-06)**: `uv pip install --dry-run pdf2zh` pulls a large,
+       divergent dependency tree — notably **downgrades `starlette` and `websockets`** below
+       what NiceGUI and the realtime-voice websocket client need, plus unrelated heavyweight
+       deps (`xinference-client`, `tencentcloud-sdk-*`, `shapely`, `tifffile`). Installing it
+       into this app's venv risks breaking NiceGUI's ASGI stack and the Phase-just-shipped voice
+       pipeline. **Do not `uv add` it directly** — if/when this lands, run it as an isolated
+       subprocess/service with its own venv (or a separate container) that Passage shells out to,
+       never as an in-process import. Current PyMuPDF overlay translation (`process_pdf`) already
+       ships translated PDFs and is the safe fallback until that isolation is built.
 2. [ ] HTML/article pipeline NOT built now — keep seams: segments format-agnostic, translation
        exposed as a clean JSON endpoint.
 3. [ ] finplatform bridge v1 = the PDF itself: make Passage excellent on finplatform
