@@ -23,6 +23,16 @@ from TranslationBackend import TranslationBackend
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("translation.ui")
 
+# Static language list for type-ahead fields. Free text stays allowed —
+# the backend takes any language name; this is autofill, not a whitelist.
+LANGUAGES = [
+    "English", "Spanish", "French", "German", "Italian", "Portuguese",
+    "Dutch", "Russian", "Ukrainian", "Polish", "Turkish", "Arabic",
+    "Hebrew", "Hindi", "Chinese", "Japanese", "Korean", "Vietnamese",
+    "Thai", "Indonesian", "Swedish", "Norwegian", "Danish", "Finnish",
+    "Greek", "Czech", "Romanian", "Hungarian",
+]
+
 
 def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
     payload: dict[str, Any] = {"event": event, **fields}
@@ -631,12 +641,14 @@ window.voiceUx = window.voiceUx || (() => {
                         label="From",
                         value=self.current_source_language or "English",
                         placeholder="Source language",
+                        autocomplete=LANGUAGES,
                     ).classes("min-w-[120px] flex-1")
                     ui.button("⇄", on_click=self.swap_languages).classes(self.button_secondary_classes)
                     self.target_language_input = ui.input(
                         label="To",
                         value=self.current_target_language or "Spanish",
                         placeholder="Target language",
+                        autocomplete=LANGUAGES,
                     ).classes("min-w-[120px] flex-1")
                     if self.mobile_mode:
                         mode_selector = ui.toggle(
@@ -687,14 +699,10 @@ window.voiceUx = window.voiceUx || (() => {
                 ui.label(f"Selected file: {self.uploaded_file_name}").classes("text-sm text-gray-600")
             return
 
-        ui.label("Image/Camera input mode selected.").classes("text-sm text-gray-700")
+        # One affordance: the file input's accept/capture props let phones
+        # offer the camera directly, so no separate fallback uploader.
         ui.upload(
-            label="Upload image (PNG/JPG/JPEG/WEBP)",
-            multiple=False,
-            on_upload=self.handle_mobile_image_upload,
-        ).classes("w-full")
-        ui.upload(
-            label="Camera capture fallback",
+            label="Click or drop an image (PNG, JPG, WEBP) — on a phone this opens the camera",
             multiple=False,
             auto_upload=True,
             on_upload=self.handle_mobile_image_upload,
@@ -1330,15 +1338,12 @@ window.voiceUx = window.voiceUx || (() => {
 
         with ui.row().classes("items-center space-x-2 mb-4"):
             ui.label("Target language:").classes("font-medium")
-            ui.html('''
-                <select id="language_select" class="px-3 py-2 p-well">
-                    <option value="en">English</option>
-                    <option value="es" selected>Spanish</option>
-                    <option value="fr">French</option>
-                    <option value="de">German</option>
-                    <option value="zh">Chinese</option>
-                </select>
-            ''')
+            options = "".join(f'<option value="{lang}"></option>' for lang in LANGUAGES)
+            ui.html(
+                f'<input id="language_select" list="passage_languages" value="Spanish" '
+                f'placeholder="Type a language…" class="px-3 py-2 p-well">'
+                f'<datalist id="passage_languages">{options}</datalist>'
+            )
 
         self._render_voice_status_block("desktop_voice")
 
