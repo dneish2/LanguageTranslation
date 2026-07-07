@@ -33,10 +33,15 @@ _STORAGE_SECRET = secrets.token_urlsafe(32)
 
 
 class TranslationUI(VoicePageMixin):
-    def __init__(self):
+    def __init__(self, *, backend: TranslationBackend | None = None, api_guard: ApiGuard | None = None):
         # ── CORE BACKEND ─────────────────────────────────────────────────
-        self.backend = TranslationBackend()
-        self.api_guard = ApiGuard()
+        # Shared across every client in the real app (see start_ui): backend
+        # holds the OpenAI/Ollama client + job store (already job-id-keyed,
+        # safe to share) and the translation cache; api_guard issues/checks
+        # the short-lived per-page tokens. Defaulting to a fresh instance
+        # keeps `TranslationUI()` with no args working for tests.
+        self.backend = backend if backend is not None else TranslationBackend()
+        self.api_guard = api_guard if api_guard is not None else ApiGuard()
 
         # ── UI CONTAINERS ────────────────────────────────────────────────
         self.upload_container = None
@@ -102,53 +107,6 @@ class TranslationUI(VoicePageMixin):
         # ── USAGE STATS ─────────────────────────────────────────────────
         self.current_count = 0
         self.current_tokens = 0
-
-        # ── VOICE TRANSLATION API ──────────────────────────────────────
-        # registers /api/voice_translate on the same port
-        app.add_api_route(
-            "/api/voice_translate",
-            self.api_voice_translate,
-            methods=["POST"],
-        )
-        app.add_api_route(
-            "/api/text_translate",
-            self.api_text_translate,
-            methods=["POST"],
-        )
-        app.add_api_route(
-            "/api/text_translate_stream",
-            self.api_text_translate_stream,
-            methods=["POST"],
-        )
-        app.add_api_route(
-            "/api/image_translate",
-            self.api_image_translate,
-            methods=["POST"],
-        )
-        # Phase 4 (accounts): identity-only, not gated by the paid-API token —
-        # degrades to anonymous with zero config until SUPABASE_URL is set.
-        app.add_api_route(
-            "/api/me",
-            self.api_me,
-            methods=["GET"],
-        )
-
-    def start_ui(self):
-        # register pages
-        ui.page("/")(self.main_page)
-        ui.page("/voice")(self.voice_translation_page)
-        # /mobile is retired — one responsive layout; keep old bookmarks working
-        ui.page("/mobile")(lambda: ui.navigate.to("/"))
-        app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))
-        # run on single port; Cloud Run injects PORT
-        ui.run(
-            host="0.0.0.0",
-            port=int(os.getenv("PORT", "8080")),
-            title="Passage",
-            favicon=str(Path(__file__).resolve().parent / "static" / "favicon.svg"),
-            reload=False,
-            storage_secret=_STORAGE_SECRET,
-        )
 
     def _inject_theme(self) -> None:
         ui.add_head_html(theme.HEAD_HTML)
@@ -240,7 +198,13 @@ class TranslationUI(VoicePageMixin):
 
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
-    def main_page(self):
+    def main_page(self, mode: str | None = None):
+        # A fresh instance per page load (see start_ui) has no memory of what
+        # mode was active on /voice — carry it across the navigation via
+        # ?mode= instead of self, which no longer survives the page change.
+        if mode in {"Text", "Document", "Image/Camera"}:
+            self.input_mode = mode
+            self.mobile_input_mode = mode
         self._inject_theme()
         self._inject_api_token()
         self._inject_workspace_text_live_translation_js()
@@ -1308,5 +1272,62 @@ class TranslationUI(VoicePageMixin):
         return JSONResponse({"authenticated": True, "user_id": user_id, "email": email})
 
 
+def start_ui() -> None:
+    """App bootstrap: one shared backend/api_guard for the whole process
+    (translation cache, job store — already job-id-keyed, safe to share),
+    but a FRESH TranslationUI() per page load for everything else.
+
+    TranslationUI used to be a single instance whose main_page() reassigned
+    self.upload_container/progress_container/result_container/stats_container
+    (and every other piece of per-visitor state — uploaded_file, segments,
+    mode, languages) on every client's page load. Two people using the app
+    at once raced for those same attributes: live-verified (2026-07-06) that
+    a second visitor loading "/" while a first visitor's document job was
+    still polling made the first visitor's job silently never render its
+    result — the completion callback wrote into whichever client's
+    containers happened to be current by the time it fired, not
+    necessarily its own. Constructing a new TranslationUI() per page load
+    gives each client truly private state; the API-route methods never
+    touch UI containers, so binding them to one throwaway instance is safe.
+    """
+    shared_backend = TranslationBackend()
+    shared_api_guard = ApiGuard()
+
+    def new_page_ui() -> "TranslationUI":
+        return TranslationUI(backend=shared_backend, api_guard=shared_api_guard)
+
+    api_service = new_page_ui()
+    app.add_api_route("/api/voice_translate", api_service.api_voice_translate, methods=["POST"])
+    app.add_api_route("/api/text_translate", api_service.api_text_translate, methods=["POST"])
+    app.add_api_route(
+        "/api/text_translate_stream", api_service.api_text_translate_stream, methods=["POST"],
+    )
+    app.add_api_route("/api/image_translate", api_service.api_image_translate, methods=["POST"])
+    # Phase 4 (accounts): identity-only, not gated by the paid-API token —
+    # degrades to anonymous with zero config until SUPABASE_URL is set.
+    app.add_api_route("/api/me", api_service.api_me, methods=["GET"])
+
+    # `mode` is a plain FastAPI-style query param (?mode=Document) — NiceGUI
+    # wires ui.page function parameters the same way. See main_page()/
+    # _go_workspace() for why this replaces setting self.input_mode directly.
+    def index(mode: str | None = None) -> None:
+        new_page_ui().main_page(mode=mode)
+
+    ui.page("/")(index)
+    ui.page("/voice")(lambda: new_page_ui().voice_translation_page())
+    # /mobile is retired — one responsive layout; keep old bookmarks working
+    ui.page("/mobile")(lambda: ui.navigate.to("/"))
+    app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))
+    # run on single port; Cloud Run injects PORT
+    ui.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        title="Passage",
+        favicon=str(Path(__file__).resolve().parent / "static" / "favicon.svg"),
+        reload=False,
+        storage_secret=_STORAGE_SECRET,
+    )
+
+
 if __name__ in {"__main__", "__mp_main__"}:
-    TranslationUI().start_ui()
+    start_ui()

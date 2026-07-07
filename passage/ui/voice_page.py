@@ -88,9 +88,10 @@ window.voiceUx = window.voiceUx || (() => {
         """)
 
     def _go_workspace(self, mode: str) -> None:
-        self.input_mode = mode
-        self.mobile_input_mode = mode
-        ui.navigate.to("/")
+        # main_page() runs on a FRESH TranslationUI() instance (see
+        # start_ui) — setting self.input_mode here would be discarded, so
+        # the mode travels via the URL instead.
+        ui.navigate.to(f"/?mode={quote(mode)}")
 
     def voice_translation_page(self):
         self._inject_theme()

@@ -35,9 +35,12 @@ machine translation and human edit.
 
 ## Repo facts a fresh session needs
 
-- Entry: `TranslationUI.py` → `ui.run(host="0.0.0.0", port=PORT)`. Backend: `TranslationBackend.py`
-  with a provider seam (`build_translation_provider`) and a real segment model
-  (`segment_map`, `_translate_segment_text`, `update_segment`).
+- Entry: `TranslationUI.py` → module-level `start_ui()` (NOT a bound method, since 2026-07-06 —
+  see the per-client instantiation fix below) → `ui.run(host="0.0.0.0", port=PORT,
+  storage_secret=...)`. `TranslationUI()` is constructed FRESH per page load; only
+  `TranslationBackend`/`ApiGuard` are shared singletons. Backend: `TranslationBackend.py` with a
+  provider seam (`build_translation_provider`) and a real segment model (`segment_map`,
+  `_translate_segment_text`, `update_segment`).
 - **pytest IS correct in this repo** (finplatform's no-pytest rule does not apply):
   `.venv\Scripts\python.exe -m pytest tests/` — uv venv, Python 3.12.
 - Dead code CLEANED 2026-07-05: `job_queue.py` deleted (the backend's own `TranslationJob` system
@@ -184,6 +187,41 @@ machine translation and human edit.
   This pattern (identity-scoped storage keyed by session cookie today) is also the natural
   stepping stone toward Phase 4's real per-user storage once auth lands — swap the session-cookie
   key for a verified `user_id` and the same shape of fix extends forward.
+- **Follow-up the same day: the fix above only covered Recent Threads — everything else was
+  still fully shared and it was worse than "collision," it was active corruption.**
+  `TranslationUI()` was constructed ONCE at process start; `ui.page("/")(self.main_page)` bound
+  EVERY client to that one instance, and `main_page()` REASSIGNS
+  `self.upload_container`/`progress_container`/`result_container`/`stats_container` (plus
+  `uploaded_file`, `original_segments_map`, `input_mode`, languages — nearly all instance state)
+  on every page load. **Live-reproduced before fixing**: User A uploads a document and clicks
+  Translate (an async job with a `ui.timer` poll loop); while A's job is still polling, User B
+  loads `/` (reassigning the shared containers to B's fresh DOM) and starts their OWN translate.
+  Result: **A's job's completion callback fired against whichever containers were current at
+  that moment — A's result never rendered on A's screen at all** (stuck showing a stale "100% /
+  Translation complete" progress bar with no result, no error, nothing — the job silently
+  vanished from A's point of view). This is worse than a privacy leak: it's live UI/data
+  corruption between concurrent users, and it would affect ANY two people using the app within
+  the same job-in-flight window, not just a viewed-history annoyance.
+  **Fix**: `start_ui()` (now a module-level function, not a bound method) builds ONE shared
+  `TranslationBackend`/`ApiGuard` (job store is already job-id-keyed internally, safe to share;
+  translation cache and clients are fine to share) but constructs a **fresh `TranslationUI()`
+  per page load** — `ui.page("/")(lambda: new_page_ui().main_page())` instead of binding one
+  instance's method. The five API routes (`/api/text_translate` etc.) stay bound to one
+  throwaway "service" instance since they only touch `self.backend`/`self.api_guard`/
+  `self.recent_threads` (already session-storage-scoped), never the UI containers — verified by
+  reading every one of those methods, not assumed. One wrinkle this broke and had to fix:
+  `_go_workspace()` (the mode-tab click on `/voice`) used to set `self.input_mode` then
+  `ui.navigate.to("/")` — with a fresh instance per page load, that `self` write is now discarded
+  before the new page even reads it. Fixed by passing the mode through the URL instead
+  (`/?mode=Document`, `main_page(mode=...)` reads it) — plain FastAPI query-param injection,
+  which NiceGUI's `ui.page` supports the same way. **Live-verified with the exact same repro that
+  found the bug**: two Playwright contexts, two different documents, uploaded and translated
+  with the second starting while the first's job is still in flight — both complete correctly
+  now, each showing ONLY its own content, checked by content markers unique to each ("zebra
+  unicorn" vs "dolphin octopus"), not just "no error". Re-ran the Recent Threads cross-session
+  test (still 4/4) and the full live browser + Python 3.11 cross-version suites after — no
+  regressions. 105/105 pytest (one test's literal source-string match for `main_page(self):`
+  needed updating for the new `mode` parameter).
 
 ### Blocked on David (do these once, in the browser)
 
@@ -341,14 +379,22 @@ looks properly good; keep committing to this branch):
 3. [~] Per-user workspace: `passage_documents`, `passage_segments` tables + `passage-files`
        Storage bucket, RLS by uid. "Recent Documents" reads user rows, not the server
        filesystem — also fixes the global-state collision (scope run state per session/user).
-       **Partially addressed 2026-07-06**: `recent_threads` moved off the shared singleton onto
-       `app.storage.user` (session-cookie-scoped) as an emergency fix for the privacy leak above
-       — this is the SAME identity-scoped-storage shape this item needs, just keyed by session
-       cookie instead of a verified `user_id`. Still fully shared/collision-prone: `uploaded_file`,
-       `original_segments_map`/`translated_segments_map`, `input_mode`, current languages — the
-       whole active-translation-in-progress state. **No Supabase project/tables exist yet**
-       (David, 2026-07-06: "i don't believe we have that db setup") — this item is genuinely
-       blocked on that provisioning, same root blocker as item 2.
+       **The runtime-corruption half of this is now fixed** (2026-07-06, same day as the
+       Recent Threads privacy leak): `TranslationUI()` used to be a single process-wide instance
+       whose `main_page()` reassigned `self.upload_container`/`result_container`/etc. (plus
+       `uploaded_file`/segments/mode/languages — nearly everything) on every client's page load,
+       so a translation job in flight for one user could complete against another user's DOM —
+       live-reproduced (a document upload's result silently never rendered when a second user
+       loaded the page mid-job) and fixed by constructing a fresh `TranslationUI()` per page
+       load instead of one shared instance (`start_ui()`, module-level now); `TranslationBackend`/
+       `ApiGuard` stay shared singletons (job store is already job-id-keyed, safe to share).
+       **What's still open** (the DB/persistence half, not the runtime-safety half): there is no
+       durable per-user storage — state is now correctly *isolated* per browser session but
+       still lives in-memory (or `app.storage.user`, which is anonymous/session-cookie-keyed,
+       not tied to a verified identity) and is lost on restart or across devices. **No Supabase
+       project/tables exist yet** (David, 2026-07-06: "i don't believe we have that db setup") —
+       building the actual `passage_documents`/`passage_segments` tables is genuinely blocked on
+       that provisioning, same root blocker as item 2.
 4. [ ] **Metering / rate limiting by sign-in status (David, 2026-07-06)**: signed-in users get a
        higher monthly quota than anonymous visitors; anonymous either hard-caps or requires
        payment past the cap. Adapt finplatform's `_meter`/402 pattern once accounts exist — no-op

@@ -358,7 +358,7 @@ def test_workspace_text_js_is_injected_once_at_page_build_not_on_rerender():
 
     injection_calls = source.count("self._inject_workspace_text_live_translation_js()")
     assert injection_calls == 1
-    main_page_body = source.split("def main_page(self):")[1].split("def _render_mode_tabs")[0]
+    main_page_body = source.split("def main_page(self")[1].split("def _render_mode_tabs")[0]
     assert "_inject_workspace_text_live_translation_js" in main_page_body
 
 
