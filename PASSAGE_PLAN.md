@@ -156,6 +156,34 @@ machine translation and human edit.
   Reconfirmed the known global-state-collision debt is still live and vivid (a fresh mobile
   session inherits the previous desktop session's mode) — still correctly scoped as a Phase 4
   fix, not something to patch around here.
+- **Cross-user privacy leak found by an independent workflow-backed code review (2026-07-06)
+  and fixed same-day**: "Recent Threads" stored raw original+translated text on
+  `self.recent_threads`, a plain instance attribute on the single `TranslationUI()` singleton
+  every browser client shares — so User A's private translated text was visible (and openable)
+  to any other concurrently connected User B via the drawer. This was WORSE than the general
+  "mode/language" state-collision debt already tracked above (that's a UX annoyance; this was
+  actual content disclosure) and confirmed genuinely new on this branch — `main`'s older
+  "Recent Documents" has an even longer-standing, more severe version of the same class of bug
+  (globs `translated_*` off the server filesystem, no scoping at all — not fixed here, out of
+  this branch's diff, but worth flagging to David as a live production exposure).
+  **Fix**: `recent_threads` is now a property backed by `app.storage.user` — NiceGUI's
+  session-cookie-scoped, server-side storage (needs `storage_secret` on `ui.run()`, added: a
+  fresh `secrets.token_urlsafe(32)` per process start, no env var, resets everyone's history on
+  every restart — an acceptable tradeoff for a convenience feature vs. hardcoding or persisting
+  a secret). Degrades to a throwaway unpersisted list outside a real request context (defensive:
+  Recent Threads silently not recording must never break the translation response itself — this
+  path is also what the unit tests exercise, since they call API methods with a fake `Request`
+  that never goes through NiceGUI's real session middleware). **Also added, per David's ask**:
+  delete-thread (a `×` button per row, `_delete_thread(thread_id)`, each thread gets a stable
+  `uuid4` id on creation). **Live-verified, not just unit-tested**: two fully separate Playwright
+  browser contexts (= two separate session cookies = two "users") each translate something
+  private; reloaded and confirmed neither can see the other's thread (4/4 checks) — this is the
+  right verification shape for a cross-user bug, since a single-context test can't exercise
+  session isolation at all. Delete-thread live-verified removing only the targeted thread.
+  105/105 pytest (6 new/updated, including one asserting the fail-safe degrade never raises).
+  This pattern (identity-scoped storage keyed by session cookie today) is also the natural
+  stepping stone toward Phase 4's real per-user storage once auth lands — swap the session-cookie
+  key for a verified `user_id` and the same shape of fix extends forward.
 
 ### Blocked on David (do these once, in the browser)
 
@@ -310,11 +338,27 @@ looks properly good; keep committing to this branch):
        Header account chip; signed-out users keep full local use. **Blocked on the anon key**
        above — the verification half (item 1) doesn't need it, but issuing a real magic-link
        request does.
-3. [ ] Per-user workspace: `passage_documents`, `passage_segments` tables + `passage-files`
+3. [~] Per-user workspace: `passage_documents`, `passage_segments` tables + `passage-files`
        Storage bucket, RLS by uid. "Recent Documents" reads user rows, not the server
        filesystem — also fixes the global-state collision (scope run state per session/user).
-4. [ ] Metering: adapt the `_meter`/402 pattern; no-op unless keys set. Billing unification
-       with finplatform is later — schema just must not preclude it.
+       **Partially addressed 2026-07-06**: `recent_threads` moved off the shared singleton onto
+       `app.storage.user` (session-cookie-scoped) as an emergency fix for the privacy leak above
+       — this is the SAME identity-scoped-storage shape this item needs, just keyed by session
+       cookie instead of a verified `user_id`. Still fully shared/collision-prone: `uploaded_file`,
+       `original_segments_map`/`translated_segments_map`, `input_mode`, current languages — the
+       whole active-translation-in-progress state. **No Supabase project/tables exist yet**
+       (David, 2026-07-06: "i don't believe we have that db setup") — this item is genuinely
+       blocked on that provisioning, same root blocker as item 2.
+4. [ ] **Metering / rate limiting by sign-in status (David, 2026-07-06)**: signed-in users get a
+       higher monthly quota than anonymous visitors; anonymous either hard-caps or requires
+       payment past the cap. Adapt finplatform's `_meter`/402 pattern once accounts exist — no-op
+       (unlimited) until keys/DB are set, so this must not gate anything today. Needs: a
+       `passage_usage`/`passage_credits`-shaped table (or reuse finplatform's schema directly if
+       billing unifies, per the locked "one login, one future bundled subscription" decision) —
+       schema design is real work, do it deliberately alongside item 3's tables rather than bolt
+       it on after. The `identity_from_auth_header`-based `/api/me` (Phase 4 item 1) is the
+       identity primitive this reads off of; anonymous quota needs a per-IP or per-`app.storage
+       .user`-session counter as an interim signal until real accounts exist.
 
 ### Phase 5 — Format-preserving PDF translation + traces (the flagship)
 

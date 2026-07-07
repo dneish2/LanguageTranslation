@@ -4,3 +4,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.DS_Store
+# NiceGUI's local storage_secret-backed persistence (app.storage.user/.general) —
+# runtime session data, never source; would otherwise leak real user content into git.
+.nicegui/

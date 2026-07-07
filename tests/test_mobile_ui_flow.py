@@ -179,8 +179,22 @@ def test_show_error_classifies_long_message_as_technical_even_without_markers():
     assert TranslationUI._is_technical_error("x" * 140) is False
 
 
-def test_record_thread_dedupes_repeated_chat_by_moving_it_to_the_top():
+def _use_fake_thread_storage(monkeypatch, ui_app):
+    """recent_threads is backed by app.storage.user (a real request/session
+    context) so cross-user data can't leak through a shared instance
+    attribute (see PASSAGE_PLAN.md, 2026-07-06 code-review fix). Outside a
+    real request the property degrades to a fresh throwaway list each call
+    (fail-safe, not a test seam) — so dedupe/ordering tests substitute a
+    plain dict-backed store here to exercise _record_thread's own logic."""
+    backing: dict = {}
+    monkeypatch.setattr(
+        type(ui_app), "recent_threads", property(lambda self: backing.setdefault("threads", []))
+    )
+
+
+def test_record_thread_dedupes_repeated_chat_by_moving_it_to_the_top(monkeypatch):
     ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
     ui_app._record_chat_thread("Hello", "Hola", "Spanish")
     ui_app._record_chat_thread("Goodbye", "Adiós", "Spanish")
     ui_app._record_chat_thread("Hello", "Hola de nuevo", "Spanish")  # repeat of the first
@@ -190,12 +204,38 @@ def test_record_thread_dedupes_repeated_chat_by_moving_it_to_the_top():
     assert ui_app.recent_threads[0]["translated"] == "Hola de nuevo"
 
 
-def test_record_thread_keeps_distinct_languages_for_the_same_text_separate():
+def test_record_thread_keeps_distinct_languages_for_the_same_text_separate(monkeypatch):
     ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
     ui_app._record_chat_thread("Hello", "Hola", "Spanish")
     ui_app._record_chat_thread("Hello", "Bonjour", "French")
 
     assert len(ui_app.recent_threads) == 2
+
+
+def test_recent_threads_degrades_to_empty_outside_a_request_context():
+    """No real request/session -> recent_threads must not raise; Recent
+    Threads silently not recording is fine, breaking translation is not."""
+    ui_app = _build_mobile_ui()
+
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+
+    assert ui_app.recent_threads == []
+
+
+def test_delete_thread_removes_only_the_matching_entry(monkeypatch):
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+    ui_app._record_chat_thread("Goodbye", "Adiós", "Spanish")
+    keep_id = ui_app.recent_threads[0]["id"]
+    delete_id = ui_app.recent_threads[1]["id"]
+    ui_app.drawer = None  # show_document_list() no-ops without a real drawer
+
+    ui_app._delete_thread(delete_id)
+
+    remaining_ids = [t["id"] for t in ui_app.recent_threads]
+    assert remaining_ids == [keep_id]
 
 
 def test_set_translate_button_busy_toggles_enabled_state():

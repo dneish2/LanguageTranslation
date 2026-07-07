@@ -3,8 +3,8 @@ import logging
 import os
 import json
 import time
+import secrets
 import uuid
-from collections import deque
 from io import BytesIO
 from pathlib import Path
 from threading import Thread
@@ -24,6 +24,12 @@ from passage.ui.voice_page import VoicePageMixin
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("translation.ui")
+
+# Signs the session cookie behind app.storage.user (per-visitor data like
+# Recent Threads). Fresh per process start — no env var to configure, and a
+# restart resets everyone's history, an acceptable tradeoff for a
+# convenience feature versus hardcoding (or persisting) a secret.
+_STORAGE_SECRET = secrets.token_urlsafe(32)
 
 
 class TranslationUI(VoicePageMixin):
@@ -63,8 +69,8 @@ class TranslationUI(VoicePageMixin):
         # Default/Advanced toggle confused more than it gated.
         self.advanced_mode = True
         # Threads: chats (text translations) and documents, newest first.
-        # In-memory until per-user workspaces land (Phase 4).
-        self.recent_threads = deque(maxlen=20)
+        # Backed by app.storage.user (see the recent_threads property) —
+        # per-visitor session cookie, not shared across users.
         self.mode_tab_row = None
         self.text_output_label = None
 
@@ -141,6 +147,7 @@ class TranslationUI(VoicePageMixin):
             title="Passage",
             favicon=str(Path(__file__).resolve().parent / "static" / "favicon.svg"),
             reload=False,
+            storage_secret=_STORAGE_SECRET,
         )
 
     def _inject_theme(self) -> None:
@@ -364,10 +371,15 @@ class TranslationUI(VoicePageMixin):
                 else:
                     handler = lambda _, thread=t: self._open_document_thread(thread)
                     kind_label = f"document · {t.get('language', '')}"
-                with ui.button(on_click=handler).classes("p-thread-item"):
-                    with ui.column().classes("gap-0 items-start"):
-                        ui.label(t["label"][:44]).classes("text-sm")
-                        ui.label(kind_label).classes("p-thread-kind")
+                with ui.row().classes("w-full items-center gap-0"):
+                    with ui.button(on_click=handler).classes("p-thread-item flex-grow"):
+                        with ui.column().classes("gap-0 items-start"):
+                            ui.label(t["label"][:44]).classes("text-sm")
+                            ui.label(kind_label).classes("p-thread-kind")
+                    ui.button(icon="close", on_click=lambda _, tid=t.get("id"): self._delete_thread(tid))\
+                        .props("flat round size=sm")\
+                        .classes("p-mode-tab")\
+                        .tooltip("Remove this thread")
 
     def _open_document_thread(self, thread: dict) -> None:
         if thread.get("label") == self.uploaded_file_name and self.original_segments_map:
@@ -1046,17 +1058,45 @@ class TranslationUI(VoicePageMixin):
 
     # ─────────────────────────── VOICE TRANSLATION API ────────────────────────────────────
 
+    @property
+    def recent_threads(self) -> list:
+        """Per-visitor (app.storage.user, keyed by session cookie), NOT
+        per-process — a shared instance-level deque here previously leaked
+        every user's translated text to every other concurrently connected
+        user (found in code review, 2026-07-06). Backed by NiceGUI's
+        ObservableList, so in-place mutation (.insert, slicing, .clear)
+        persists correctly; requires storage_secret on ui.run().
+
+        Falls back to a throwaway, unpersisted list outside a real request
+        context (unit tests calling API methods directly with a fake
+        Request; any future NiceGUI edge case) — Recent Threads silently
+        not recording is fine; breaking the translation response over it
+        is not.
+        """
+        try:
+            return app.storage.user.setdefault("recent_threads", [])
+        except RuntimeError:
+            return []
+
     def _record_thread(self, entry: dict) -> None:
         """Newest-first with dedupe: repeating a translation moves its thread
         to the top instead of stacking duplicates."""
+        entry.setdefault("id", str(uuid.uuid4()))
         key = (entry.get("kind"), entry.get("label"), entry.get("language"))
         survivors = [
             t for t in self.recent_threads
             if (t.get("kind"), t.get("label"), t.get("language")) != key
         ]
-        self.recent_threads.clear()
-        self.recent_threads.extend(survivors)
-        self.recent_threads.appendleft(entry)
+        threads = self.recent_threads
+        threads.clear()
+        threads.extend(survivors)
+        threads.insert(0, entry)
+        del threads[20:]
+
+    def _delete_thread(self, thread_id: str) -> None:
+        threads = self.recent_threads
+        threads[:] = [t for t in threads if t.get("id") != thread_id]
+        self.show_document_list()
 
     def _record_chat_thread(self, original: str, translated: str, language: str) -> None:
         self._record_thread({
