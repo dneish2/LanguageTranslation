@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from TranslationBackend import TranslationBackend, TranslationRunState
 from TranslationUI import TranslationUI
 
 
@@ -236,6 +237,82 @@ def test_delete_thread_removes_only_the_matching_entry(monkeypatch):
 
     remaining_ids = [t["id"] for t in ui_app.recent_threads]
     assert remaining_ids == [keep_id]
+
+
+def _build_ui_with_backend(backend) -> TranslationUI:
+    ui_app = TranslationUI(backend=backend)
+    ui_app.upload_container = DummyContainer()
+    ui_app.progress_container = DummyContainer()
+    ui_app.result_container = DummyContainer()
+    ui_app.stats_container = DummyContainer()
+    return ui_app
+
+
+def test_two_clients_sharing_one_backend_have_independent_document_run_state(monkeypatch):
+    """The real production topology since start_ui()'s per-client fix: one
+    shared TranslationBackend, many TranslationUI instances. Each instance's
+    document_run_state must be its own object, never the backend's ambient
+    ._active_run_state (which get_job_result() reassigns on every client's
+    job completion)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    shared_backend = TranslationBackend()
+
+    ui_a = _build_ui_with_backend(shared_backend)
+    ui_b = _build_ui_with_backend(shared_backend)
+
+    assert ui_a.backend is ui_b.backend
+    assert ui_a.document_run_state is not ui_b.document_run_state
+
+    ui_a.document_run_state.segment_map["seg-a"] = {"original": "A", "translated": "A-translated"}
+    ui_b.document_run_state.segment_map["seg-b"] = {"original": "B", "translated": "B-translated"}
+
+    assert "seg-b" not in ui_a.document_run_state.segment_map
+    assert "seg-a" not in ui_b.document_run_state.segment_map
+
+
+def test_refresh_upload_ui_does_not_clear_another_clients_segments(monkeypatch):
+    """The exact bug found live (2026-07-06): User B calling refresh_upload_ui
+    (e.g. uploading a new file) used to call self.backend.segment_map.clear(),
+    wiping the SHARED ambient state and breaking User A's still-open segment
+    editor with 'Segment not found'."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    shared_backend = TranslationBackend()
+
+    ui_a = _build_ui_with_backend(shared_backend)
+    ui_b = _build_ui_with_backend(shared_backend)
+    ui_a.document_run_state.segment_map["seg-a"] = {"original": "A", "translated": "A-translated"}
+    # Isolate the assertion to refresh_upload_ui's document_run_state reset -
+    # full rendering needs real NiceGUI containers, out of scope here.
+    ui_b.render_unified_workspace = lambda: None
+    ui_b.show_document_list = lambda: None
+
+    ui_b.refresh_upload_ui()
+
+    assert "seg-a" in ui_a.document_run_state.segment_map, "User B's refresh must not touch User A's segments"
+
+
+def test_retranslate_segment_callback_reads_its_own_document_run_state(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    shared_backend = TranslationBackend()
+    ui_a = _build_ui_with_backend(shared_backend)
+    ui_b = _build_ui_with_backend(shared_backend)
+    ui_a.document_run_state.segment_map["seg-a"] = {"original": "Hello", "translated": "stale"}
+    ui_a.current_target_language = "Spanish"
+    monkeypatch.setattr(shared_backend, "translate_text", lambda *a, **k: "Hola")
+    monkeypatch.setattr(shared_backend, "update_segment", lambda *a, **k: "Hola")
+
+    # B racing in with an unrelated fresh run_state must not affect A's lookup.
+    ui_b.document_run_state = TranslationRunState()
+
+    textarea = DummyInput()
+    notified = []
+    import TranslationUI as translation_ui_module
+    monkeypatch.setattr(translation_ui_module.ui, "notify", lambda msg, **k: notified.append(msg))
+
+    ui_a.retranslate_segment_callback("seg-a", textarea)
+
+    assert textarea.value == "Hola"
+    assert not any("not found" in str(m).lower() for m in notified)
 
 
 def test_set_translate_button_busy_toggles_enabled_state():

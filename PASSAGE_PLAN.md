@@ -222,6 +222,34 @@ machine translation and human edit.
   test (still 4/4) and the full live browser + Python 3.11 cross-version suites after — no
   regressions. 105/105 pytest (one test's literal source-string match for `main_page(self):`
   needed updating for the new `mode` parameter).
+- **Immediate follow-up, same audit: a THIRD instance of the same bug class, at the backend
+  layer this time.** After fixing the UI-layer singleton, re-checked `TranslationBackend`
+  (explicitly shared across clients by design, for its job store/cache) for the same pattern —
+  and found one. `self._active_run_state` is a single mutable pointer; `segment_map`/
+  `current_document`/`current_pdf`/`output_stream`/`pdf_overlay_ocg` are all properties that
+  read it AMBIENTLY (no job_id/run_state argument), and `get_job_result()` reassigns that
+  pointer as a side effect on **every** client's job completion. `TranslationUI.py`'s segment
+  editor (Update/Re-translate/Delete, the image-overlay refresh, the download regeneration)
+  read/wrote through these ambient properties instead of the job-scoped `run_state=`/`job_id=`
+  parameters those same backend methods already supported. **Live-reproduced**: User A
+  translates a document and has the segment editor open; User B uploads an unrelated file
+  (`refresh_upload_ui()` used to call `self.backend.segment_map.clear()`) — User A's next
+  "Re-translate" click failed with **"Segment not found"**, even though A's segments were still
+  visibly rendered on A's own screen. **Fix**: `TranslationUI` now owns a private
+  `self.document_run_state: TranslationRunState` (never `None`, set fresh in `__init__` and on
+  every `refresh_upload_ui()`; replaced with the job's real run_state — fetched by
+  `result_handle` via `get_run_state_for_result()`, not the ambient pointer — the moment a
+  document job completes). Every segment-editing method, the image-overlay preview/refresh, and
+  `get_fresh_download_stream()` now read/write `self.document_run_state` directly instead of
+  `self.backend.segment_map`/`.output_stream`/`._active_run_state`. **Live-verified with the
+  exact repro**: the "Segment not found" click now succeeds ("Re-translation complete!").
+  Extended the check further — two documents translated concurrently, BOTH re-translate a
+  segment, BOTH download — confirmed zero cross-contamination in either direction at every
+  step, including the actual downloaded PDF's text content. 108/108 pytest (3 new: independent
+  `document_run_state` objects across instances sharing one backend, `refresh_upload_ui`
+  doesn't touch another client's segments, `retranslate_segment_callback` reads its own state).
+  Re-ran the full regression suite (live browser, Recent Threads cross-session, Python 3.11)
+  after — no regressions.
 
 ### Blocked on David (do these once, in the browser)
 

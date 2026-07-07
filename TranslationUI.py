@@ -17,7 +17,7 @@ from starlette.responses import Response, JSONResponse, StreamingResponse
 
 import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
-from TranslationBackend import TranslationBackend
+from TranslationBackend import TranslationBackend, TranslationRunState
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage.auth.jwt_verify import identity_from_auth_header
 from passage.ui.voice_page import VoicePageMixin
@@ -67,6 +67,15 @@ class TranslationUI(VoicePageMixin):
         # ── SEGMENT EDITING ─────────────────────────────────────────────
         self.original_segments_map: dict[str, str] = {}
         self.translated_segments_map: dict[str, str] = {}
+        # This client's own document state — never read self.backend.segment_map
+        # /.output_stream/etc. (those ambient properties proxy the backend's
+        # SHARED self._active_run_state pointer, reassigned by get_job_result()
+        # every time ANY client's job completes). Confirmed exploitable live
+        # (2026-07-06): User B uploading a new file wiped User A's still-open
+        # segment editor ("Segment not found") via that shared pointer. Always
+        # a private, real object (never None) so nothing falls through to the
+        # ambient default.
+        self.document_run_state: TranslationRunState = TranslationRunState()
 
         # ── DRAWER & ADVANCED MODE ──────────────────────────────────────
         self.drawer = None
@@ -374,7 +383,10 @@ class TranslationUI(VoicePageMixin):
         self.progress_container.clear()
         self.result_container.clear()
         self.stats_container.clear()
-        self.backend.segment_map.clear()
+        # A fresh, private TranslationRunState — NOT self.backend.segment_map
+        # .clear(), which used to mutate the backend's SHARED ambient state
+        # and could wipe another concurrently connected client's segments.
+        self.document_run_state = TranslationRunState()
 
         self.render_unified_workspace()
         # Pick up threads recorded by the API layer since the last render.
@@ -698,6 +710,13 @@ class TranslationUI(VoicePageMixin):
                 _log_event(failed_event, correlation_id=correlation_id, error="missing_result_handle")
                 self.show_error("Translation failed: missing result payload.", retry=self.start_mobile_translation)
                 return
+            # This client's OWN run_state, fetched by result_handle — NOT the
+            # backend's shared _active_run_state (get_job_result reassigns
+            # that pointer as a side effect on EVERY client's job completion,
+            # which is exactly the bug this line avoids reintroducing).
+            job_run_state = self.backend.get_run_state_for_result(job.result_handle)
+            if job_run_state is not None:
+                self.document_run_state = job_run_state
 
             count = result["count"]
             tokens = result["tokens"]
@@ -736,10 +755,11 @@ class TranslationUI(VoicePageMixin):
 
     def get_fresh_download_stream(self):
         # re-generate with edits and return a fresh BytesIO
-        self.backend.regenerate_output_stream()
+        self.backend.regenerate_output_stream(run_state=self.document_run_state)
         fresh = BytesIO()
-        self.backend.output_stream.seek(0)
-        fresh.write(self.backend.output_stream.read())
+        output_stream = self.document_run_state.output_stream
+        output_stream.seek(0)
+        fresh.write(output_stream.read())
         fresh.seek(0)
         return fresh
 
@@ -774,7 +794,7 @@ class TranslationUI(VoicePageMixin):
                     for i, seg_id in enumerate(list(self.original_segments_map.keys())):
                         orig = self.original_segments_map[seg_id]
                         trans = self.translated_segments_map[seg_id]
-                        seg_info = self.backend.segment_map.get(seg_id, {})
+                        seg_info = self.document_run_state.segment_map.get(seg_id, {})
                         location = self._describe_segment_for_editor(i + 1, seg_info)
 
                         with ui.expansion(location, value=i == 0)\
@@ -829,10 +849,11 @@ class TranslationUI(VoicePageMixin):
                         ui.switch("Show original overlay", value=self.overlay_show_original, on_change=lambda e: setattr(self, "overlay_show_original", bool(e.value)))
                         ui.switch("Preview visible", value=self.overlay_preview_visible, on_change=lambda e: setattr(self, "overlay_preview_visible", bool(e.value)) or self.show_result())
                         ui.button("Refresh overlay", on_click=self.refresh_image_overlay).classes(theme.BTN_SECONDARY_SM)
-                    if self.overlay_preview_visible and self.backend.output_stream is not None:
+                    if self.overlay_preview_visible and self.document_run_state.output_stream is not None:
                         import base64
-                        self.backend.output_stream.seek(0)
-                        encoded = base64.b64encode(self.backend.output_stream.read()).decode("ascii")
+                        output_stream = self.document_run_state.output_stream
+                        output_stream.seek(0)
+                        encoded = base64.b64encode(output_stream.read()).decode("ascii")
                         ui.html(f'<img alt="overlay preview" style="max-width:100%;border:1px solid #ddd;border-radius:8px" src="data:image/png;base64,{encoded}"/>')
 
                 # ── DOWNLOAD & NAV ───────────────────────────────
@@ -858,7 +879,7 @@ class TranslationUI(VoicePageMixin):
                 show_original=self.overlay_show_original,
                 font_size=self.overlay_font_size,
                 font_family=self.overlay_font_family,
-                run_state=self.backend._active_run_state,
+                run_state=self.document_run_state,
             )
             self.show_result()
         except Exception as ex:
@@ -880,7 +901,8 @@ class TranslationUI(VoicePageMixin):
         try:
             instructions = refine_input.value or None
             updated = self.backend.update_segment(
-                seg_id, textarea.value, self.current_target_language, instructions
+                seg_id, textarea.value, self.current_target_language, instructions,
+                run_state=self.document_run_state,
             )
             textarea.value = updated
             self.translated_segments_map[seg_id] = updated
@@ -892,14 +914,16 @@ class TranslationUI(VoicePageMixin):
 
     def retranslate_segment_callback(self, seg_id, textarea):
         try:
-            seg_info = self.backend.segment_map.get(seg_id)
+            seg_info = self.document_run_state.segment_map.get(seg_id)
             if not seg_info:
                 ui.notify("Segment not found", type="negative")
                 return
             ui.notify("Re-­translating...", type="info")
             original = seg_info["original"]
             new_trans = self.backend.translate_text(original, self.current_target_language)
-            self.backend.update_segment(seg_id, new_trans, self.current_target_language)
+            self.backend.update_segment(
+                seg_id, new_trans, self.current_target_language, run_state=self.document_run_state,
+            )
             textarea.value = new_trans
             self.translated_segments_map[seg_id] = new_trans
             ui.notify("Re-translation complete!", type="positive")
@@ -917,10 +941,10 @@ class TranslationUI(VoicePageMixin):
 
     def _delete_segment(self, seg_id):
         try:
-            self.backend.delete_segment(seg_id)
+            self.backend.delete_segment(seg_id, run_state=self.document_run_state)
             self.original_segments_map.pop(seg_id, None)
             self.translated_segments_map.pop(seg_id, None)
-            self.current_count = len(self.backend.segment_map)
+            self.current_count = len(self.document_run_state.segment_map)
             ui.notify("Segment deleted successfully!", type="info")
             self.show_result()
         except Exception as ex:
@@ -981,7 +1005,7 @@ class TranslationUI(VoicePageMixin):
 
     def save_all_edits(self):
         try:
-            self.backend.regenerate_output_stream()
+            self.backend.regenerate_output_stream(run_state=self.document_run_state)
             ui.notify("All edits saved to document!", type="positive")
         except Exception as ex:
             logging.error(f"[UI] Error saving edits: {ex}", exc_info=True)
