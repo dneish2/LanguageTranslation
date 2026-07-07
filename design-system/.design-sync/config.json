@@ -1,0 +1,13 @@
+{
+  "projectId": "0a6998a3-8cf8-47ae-9e8e-d633dac1475e",
+  "pkg": "@passage/design-system",
+  "globalName": "PassageDS",
+  "shape": "package",
+  "buildCmd": "npm run build",
+  "cssEntry": "dist/styles.css",
+  "extraFonts": ["fonts/cascadia-mono.css"],
+  "overrides": {
+    "Banner": { "cardMode": "column" }
+  },
+  "readmeHeader": ".design-sync/conventions.md"
+}

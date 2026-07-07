@@ -1,0 +1,12 @@
+/* Cascadia Mono — Microsoft, SIL Open Font License 1.1.
+   Fetched from Google Fonts' own CDN (fonts.gstatic.com), regular weight.
+   The real app's --p-data stack is "Consolas, Cascadia Mono, monospace" —
+   Consolas is a licensed Windows system font (not redistributable here);
+   Cascadia Mono is the one member of that stack we can legitimately ship. */
+@font-face {
+  font-family: 'Cascadia Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./CascadiaMono-Regular.ttf') format('truetype');
+}
