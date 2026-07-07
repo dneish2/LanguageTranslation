@@ -645,10 +645,15 @@ class TranslationUI(VoicePageMixin):
         )
 
     def cancel_translation(self):
+        # Defensive: self.cancel_button only exists while self.active_job_id
+        # is set (both happen synchronously in handle_translation before any
+        # click could land), so this should never be the no-job-id case. Not
+        # falling back to backend.request_cancel() deliberately — that flag
+        # is a single value shared across every client's backend instance,
+        # found while auditing the segment-editor cross-user bug (same
+        # session) — no need to introduce a fourth reachable path to it.
         if self.active_job_id:
             self.backend.cancel_job(self.active_job_id)
-        else:
-            self.backend.request_cancel()
         self.show_error("Translation was canceled. Please upload or try again.")
 
     def _start_job_and_poll(

@@ -250,6 +250,31 @@ machine translation and human edit.
   doesn't touch another client's segments, `retranslate_segment_callback` reads its own state).
   Re-ran the full regression suite (live browser, Recent Threads cross-session, Python 3.11)
   after — no regressions.
+- **Concluding the audit chain (same session)**: grepped the rest of the codebase for the same
+  shape ("`self._foo`, a single mutable pointer, read via a no-arg property, reassigned by an
+  unrelated method") before moving on, rather than assuming three was the full count. Found two
+  more, both assessed and handled proportionately rather than chased into more fixes:
+  - `TranslationBackend._manual_cancel_requested` — a single shared bool, mirroring the exact
+    pattern, reachable in principle from `TranslationUI.cancel_translation()`'s `else` branch
+    (no `job_id` → falls to the shared flag). Traced it and confirmed it's **not currently
+    reachable**: `self.cancel_button` only exists while `self.active_job_id` is set (both set
+    synchronously, no yield point between them, in `handle_translation`), so the `else` branch
+    can never fire through the live UI today. Hardened anyway (removed the fallback outright —
+    if `active_job_id` isn't set, do nothing rather than touch shared state) since it's a
+    landmine for a future change, not because it's exploitable now.
+  - `TranslationBackend.metrics` (a shared `MetricsCollector`) — same shape, but checked where
+    it's actually READ: `translate_text`/`translate_text_with_instructions` (Text mode's
+    `/api/text_translate`, retranslate) fall back to it when no `file_metrics` is passed. Traced
+    every consumer and confirmed it's **not user-facing anywhere live** — Document mode's job
+    path already uses its own local `MetricsCollector` per job (correctly scoped, untouched by
+    this); `MetricsDashboard` (the only reader of aggregate stats) isn't wired into any live
+    route, only exercised in its own test. Concurrent Text-mode calls under load would produce
+    imprecise shared counters, but nothing currently displays or acts on those counters, so
+    there is no live user-visible harm — documented rather than fixed, since fixing a metrics
+    object nobody reads is not itself the priority; if `MetricsDashboard` or a per-request
+    metrics response is ever wired in later, this needs the same `file_metrics=`-threading fix
+    as the segment editor got.
+  108/108 pytest unaffected, live-verified Cancel still works correctly on a real job.
 
 ### Blocked on David (do these once, in the browser)
 
