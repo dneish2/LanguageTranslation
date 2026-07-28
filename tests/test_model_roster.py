@@ -355,3 +355,94 @@ def test_translate_text_uncapped_provider_never_splits(monkeypatch):
     backend.translate_text(long_text, "German")
 
     assert calls == [long_text.replace("\t", " ").strip()]
+
+
+def test_mask_and_restore_protects_urls_and_emails_verbatim():
+    """Translating a real finplatform dossier corrupted 6 of its 12 source
+    URLs even though the prompt asked the model to leave URLs alone
+    (".../post-money-valuation" came back ".../post-money-valoración").
+    A research dossier's citation trail is the product, so protect it
+    deterministically instead of asking."""
+    text = (
+        "See https://www.anthropic.com/news/series-f-at-usd183b-post-money-valuation "
+        "and www.example.com/everything-we-know, or mail research@finplatform.io."
+    )
+    masked, spans = tb._mask_protected_spans(text)
+
+    assert "anthropic.com" not in masked
+    assert "research@finplatform.io" not in masked
+    assert len(spans) == 3
+    assert "[[PSG:0]]" in masked and "[[PSG:2]]" in masked
+
+    # The model translates around the placeholders and may reflow whitespace.
+    translated = masked.replace("See ", "Ver ").replace(" and ", " y ").replace("[[PSG:1]]", "[[PSG: 1]]")
+    restored = tb._restore_protected_spans(translated, spans)
+
+    for original in spans:
+        assert original in restored
+    assert "valoración" not in restored
+
+
+def test_restore_survives_a_placeholder_the_model_dropped():
+    """Losing one is no worse than the corruption this replaces — it must not
+    raise, and it must not misplace the survivors."""
+    spans = ["https://a.example/one", "https://b.example/two"]
+    restored = tb._restore_protected_spans("solo queda [[PSG:1]]", spans)
+
+    assert restored == "solo queda https://b.example/two"
+
+
+def test_mask_leaves_ordinary_prose_untouched():
+    text = "The quarterly report shows revenue grew twelve percent."
+    masked, spans = tb._mask_protected_spans(text)
+
+    assert masked == text and spans == []
+
+
+def test_translate_chunk_never_shows_the_model_a_raw_url(monkeypatch):
+    provider_seen = {}
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+
+    def fake_completion(messages):
+        provider_seen["prompt"] = messages[-1]["content"]
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="Consulte [[PSG:0]] para más detalles."))])
+
+    backend._create_chat_completion_with_retry = fake_completion
+    url = "https://www.anthropic.com/news/post-money-valuation"
+
+    out = backend._translate_chunk(f"See {url} for details.", "Spanish")
+
+    assert url not in provider_seen["prompt"], "the raw URL reached the model"
+    assert "[[PSG:0]]" in provider_seen["prompt"]
+    assert out == f"Consulte {url} para más detalles."
+
+
+def test_url_fragment_detection_covers_wrapped_tails_but_not_prose():
+    """Layout-preserving PDF translation feeds each positioned span to the
+    model separately, and PyMuPDF splits a wrapped URL into two spans. The
+    tail has no scheme, so the masker cannot see it and it got translated:
+    ".../offers-hope-for-struggling-office-market/" came back
+    ".../offers-hope-para-el-mercado-de-oficinas-en-lucha/"."""
+    for tail in ("for-struggling-office-market/", "post-money-valuation",
+                 "white-house-2026-7", "or-more-thi/"):
+        assert tb._is_url_fragment(tail), tail
+
+    for prose in ("Overview", "Why It Matters", "Anthropic", "Financials",
+                  "Series F", "2026", "The quarterly report shows revenue grew."):
+        assert not tb._is_url_fragment(prose), prose
+
+
+def test_translate_chunk_returns_a_url_fragment_untouched(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+
+    def must_not_run(messages):  # pragma: no cover
+        raise AssertionError("a URL tail was sent to the model")
+
+    backend._create_chat_completion_with_retry = must_not_run
+
+    assert backend._translate_chunk("for-struggling-office-market/", "Spanish") == \
+        "for-struggling-office-market/"
