@@ -125,6 +125,10 @@ class TranslationUI(VoicePageMixin):
         self.image_translation_result: dict[str, Any] | None = None
         self.current_source_language = "English"
         self.current_target_language = "Spanish"
+        # Languages whose Piper voice this page load has already asked for.
+        # Per-instance, i.e. per page load, which is the right scope: the
+        # download itself is process-wide and idempotent.
+        self._voice_prefetch_requested: set[str] = set()
 
         # ── UI CONSISTENCY STANDARDS (Passage "Press" tokens, theme.py) ──
         self.button_primary_classes = theme.BTN_PRIMARY
@@ -228,9 +232,20 @@ class TranslationUI(VoicePageMixin):
 
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
-    def _prefetch_local_voice(self) -> None:
-        """Fetch the Piper voice for the CURRENT target language, in the
-        background, at workspace load.
+    def request_voice_prefetch(self, language: str | None = None) -> None:
+        """Fetch the Piper voice for the language the user is ACTUALLY
+        targeting, in the background, as soon as that language is known — and
+        again whenever it changes.
+
+        This used to fire once from main_page() with `self.current_target_language`,
+        which was always the "Spanish" hardcoded in __init__: start_ui builds a
+        FRESH TranslationUI per page load, and the prefetch ran before the
+        language input (and therefore its bind_value) existed. en_US/es_ES ship
+        with the image, so prefetch_voice no-opped every time and the fetch path
+        was unreachable for every other language — a user translating into
+        German got hosted TTS forever. The language now has to be passed in by
+        whoever knows it (the "To" input's change handler, the voice page), so
+        no caller can accidentally read a default.
 
         Same shape as `backend.prewarm_live()`, for the same reason: a voice is
         ~63MB, so doing it lazily at the moment someone presses speak would put
@@ -243,8 +258,18 @@ class TranslationUI(VoicePageMixin):
         failed download must never reach the UI - a translation that finds no
         voice simply uses hosted TTS and names it in meta["tts"].
         """
+        language = (language if language is not None else self.current_target_language) or ""
+        language = language.strip()
+        if not language:
+            return
+        # A change handler fires on every keystroke; one request per language
+        # per page is enough (prefetch_voice itself is idempotent, but there is
+        # no reason to hand it "G", "Ge", "Ger"... either).
+        if language.lower() in self._voice_prefetch_requested:
+            return
+        self._voice_prefetch_requested.add(language.lower())
         try:
-            local_voice.prefetch_voice(self.current_target_language)
+            local_voice.prefetch_voice(language)
         except Exception as error:
             # Belt and braces: even the act of *starting* the prefetch must not
             # be able to take the page down.
@@ -263,9 +288,10 @@ class TranslationUI(VoicePageMixin):
         # Get the local live model into VRAM while the user is still reading
         # the page, not on their first keystroke. Fire-and-forget.
         self.backend.prewarm_live()
-        # And, on the same principle, get the Piper voice for the language they
-        # are actually translating INTO onto disk before they ask for audio.
-        self._prefetch_local_voice()
+        # The voice prefetch deliberately does NOT happen here: at this point
+        # the "To" input does not exist yet, so the only language available is
+        # the __init__ default. It fires from the input's change handler (and
+        # once with that input's real value) — see request_voice_prefetch.
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
@@ -389,9 +415,12 @@ class TranslationUI(VoicePageMixin):
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Voice").classes(theme.DATA)
-                    ui.label(policy.describe_voice_privacy(
-                        self.current_target_language)).classes("text-base")
-                    ui.label(local_voice.describe()).classes(theme.DATA)
+                    # One probe feeds both lines. They used to be derived from
+                    # two different places, which is how the privacy sentence
+                    # came to contradict the capability line under it.
+                    voice = engine_ledger.voice_state()
+                    ui.label(voice["privacy"]).classes("text-base")
+                    ui.label(voice["detail"]).classes(theme.DATA)
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Metered usage").classes(theme.DATA)
@@ -678,6 +707,9 @@ class TranslationUI(VoicePageMixin):
         source = self.source_language_input.value if self.source_language_input else self.current_source_language
         target = self.target_language_input.value if self.target_language_input else self.current_target_language
         self.current_source_language, self.current_target_language = target, source
+        # The swap is a language CHANGE like any other; the new target's voice
+        # should start downloading now, not when someone presses speak.
+        self.request_voice_prefetch(self.current_target_language)
         self.refresh_upload_ui()
 
     def _describe_segment_for_editor(self, index: int, seg_info: dict) -> str:
@@ -801,6 +833,13 @@ class TranslationUI(VoicePageMixin):
                         placeholder="Target language",
                         autocomplete=LANGUAGES,
                     ).bind_value(self, "current_target_language").classes("min-w-[120px] flex-1")
+                    # The voice for the language they are ACTUALLY targeting,
+                    # fetched now and again on every change. This is the only
+                    # place the real target language is first known on a page
+                    # load, so it is the only place the prefetch can start.
+                    self.target_language_input.on_value_change(
+                        lambda event: self.request_voice_prefetch(event.value))
+                    self.request_voice_prefetch(self.target_language_input.value)
                     self.translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
                     self.translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
@@ -895,6 +934,9 @@ class TranslationUI(VoicePageMixin):
     def start_mobile_translation(self):
         language = self.target_language_input.value if self.target_language_input else self.current_target_language
         self.current_target_language = language
+        # Last-chance backstop: even if no change handler ever fired (an API
+        # caller, a restored thread), the language is unambiguous here.
+        self.request_voice_prefetch(language)
         if not language:
             self.show_error("Please enter a valid target language.")
             return

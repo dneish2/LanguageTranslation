@@ -159,13 +159,35 @@ def voice_stays_local() -> bool:
 
 
 def describe_voice_privacy(target_language: str | None = None) -> str:
+    """What actually happens to a recording — for ONE language, or, when the
+    language is not known, as a statement of CAPABILITY rather than a promise.
+
+    The no-language case is not a convenience: /engines is rendered by a fresh
+    per-page-load instance that has no idea what the visitor is translating
+    into, so any claim it makes about "playback" is a claim about a request it
+    cannot see. It previously read a hardcoded "Spanish", found the bundled
+    es_ES voice, and told every visitor "recording and playback both run on
+    this machine" — including visitors targeting German, Japanese or Arabic,
+    whose translated text is in fact sent to the hosted voice. That is the same
+    class of bug as the page once printing "hosted — metered" directly above
+    "100% stayed on this machine": a privacy guarantee the request may not
+    satisfy. So with no language: list the installed voices and say plainly
+    that everything else is spoken elsewhere.
+    """
     from passage import local_voice
     if not local_voice.stt_available():
         return "Recordings are sent to Passage's hosted speech models."
-    if local_voice.tts_available(target_language):
-        return "Recording and playback both run on this machine."
-    return ("Your recording is transcribed on this machine; only the translated "
-            "text is sent out to be spoken.")
+    if target_language:
+        if local_voice.tts_available(target_language):
+            return (f"Recording and playback both run on this machine for "
+                    f"{target_language}.")
+        return ("Your recording is transcribed on this machine; only the translated "
+                "text is sent out to be spoken.")
+    voices = local_voice.installed_voices()
+    installed = ", ".join(voices) if voices else "none"
+    return ("Recordings are transcribed on this machine. Playback stays here only "
+            f"for the voices installed ({installed}); any other language has its "
+            "translated text sent out to be spoken.")
 
 
 def describe_privacy(profile, *, local_first_model: str | None = None) -> str:

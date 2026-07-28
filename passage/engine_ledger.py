@@ -46,8 +46,8 @@ def record(store: list, *, surface: str, engine: str, is_local: bool,
         del store[:len(store) - MAX_ENTRIES]
 
 
-def voice_state() -> dict[str, Any]:
-    """What /engines should say about voice, from the RESOLVED tri-state.
+def voice_state(target_language: str | None = None) -> dict[str, Any]:
+    """What /engines says about voice, from the RESOLVED tri-state.
 
     Not from the raw env var. Local voice is now on by default when the models
     are present (DECISIONS.md §2), so `PASSAGE_LOCAL_VOICE` being unset no
@@ -55,8 +55,17 @@ def voice_state() -> dict[str, Any]:
     metered hosted speech on a machine where every recording stays put. This
     page has made exactly that class of mistake before: it once printed
     "hosted — metered" directly above "100% stayed on this machine".
+
+    The privacy sentence belongs in here rather than beside it. This helper was
+    for a while a probe with no production caller — /engines assembled its own
+    voice block from policy + local_voice — and the bug it existed to prevent
+    promptly reappeared in the block it was not wired into. One probe, one page.
+
+    `target_language` is optional and normally absent: /engines is rendered per
+    page load and does not know the visitor's target. Absent means the privacy
+    line describes capability instead of promising anything.
     """
-    from passage import local_voice
+    from passage import local_voice, policy
     state = local_voice.status()
     return {
         "mode": state["mode"],
@@ -64,6 +73,8 @@ def voice_state() -> dict[str, Any]:
         "is_local": state["stt_ready"],
         "detail": local_voice.describe(),
         "forced_but_missing": state["forced_but_missing"],
+        "voices": list(state["voices"]),
+        "privacy": policy.describe_voice_privacy(target_language),
     }
 
 
