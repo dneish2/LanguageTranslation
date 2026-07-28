@@ -523,3 +523,98 @@ def test_batched_block_translation_fills_from_one_call(monkeypatch):
 
     assert len(calls) == 1
     assert [b["translated_text"] for b in blocks] == ["STARTERS", "Catalan cream"]
+
+
+def _live_backend(monkeypatch, *, reachable=True):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    backend._live_probe_at = 1e18  # pin the probe cache; never touch the network
+    backend._live_reachable = reachable
+    if reachable:
+        backend._live_provider = tb.ChatCompletionsProvider(
+            api_key="ollama", base_url="http://localhost:11434/v1", text_model="qwen2.5:7b")
+    return backend
+
+
+def test_live_path_prefers_local_and_reports_the_engine(monkeypatch):
+    """Local qwen2.5:7b measured 163ms p50 against hosted gpt-5.4-nano's 616ms
+    on this machine, and costs nothing — so the keystroke path, which reruns
+    ~8x per sentence, should use it whenever it is reachable."""
+    backend = _live_backend(monkeypatch)
+    backend._live_provider.create_chat_completion = lambda **kw: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="Hola mundo"))])
+    backend.translate_text = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("hosted was called while local was reachable"))
+
+    assert backend.translate_live("Hello world", "Spanish") == ("Hola mundo", "local:qwen2.5:7b")
+
+
+def test_live_path_falls_back_to_hosted_when_local_fails(monkeypatch):
+    """A flaky local endpoint must never break typing."""
+    backend = _live_backend(monkeypatch)
+
+    def boom(**kw):
+        raise ConnectionError("connection refused")
+
+    backend._live_provider.create_chat_completion = boom
+    backend.translate_text = lambda text, lang, **kw: "Hola desde la nube"
+
+    result, engine = backend.translate_live("Hello world", "Spanish")
+    assert result == "Hola desde la nube"
+    assert engine.startswith("hosted:")
+
+
+def test_live_path_falls_back_when_local_returns_empty(monkeypatch):
+    backend = _live_backend(monkeypatch)
+    backend._live_provider.create_chat_completion = lambda **kw: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="   "))])
+    backend.translate_text = lambda text, lang, **kw: "hosted result"
+
+    assert backend.translate_live("Hello", "Spanish")[0] == "hosted result"
+
+
+def test_live_path_uses_hosted_when_local_is_unreachable(monkeypatch):
+    backend = _live_backend(monkeypatch, reachable=False)
+    backend.translate_text = lambda text, lang, **kw: "hosted result"
+
+    assert backend.translate_live("Hello", "Spanish")[1].startswith("hosted:")
+
+
+def test_live_prompt_drops_the_document_hardening_preamble(monkeypatch):
+    """143 tokens of injection hardening per call against ~4 tokens of real
+    text, re-sent on every typing pause. That preamble protects against
+    untrusted text from a FILE; the live box is typed by the same person
+    reading the output, so it buys nothing there."""
+    backend = _live_backend(monkeypatch)
+    messages = backend._live_prompt_messages("Hello", "Spanish")
+
+    joined = " ".join(m["content"] for m in messages)
+    assert "BEGIN TEXT" not in joined
+    assert len(joined) < 160, f"live prompt is still {len(joined)} chars"
+    assert "Spanish" in joined
+
+
+def test_live_path_still_protects_urls(monkeypatch):
+    """The slim prompt must not lose the URL guarantee."""
+    backend = _live_backend(monkeypatch)
+    seen = {}
+
+    def capture(**kw):
+        seen["text"] = kw["messages"][-1]["content"]
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="Visita [[PSG:0]] ahora"))])
+
+    backend._live_provider.create_chat_completion = capture
+    url = "https://example.com/post-money-valuation"
+
+    result, _ = backend.translate_live(f"Visit {url} now", "Spanish")
+
+    assert url not in seen["text"]
+    assert result == f"Visita {url} ahora"
+
+
+def test_live_local_can_be_disabled_by_env(monkeypatch):
+    monkeypatch.setattr(tb, "LIVE_LOCAL_ENABLED", False)
+    backend = _live_backend(monkeypatch)
+
+    assert backend._live_local_provider() is None

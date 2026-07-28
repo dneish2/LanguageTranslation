@@ -187,7 +187,10 @@ class TranslationUI(VoicePageMixin):
             if (token !== activeRequestToken) return;
             if (!resp.ok) throw new Error(data?.error || 'Translation failed.');
             output.textContent = data.translated_text || '';
-            setStatus(stateLabels.UPDATED);
+            // Name the model that answered. Local vs hosted changes both cost
+            // and latency, so it is state the user should be able to see.
+            const engine = data.engine ? ` · ${data.engine}` : '';
+            setStatus(`${stateLabels.UPDATED}${engine}`);
         } catch (err) {
             if (token !== activeRequestToken) return;
             setStatus(`${stateLabels.ERROR}: ${err?.message || 'unknown error'}`);
@@ -222,6 +225,9 @@ class TranslationUI(VoicePageMixin):
         self._inject_theme()
         self._inject_api_token()
         self._inject_workspace_text_live_translation_js()
+        # Get the local live model into VRAM while the user is still reading
+        # the page, not on their first keystroke. Fire-and-forget.
+        self.backend.prewarm_live()
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
@@ -1254,8 +1260,12 @@ class TranslationUI(VoicePageMixin):
                 language=language,
                 chars=len(cleaned_text),
             )
-            translated = await asyncio.to_thread(
-                self.backend.translate_text,
+            # The keystroke path: prefers a local model when one is reachable
+            # (free, and measurably faster here), hosted otherwise. The engine
+            # comes back with the translation so the UI can show which model
+            # answered rather than leaving the user guessing.
+            translated, engine = await asyncio.to_thread(
+                self.backend.translate_live,
                 cleaned_text,
                 language,
             )
@@ -1263,6 +1273,7 @@ class TranslationUI(VoicePageMixin):
                 "ui.text_translate_succeeded",
                 correlation_id=correlation_id,
                 language=language,
+                engine=engine,
             )
             self._record_chat_thread(cleaned_text, translated, language)
             return JSONResponse(
@@ -1270,6 +1281,7 @@ class TranslationUI(VoicePageMixin):
                     "original_text": cleaned_text,
                     "translated_text": translated,
                     "target_language": language,
+                    "engine": engine,
                 },
                 headers={"X-Correlation-Id": correlation_id},
             )
