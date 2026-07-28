@@ -9,7 +9,7 @@ import uuid
 from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -20,11 +20,16 @@ from starlette.responses import Response, JSONResponse, StreamingResponse
 import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
 from TranslationBackend import (
+    LIVE_LOCAL_MODEL,
+    LIVE_LOCAL_PREFERENCE,
+    LIVE_PROBE_TTL_SECONDS,
     OLLAMA_BASE_URL,
     TEXT_MODEL,
     TranslationBackend,
     TranslationRunState,
     SUPPORTED_DOCUMENT_EXTENSIONS,
+    ollama_suits_translation,
+    probe_local_llm,
 )
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage import __version__ as passage_version
@@ -46,6 +51,191 @@ LOGGER = logging.getLogger("translation.ui")
 # restart resets everyone's history, an acceptable tradeoff for a
 # convenience feature versus hardcoding (or persisting) a secret.
 _STORAGE_SECRET = secrets.token_urlsafe(32)
+
+
+# ─────────────────── ONE local probe, off the event loop ────────────────── #
+#
+# /api/health used to call available_local_models(), diagnostics.collect()
+# (which probes again) and choose_local_model() (which probes a third and a
+# fourth time), SYNCHRONOUSLY, from an `async def`. Measured against an
+# endpoint that accepts the connection and then says nothing: 15.31 s wall
+# clock, four outbound probes, and a 50 ms heartbeat task that recorded ZERO
+# ticks for the whole 15.31 s — the loop was blocked, so a single
+# unauthenticated GET stalled every other connected client. /diagnostics and
+# /engines had the same shape (7-8 s renders).
+#
+# Two fixes, both needed:
+#   1. the probe work runs in a thread (asyncio.to_thread), so the loop keeps
+#      serving while it waits;
+#   2. it is ONE probe per request, and everything else — the model list, the
+#      chosen model, the diagnostics section — is DERIVED from that single
+#      result instead of re-probing.
+#
+# The answer is then reused for LIVE_PROBE_TTL_SECONDS, the same 60 s window
+# the keystroke path already trusts (TranslationBackend.LIVE_PROBE_TTL_SECONDS)
+# rather than a second, differently-tuned cache. A cached diagnostic that does
+# not say how old it is would be worse than a slow one, so every consumer is
+# handed `age_seconds`/`cached` and both surfaces print it.
+
+#: Where a backend's snapshot lives. An attribute on the backend instance, not
+#: a module global keyed by id(), so the shared production backend shares one
+#: probe while a test's stub backend keeps its own.
+_SNAPSHOT_ATTR = "_passage_probe_snapshot"
+_snapshot_lock = Lock()
+
+
+def _choose_from_probe(models: list[str]) -> str | None:
+    """The model that would run, decided from an ALREADY-TAKEN probe.
+
+    Mirrors TranslationBackend.choose_local_model — explicit override wins,
+    then measured preference order, then any installed model that suits
+    translation — but reads the model list off the probe result instead of
+    issuing another HTTP call for it.
+    """
+    if LIVE_LOCAL_MODEL:
+        return LIVE_LOCAL_MODEL
+    installed = set(models)
+    for candidate in LIVE_LOCAL_PREFERENCE:
+        if candidate in installed:
+            return candidate
+    return sorted(installed)[0] if installed else None
+
+
+def _take_local_snapshot(backend: Any) -> dict[str, Any]:
+    """Run exactly one probe and derive everything from it. Blocking: callers
+    must run this in a thread (or accept a stale snapshot)."""
+    probe = getattr(backend, "probe_local_llm", None) or probe_local_llm
+    try:
+        report = dict(probe() or {})
+    except Exception as error:  # a dead endpoint is a finding, never a 500
+        report = {"reachable": False, "outcome": "error", "models": [],
+                  "endpoint": None, "timeout_seconds": None,
+                  "elapsed_ms": None, "detail": str(error)[:300]}
+    models = [name for name in (report.get("models") or [])
+              if "embed" not in name and ollama_suits_translation(name)]
+    snapshot = {
+        "probe": report,
+        "models": models,
+        "chosen_model": _choose_from_probe(models),
+        "probed_at": time.time(),
+        "ttl_seconds": LIVE_PROBE_TTL_SECONDS,
+    }
+    # Parity with available_local_models(), which records the same thing so a
+    # caller can tell "refused" from "too slow".
+    try:
+        backend.last_local_probe = report
+    except Exception:  # pragma: no cover - read-only stub
+        pass
+    with _snapshot_lock:
+        try:
+            setattr(backend, _SNAPSHOT_ATTR, snapshot)
+        except Exception:  # pragma: no cover - read-only stub
+            pass
+    return snapshot
+
+
+def _pending_snapshot() -> dict[str, Any]:
+    """What a page renders before its first probe has landed. Deliberately
+    NOT reported as reachable=False: "we have not asked yet" and "we asked and
+    nothing answered" are different facts, and collapsing them is the exact
+    mistake the probe outcomes exist to prevent."""
+    return {
+        "probe": {"reachable": None, "outcome": "probing", "models": [],
+                  "endpoint": None, "timeout_seconds": None,
+                  "elapsed_ms": None, "detail": "probe in flight"},
+        "models": [],
+        "chosen_model": None,
+        "probed_at": time.time(),
+        "ttl_seconds": LIVE_PROBE_TTL_SECONDS,
+        "pending": True,
+    }
+
+
+def _fresh_snapshot(backend: Any) -> dict[str, Any] | None:
+    """The cached snapshot if it is still inside the TTL, else None. Never
+    probes, never blocks."""
+    with _snapshot_lock:
+        snapshot = getattr(backend, _SNAPSHOT_ATTR, None)
+    if not isinstance(snapshot, dict):
+        return None
+    if time.time() - snapshot["probed_at"] >= snapshot.get(
+            "ttl_seconds", LIVE_PROBE_TTL_SECONDS):
+        return None
+    return snapshot
+
+
+def _cached_snapshot(backend: Any) -> dict[str, Any] | None:
+    """The last snapshot whatever its age, or None. Never probes, never
+    blocks. Callers MUST report the age — see age_seconds()."""
+    with _snapshot_lock:
+        snapshot = getattr(backend, _SNAPSHOT_ATTR, None)
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def snapshot_age_seconds(snapshot: dict[str, Any]) -> float:
+    return max(0.0, time.time() - snapshot["probed_at"])
+
+
+def describe_snapshot_age(snapshot: dict[str, Any] | None) -> str:
+    """The freshness line both surfaces print. A cache that hides its age is
+    how a diagnostic starts lying."""
+    if snapshot is None or snapshot.get("pending"):
+        return "probing this machine now…"
+    age = snapshot_age_seconds(snapshot)
+    if age < 1.0:
+        return "probed just now"
+    return f"probed {int(age)}s ago (re-probed after {int(snapshot['ttl_seconds'])}s)"
+
+
+async def local_snapshot_async(backend: Any) -> dict[str, Any]:
+    """A snapshot without blocking the event loop: the cached one when fresh,
+    otherwise ONE probe on a worker thread."""
+    fresh = _fresh_snapshot(backend)
+    if fresh is not None:
+        return fresh
+    return await asyncio.to_thread(_take_local_snapshot, backend)
+
+
+def snapshot_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The freshness facts that ride along with any cached answer."""
+    age = snapshot_age_seconds(snapshot)
+    return {
+        "age_seconds": round(age, 3),
+        "cached": age >= 1.0,
+        "ttl_seconds": snapshot["ttl_seconds"],
+        "outcome": snapshot["probe"].get("outcome"),
+        "elapsed_ms": snapshot["probe"].get("elapsed_ms"),
+    }
+
+
+class _SnapshotBackend:
+    """A read-only stand-in handed to diagnostics.collect() so it reuses the
+    snapshot's single probe instead of taking its own (collect() calls
+    ``probe_local_llm`` and ``choose_local_model`` off whatever it is given).
+
+    diagnostics.py is not modified for this — it already accepts an injected
+    probe, which is exactly the seam needed.
+    """
+
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        self._snapshot = snapshot
+
+    def probe_local_llm(self) -> dict[str, Any]:
+        return self._snapshot["probe"]
+
+    def choose_local_model(self) -> str | None:
+        return self._snapshot["chosen_model"]
+
+
+def collect_diagnostics(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """diagnostics.collect() driven by an already-taken probe, with the
+    probe's age stamped into the local_llm section so a reader can never
+    mistake a 59-second-old answer for a live one."""
+    report = diagnostics.collect(_SnapshotBackend(snapshot))
+    section = report.get("local_llm")
+    if isinstance(section, dict):
+        section.update(snapshot_payload(snapshot))
+    return report
 
 
 class TranslationUI(VoicePageMixin):
@@ -369,20 +559,34 @@ class TranslationUI(VoicePageMixin):
 
         profile = self.active_profile
         summary = engine_ledger.summarise(self.engine_runs)
+        # This render must not probe. It used to call choose_local_model() and
+        # available_local_models() inline — three blocking probes on the event
+        # loop, a 7.6 s render against a silent Ollama that also froze every
+        # other client. Render whatever was last probed (labelled with its
+        # age), and let a timer fill in a fresh probe from a worker thread.
+        snapshot = _cached_snapshot(self.backend) or _pending_snapshot()
         with ui.column().classes("w-full items-center p-4"):
             with ui.column().classes("w-full max-w-5xl gap-4"):
                 ui.label("Where your text goes").classes("p-display text-xl")
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Right now").classes(theme.DATA)
-                    local_default = self.backend.choose_local_model()
-                    ui.label(policy.describe_privacy(
-                        profile, local_first_model=local_default)).classes("text-base")
-                    bits = [f"engine: {profile.describe() if profile else 'auto (local first)'}"]
-                    bits.append("metered" if policy.is_metered(
-                        profile, local_first_model=local_default) else "not metered")
-                    bits.append(f"local default: {local_default or 'none installed'}")
-                    ui.label(" · ".join(bits)).classes(theme.DATA)
+                    privacy_label = ui.label("").classes("text-base")
+                    detail_label = ui.label("").classes(theme.DATA)
+                    freshness_label = ui.label("").classes("text-xs p-muted-text")
+
+                    def render_right_now(snap: dict[str, Any]) -> None:
+                        local_default = snap["chosen_model"]
+                        privacy_label.set_text(policy.describe_privacy(
+                            profile, local_first_model=local_default))
+                        bits = [f"engine: {profile.describe() if profile else 'auto (local first)'}"]
+                        bits.append("metered" if policy.is_metered(
+                            profile, local_first_model=local_default) else "not metered")
+                        bits.append(f"local default: {local_default or 'none installed'}")
+                        detail_label.set_text(" · ".join(bits))
+                        freshness_label.set_text(describe_snapshot_age(snap))
+
+                    render_right_now(snapshot)
                     ui.button("Change engine", on_click=self.open_engine_settings)\
                         .classes(f"{theme.BTN_SECONDARY_SM} mt-1")
 
@@ -441,18 +645,38 @@ class TranslationUI(VoicePageMixin):
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Models on this machine").classes(theme.DATA)
                     bench = self._load_bench_rows()
-                    installed = self.backend.available_local_models()
-                    if not installed:
-                        ui.label("No local models reachable — everything runs hosted.")\
-                            .classes("text-sm p-muted-text")
-                    for name in installed:
-                        row = bench.get(name)
-                        detail = "not benchmarked yet"
-                        if row:
-                            detail = (f"{row.get('size_gb', 0):.1f} GB · {row.get('median_ms')} ms"
-                                      f" · agreement {row.get('consensus')}")
-                        marker = " (default)" if name == self.backend.choose_local_model() else ""
-                        ui.label(f"{name}{marker} — {detail}").classes(theme.DATA)
+                    models_box = ui.column().classes("w-full gap-1")
+
+                    def render_models(snap: dict[str, Any]) -> None:
+                        models_box.clear()
+                        with models_box:
+                            if snap.get("pending"):
+                                ui.label("Checking this machine…")\
+                                    .classes("text-sm p-muted-text")
+                                return
+                            installed = snap["models"]
+                            if not installed:
+                                ui.label("No local models reachable — everything runs hosted.")\
+                                    .classes("text-sm p-muted-text")
+                            for name in installed:
+                                row = bench.get(name)
+                                detail = "not benchmarked yet"
+                                if row:
+                                    detail = (f"{row.get('size_gb', 0):.1f} GB · {row.get('median_ms')} ms"
+                                              f" · agreement {row.get('consensus')}")
+                                marker = " (default)" if name == snap["chosen_model"] else ""
+                                ui.label(f"{name}{marker} — {detail}").classes(theme.DATA)
+
+                    render_models(snapshot)
+
+                    async def refresh_local_state() -> None:
+                        """One probe, on a worker thread, after the page is
+                        already on screen. The render never waits for it."""
+                        snap = await local_snapshot_async(self.backend)
+                        render_right_now(snap)
+                        render_models(snap)
+
+                    ui.timer(0.05, refresh_local_state, once=True)
                     ui.label(
                         "Agreement is how closely a model matches the others on a fixed "
                         "suite; it rewards the mainstream reading, so a low score is a "
@@ -1805,6 +2029,7 @@ class TranslationUI(VoicePageMixin):
                 surface=policy.Surface.LIVE_TEXT, engine=engine,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 chars=len(cleaned_text))
+            local_snapshot = await local_snapshot_async(self.backend)
             _log_event(
                 "ui.text_translate_succeeded",
                 correlation_id=correlation_id,
@@ -1822,12 +2047,17 @@ class TranslationUI(VoicePageMixin):
                     "translated_text": translated,
                     "target_language": language,
                     "engine": engine,
+                    # Two calls to choose_local_model() used to sit here, each
+                    # a blocking probe on the event loop of the keystroke
+                    # path. One threaded snapshot, reused for both lines, so
+                    # the privacy sentence and the metered flag can never
+                    # disagree either.
                     "privacy": policy.describe_privacy(
                         self.active_profile,
-                        local_first_model=self.backend.choose_local_model()),
+                        local_first_model=local_snapshot["chosen_model"]),
                     "metered": policy.is_metered(
                         self.active_profile,
-                        local_first_model=self.backend.choose_local_model()),
+                        local_first_model=local_snapshot["chosen_model"]),
                 },
                 headers={"X-Correlation-Id": correlation_id},
             )
@@ -1962,14 +2192,23 @@ class TranslationUI(VoicePageMixin):
         configured and which local models are reachable, because "up but
         unable to translate" is the failure worth catching.
         """
-        local = self.backend.available_local_models()
-        report = diagnostics.collect(self.backend)
+        # ONE probe, on a worker thread. This route is unauthenticated by
+        # design, and the previous version took four blocking probes directly
+        # on the event loop: a single GET against an unreachable Ollama froze
+        # the whole server for 8-15 s (measured), which is a denial of service
+        # anyone could trigger. Nothing here may block the loop.
+        snapshot = await local_snapshot_async(self.backend)
+        report = await asyncio.to_thread(collect_diagnostics, snapshot)
         return JSONResponse({
             "status": "ok",
             "version": passage_version,
             "hosted_provider": self.backend.provider is not None,
-            "local_models": local,
-            "local_default": self.backend.choose_local_model(),
+            "local_models": list(snapshot["models"]),
+            "local_default": snapshot["chosen_model"],
+            # How old the local answer is. Reusing a probe is only acceptable
+            # if the reader is told; an undated cache turns a diagnostic into
+            # a confident guess.
+            "local_probe": snapshot_payload(snapshot),
             # PORTABILITY_PLAN.md §5 Phase B. Kept alongside the original keys
             # rather than replacing them: something out there health-checks this
             # route, and a diagnostic is not worth breaking a deploy probe for.
@@ -1993,7 +2232,12 @@ class TranslationUI(VoicePageMixin):
         observe a secure context or the sample rate a browser granted.
         """
         self._inject_theme()
-        report = diagnostics.collect(self.backend)
+        # Same rule as /engines and /api/health: no probe on the render path.
+        # This page took 7.8 s against a silent endpoint and blocked the loop
+        # for everyone while it did. Start from the last probe (its age is
+        # printed under the block) and refresh from a thread.
+        snapshot = _cached_snapshot(self.backend) or _pending_snapshot()
+        report = collect_diagnostics(snapshot)
 
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
@@ -2016,6 +2260,21 @@ class TranslationUI(VoicePageMixin):
 
                 state: dict[str, Any] = {"report": report}
 
+                age_label = ui.label(describe_snapshot_age(snapshot))\
+                    .classes("text-xs p-muted-text")
+
+                async def refresh_local_llm() -> None:
+                    """The local-LLM section, re-derived from ONE probe taken
+                    on a worker thread. Never blocks the page or the loop."""
+                    snap = await local_snapshot_async(self.backend)
+                    fresh = await asyncio.to_thread(collect_diagnostics, snap)
+                    fresh["browser"] = state["report"].get(
+                        "browser", diagnostics.browser_placeholder())
+                    state["report"] = fresh
+                    age_label.set_text(describe_snapshot_age(snap))
+                    text_area.set_content(
+                        f"```\n{diagnostics.format_text(fresh)}\n```")
+
                 async def gather_browser() -> None:
                     try:
                         browser = await ui.run_javascript(
@@ -2035,6 +2294,7 @@ class TranslationUI(VoicePageMixin):
                     ui.notify("Copied")
 
                 ui.button("Copy", on_click=copy_all).classes(theme.BTN_SECONDARY_SM)
+                ui.timer(0.05, refresh_local_llm, once=True)
                 ui.timer(0.1, gather_browser, once=True)
 
 
