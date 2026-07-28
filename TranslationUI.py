@@ -1,10 +1,12 @@
 import asyncio
+import base64
 import logging
 import os
 import json
 import time
 import secrets
 import uuid
+from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 from threading import Thread
@@ -17,8 +19,19 @@ from starlette.responses import Response, JSONResponse, StreamingResponse
 
 import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
-from TranslationBackend import TranslationBackend, TranslationRunState
+from TranslationBackend import (
+    OLLAMA_BASE_URL,
+    TranslationBackend,
+    TranslationRunState,
+    SUPPORTED_DOCUMENT_EXTENSIONS,
+)
 from passage.ui.common import LANGUAGES, log_event as _log_event
+from passage import __version__ as passage_version
+from passage import engine_ledger
+from passage import local_voice
+from passage import policy
+from passage import usage
+from passage import provider_profiles
 from passage.auth.jwt_verify import identity_from_auth_header
 from passage.ui.voice_page import VoicePageMixin
 
@@ -182,7 +195,10 @@ class TranslationUI(VoicePageMixin):
             if (token !== activeRequestToken) return;
             if (!resp.ok) throw new Error(data?.error || 'Translation failed.');
             output.textContent = data.translated_text || '';
-            setStatus(stateLabels.UPDATED);
+            // Name the model that answered. Local vs hosted changes both cost
+            // and latency, so it is state the user should be able to see.
+            const engine = data.engine ? ` · ${data.engine}` : '';
+            setStatus(`${stateLabels.UPDATED}${engine}`);
         } catch (err) {
             if (token !== activeRequestToken) return;
             setStatus(`${stateLabels.ERROR}: ${err?.message || 'unknown error'}`);
@@ -217,9 +233,17 @@ class TranslationUI(VoicePageMixin):
         self._inject_theme()
         self._inject_api_token()
         self._inject_workspace_text_live_translation_js()
+        # Get the local live model into VRAM while the user is still reading
+        # the page, not on their first keystroke. Fire-and-forget.
+        self.backend.prewarm_live()
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
+                # The only way into Recent Threads on a phone.
+                ui.button(icon="menu", on_click=lambda: self.drawer.toggle())\
+                    .props("flat round dense")\
+                    .classes("p-mode-tab")\
+                    .tooltip("Recent threads")
                 ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
                     .on("click", lambda: ui.navigate.to("/"))
                 ui.element("div").classes("p-header-sep")
@@ -227,7 +251,11 @@ class TranslationUI(VoicePageMixin):
                 self._render_mode_tabs()
 
         # Recent Threads drawer (renders itself into self.drawer)
-        self.drawer = ui.drawer(side='left').classes(theme.DRAWER)
+        # show-if-above keeps the drawer open on wide screens and closed on a
+        # phone, where it is opened by the header's menu button. Without that
+        # button the drawer was simply unreachable at 390px: the page's only
+        # controls were the mode tabs, swap and Translate.
+        self.drawer = ui.drawer(side='left').props("show-if-above").classes(theme.DRAWER)
         self.show_document_list()
 
         # Default workspace page
@@ -252,6 +280,337 @@ class TranslationUI(VoicePageMixin):
             ui.button("Voice", on_click=lambda: ui.navigate.to("/voice"))\
                 .props("flat no-caps")\
                 .classes("p-mode-tab")
+            profile = self.active_profile
+            ui.button("Engines", icon="insights",
+                      on_click=lambda: ui.navigate.to("/engines"))                .props("flat no-caps dense").classes("p-mode-tab ml-auto")                .tooltip("Where your text goes")
+            ui.button(profile.describe() if profile else "Engine",
+                      icon="tune", on_click=self.open_engine_settings)\
+                .props("flat no-caps dense")\
+                .classes("p-mode-tab ml-auto")\
+                .tooltip("Choose where translation runs")
+
+    def engines_page(self):
+        """Where your text has actually been going.
+
+        Deliberately not a settings screen. It answers "what happened to my
+        text this session, and what could this machine do instead", which is
+        the question the engine picker creates and nothing else answers.
+        """
+        self._inject_theme()
+        self._inject_api_token()
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                ui.button("Workspace", on_click=lambda: ui.navigate.to("/"))\
+                    .props("flat no-caps").classes("p-mode-tab")
+                ui.button("Compare", on_click=lambda: ui.navigate.to("/compare"))\
+                    .props("flat no-caps").classes("p-mode-tab")
+                ui.button("Engines").props("flat no-caps")\
+                    .classes("p-mode-tab p-mode-tab-active")
+
+        profile = self.active_profile
+        summary = engine_ledger.summarise(self.engine_runs)
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-5xl gap-4"):
+                ui.label("Where your text goes").classes("p-display text-xl")
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Right now").classes(theme.DATA)
+                    local_default = self.backend.choose_local_model()
+                    ui.label(policy.describe_privacy(
+                        profile, local_first_model=local_default)).classes("text-base")
+                    bits = [f"engine: {profile.describe() if profile else 'auto (local first)'}"]
+                    bits.append("metered" if policy.is_metered(
+                        profile, local_first_model=local_default) else "not metered")
+                    bits.append(f"local default: {local_default or 'none installed'}")
+                    ui.label(" · ".join(bits)).classes(theme.DATA)
+                    ui.button("Change engine", on_click=self.open_engine_settings)\
+                        .classes(f"{theme.BTN_SECONDARY_SM} mt-1")
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("This session").classes(theme.DATA)
+                    if not summary["total_runs"]:
+                        ui.label("Nothing translated yet.").classes("text-sm p-muted-text")
+                    else:
+                        local, remote = summary["local"], summary["remote"]
+                        share = int(summary["local_share_of_chars"] * 100)
+                        ui.label(f"{share}% of your text stayed on this machine")\
+                            .classes("text-base")
+                        # A bar, because a ratio is the whole point and a
+                        # number makes you do the comparison yourself.
+                        with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
+                                .style("background: var(--p-rule, #d6cbb4)"):
+                            if share:
+                                ui.element("div").classes("h-full")\
+                                    .style(f"width:{share}%; background: var(--p-ok, #3F6B4A)")
+                        ui.label(
+                            f"local: {local['runs']} runs · {local['chars']} chars"
+                            + (f" · {local['median_ms']} ms median" if local["median_ms"] is not None else "")
+                        ).classes(theme.DATA)
+                        ui.label(
+                            f"sent out: {remote['runs']} runs · {remote['chars']} chars"
+                            + (f" · {remote['median_ms']} ms median" if remote["median_ms"] is not None else "")
+                        ).classes(theme.DATA)
+                        for name, count in summary["engines"].items():
+                            ui.label(f"{name} — {count} run{'s' if count != 1 else ''}")\
+                                .classes(theme.DATA)
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Voice").classes(theme.DATA)
+                    ui.label(policy.describe_voice_privacy(
+                        self.current_target_language)).classes("text-base")
+                    ui.label(local_voice.describe()).classes(theme.DATA)
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Metered usage").classes(theme.DATA)
+                    used = usage.summary(self.usage_store)
+                    ui.label(usage.describe(used)).classes("text-base")
+                    if used.metered_runs:
+                        with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
+                                .style("background: var(--p-rule, #d6cbb4)"):
+                            ui.element("div").classes("h-full")\
+                                .style(f"width:{int(used.share_used * 100)}%; "
+                                       "background: var(--p-accent, #802F3D)")
+                    ui.label(
+                        "Only work Passage paid for is counted. Anything that ran on this "
+                        "machine or on your own key never reaches the counter."
+                    ).classes("text-xs p-muted-text")
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Models on this machine").classes(theme.DATA)
+                    bench = self._load_bench_rows()
+                    installed = self.backend.available_local_models()
+                    if not installed:
+                        ui.label("No local models reachable — everything runs hosted.")\
+                            .classes("text-sm p-muted-text")
+                    for name in installed:
+                        row = bench.get(name)
+                        detail = "not benchmarked yet"
+                        if row:
+                            detail = (f"{row.get('size_gb', 0):.1f} GB · {row.get('median_ms')} ms"
+                                      f" · agreement {row.get('consensus')}")
+                        marker = " (default)" if name == self.backend.choose_local_model() else ""
+                        ui.label(f"{name}{marker} — {detail}").classes(theme.DATA)
+                    ui.label(
+                        "Agreement is how closely a model matches the others on a fixed "
+                        "suite; it rewards the mainstream reading, so a low score is a "
+                        "reason to look rather than proof of error."
+                    ).classes("text-xs p-muted-text")
+
+    def _load_bench_rows(self) -> dict[str, dict]:
+        """Latest benchmark row per model from data/model_bench.jsonl."""
+        rows: dict[str, dict] = {}
+        path = Path(__file__).resolve().parent / "data" / "model_bench.jsonl"
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    rows[row.get("model", "?")] = row      # later runs win
+        except (OSError, ValueError):
+            return {}
+        return rows
+
+    def compare_page(self):
+        """Same sentence, every engine, side by side.
+
+        Answers "I brought my own key — how does it compare?", which no single
+        translation view can. Ranks nothing: there is no reference translation
+        here, so the honest signal is how far each engine sits from the others.
+        """
+        self._inject_theme()
+        self._inject_api_token()
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                ui.button("Workspace", on_click=lambda: ui.navigate.to("/"))\
+                    .props("flat no-caps").classes("p-mode-tab")
+                ui.button("Compare").props("flat no-caps").classes("p-mode-tab p-mode-tab-active")
+
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-5xl gap-3"):
+                ui.label("Compare engines").classes("p-display text-xl")
+                ui.label(
+                    "One sentence, every engine you can reach. Latency and tokens are "
+                    "measured per run. Agreement is how closely each output matches the "
+                    "others — there's no reference translation to score against, so an "
+                    "outlier is a prompt to look, not a verdict."
+                ).classes("text-sm p-muted-text")
+                ui.label(
+                    "Local engines run one at a time — they share a GPU, and running "
+                    "them together measures contention rather than the model. A local "
+                    "model's first run still includes loading it into memory, so read "
+                    "the second run for steady-state speed."
+                ).classes(f"text-xs {theme.DATA}")
+
+                with ui.row().classes(f"w-full items-center gap-3 flex-wrap {theme.WELL} p-3"):
+                    # A default with idiom, a figure and a domain term: engines
+                    # agree trivially on "Where is the pharmacy?", so seeding
+                    # with an easy sentence would make the feature look useless.
+                    source = ui.textarea(
+                        label="Text",
+                        value="The board pushed back on the buyback, arguing it "
+                              "would leave the balance sheet stretched heading "
+                              "into a soft quarter.",
+                    ).props("autogrow rows=2").classes("flex-grow")
+                    target = ui.input("To", value="Spanish").classes("w-40")
+                run_row = ui.row().classes("w-full items-center gap-3")
+                results_box = ui.column().classes("w-full gap-2")
+
+                def render(results) -> None:
+                    results_box.clear()
+                    with results_box:
+                        if not results:
+                            ui.label("No engines available.").classes("text-sm p-muted-text")
+                            return
+                        fastest = min((r.latency_ms for r in results if r.ok), default=None)
+                        for r in sorted(results, key=lambda x: (not x.ok, x.latency_ms or 10**9)):
+                            with ui.column().classes(f"w-full gap-1 p-3 {theme.WELL}"):
+                                with ui.row().classes("w-full items-baseline justify-between gap-2"):
+                                    ui.label(r.label).classes("p-display")
+                                    bits = [r.engine]
+                                    if r.latency_ms is not None:
+                                        fast = " (fastest)" if r.latency_ms == fastest else ""
+                                        bits.append(f"{r.latency_ms} ms{fast}")
+                                    if r.output_tokens is not None:
+                                        bits.append(f"{r.output_tokens} tok")
+                                    bits.append("free" if r.is_local
+                                                else (f"${r.cost_usd:.6f}" if r.cost_usd is not None
+                                                      else "metered · unpriced"))
+                                    if r.agreement is not None:
+                                        bits.append(f"agreement {r.agreement:.2f}")
+                                    ui.label(" · ".join(bits)).classes(theme.DATA)
+                                if r.ok:
+                                    ui.label(r.text).classes(f"w-full p-2 {theme.PANEL_TARGET}")
+                                else:
+                                    ui.label(f"Failed: {r.error}")\
+                                        .classes(f"w-full p-2 {theme.BANNER['negative']}")
+
+                async def run() -> None:
+                    text = (source.value or "").strip()
+                    if not text:
+                        ui.notify("Enter some text to compare.", type="warning")
+                        return
+                    run_row.clear()
+                    with run_row:
+                        ui.spinner(size="sm")
+                        ui.label("Running every engine…").classes(theme.DATA)
+                    candidates = self.backend.comparison_candidates(self.active_profile)
+                    results = await asyncio.to_thread(
+                        self.backend.compare_translations, text, target.value or "Spanish", candidates)
+                    render(results)
+                    run_row.clear()
+                    with run_row:
+                        ui.button("Run comparison", on_click=run).classes(theme.BTN_PRIMARY)
+                        ui.label(f"{sum(1 for r in results if r.ok)}/{len(results)} engines answered")\
+                            .classes(theme.DATA)
+
+                with run_row:
+                    ui.button("Run comparison", on_click=run).classes(theme.BTN_PRIMARY)
+
+    def open_engine_settings(self) -> None:
+        """Choose where translation runs: Passage's key, a local model, or your
+        own endpoint. Session-scoped — see the active_profile property."""
+        current = self.active_profile
+        with ui.dialog() as dialog, ui.card().classes(f"w-full max-w-xl {theme.WELL} p-5 gap-3"):
+            ui.label("Translation engine").classes("p-display text-lg")
+            ui.label(
+                "Bring your own endpoint and key and Passage stops metering the "
+                "work — it isn't paying for it, so it shouldn't bill for it."
+            ).classes("text-sm p-muted-text")
+
+            kind = ui.radio(
+                {
+                    provider_profiles.KIND_APP: "Passage hosted (metered)",
+                    provider_profiles.KIND_LOCAL: "Local model on this machine",
+                    provider_profiles.KIND_BYO: "My own endpoint and key",
+                },
+                value=current.kind if current else provider_profiles.KIND_APP,
+            ).props("inline")
+
+            base_url = ui.input(
+                "Base URL", placeholder="https://api.example.com/v1",
+                value=(current.base_url if current else "") or "",
+            ).classes("w-full")
+            api_key = ui.input(
+                "API key", placeholder="sk-…",
+                value="",
+            ).props("type=password").classes("w-full")
+            if current and current.api_key:
+                ui.label(f"A key is already saved for this session ({current.redacted()['api_key_hint']}). "
+                         "Leave blank to keep it.").classes("text-xs p-muted-text")
+            model = ui.input(
+                "Model", placeholder="qwen2.5:7b",
+                value=(current.model if current else "") or "",
+            ).classes("w-full")
+            status = ui.label("").classes("text-sm")
+
+            def build() -> tuple[Any, str | None]:
+                chosen = kind.value
+                if chosen == provider_profiles.KIND_APP:
+                    return None, None
+                if chosen == provider_profiles.KIND_LOCAL and not base_url.value.strip():
+                    base_url.value = OLLAMA_BASE_URL
+                key = api_key.value.strip() or (current.api_key if current else "")
+                problem = provider_profiles.validate(base_url.value, key, model.value)
+                if problem:
+                    return None, problem
+                return provider_profiles.ProviderProfile(
+                    label=model.value.strip() or "Custom",
+                    kind=chosen,
+                    base_url=base_url.value.strip(),
+                    api_key=key,
+                    model=model.value.strip(),
+                ), None
+
+            async def test() -> None:
+                profile, problem = build()
+                if problem:
+                    status.text = problem
+                    status.classes(replace="text-sm p-banner p-banner-negative")
+                    return
+                if profile is None:
+                    status.text = "Passage's hosted key needs no test."
+                    return
+                status.text = "Testing…"
+                status.classes(replace="text-sm p-muted-text")
+                result = await asyncio.to_thread(self.backend.test_profile, profile)
+                if result.get("ok"):
+                    status.text = (f"Connected — {result['model']} answered in "
+                                   f"{result['latency_ms']} ms: “{result['sample']}”")
+                    status.classes(replace="text-sm p-banner p-banner-positive")
+                else:
+                    status.text = f"Couldn't connect: {result.get('error', 'unknown error')}"
+                    status.classes(replace="text-sm p-banner p-banner-negative")
+
+            def save() -> None:
+                profile, problem = build()
+                if problem:
+                    status.text = problem
+                    status.classes(replace="text-sm p-banner p-banner-negative")
+                    return
+                self._set_active_profile(profile)
+                ui.notify(
+                    "Using Passage's hosted key." if profile is None
+                    else f"Using {profile.describe()} — this session is unmetered.",
+                    type="positive",
+                )
+                dialog.close()
+                # The header chip names the active engine, so it has to
+                # re-render too — refresh_upload_ui only rebuilds the workspace.
+                self._render_mode_tabs()
+                self.refresh_upload_ui()
+
+            with ui.row().classes("w-full justify-end gap-2 mt-1"):
+                ui.button("Test connection", on_click=test).classes(theme.BTN_SECONDARY_SM)
+                ui.button("Save", on_click=save).classes(theme.BTN_PRIMARY)
+        dialog.open()
 
     def set_workspace_mode(self, mode: str) -> None:
         self.input_mode = mode
@@ -451,12 +810,17 @@ class TranslationUI(VoicePageMixin):
         if self.input_mode == "Document":
             # auto_upload so picking a file IS the upload — without it the file
             # sits queued at 0% and Translate says "no file uploaded".
+            # accept= matches the label: without it the picker offered every
+            # file, and choosing e.g. a CSV export produced a green "Selected"
+            # toast and "Ready to translate" before failing on Translate with
+            # "Unsupported file extension: csv". Say no at selection time.
             ui.upload(
                 label="Click or drop DOCX, PPTX, or PDF",
                 multiple=False,
                 auto_upload=True,
                 on_upload=self.handle_mobile_upload,
-            ).classes("w-full")
+            ).props(f"accept={','.join('.' + e for e in sorted(SUPPORTED_DOCUMENT_EXTENSIONS))}")\
+             .classes("w-full")
             if self.uploaded_file_name:
                 ui.label(f"Selected file: {self.uploaded_file_name}").classes("text-sm p-muted-text")
             return
@@ -468,7 +832,7 @@ class TranslationUI(VoicePageMixin):
             multiple=False,
             auto_upload=True,
             on_upload=self.handle_mobile_image_upload,
-        ).props("accept=image/* capture=environment").classes("w-full")
+        ).props('accept=".png,.jpg,.jpeg,.webp" capture=environment').classes("w-full")
         if self.image_upload_name:
             ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm p-muted-text")
 
@@ -479,8 +843,21 @@ class TranslationUI(VoicePageMixin):
 
     async def handle_mobile_upload(self, event):
         # NiceGUI 3.x: the payload lives on event.file (FileUpload) and reads async.
-        self.uploaded_file_name = event.file.name
-        self.uploaded_file_extension = self.uploaded_file_name.split(".")[-1].lower()
+        name = event.file.name
+        extension = name.split(".")[-1].lower() if "." in name else ""
+        # accept= on the input is only a picker hint — drag-and-drop ignores it
+        # entirely. Reject here too, so an unsupported file never gets a green
+        # "Selected" toast and a "Ready to translate" status it can't honour.
+        if extension not in SUPPORTED_DOCUMENT_EXTENSIONS:
+            supported = ", ".join(sorted(e.upper() for e in SUPPORTED_DOCUMENT_EXTENSIONS))
+            ui.notify(
+                f"Passage can't translate .{extension or 'unknown'} files yet — "
+                f"upload a {supported}.",
+                type="negative",
+            )
+            return
+        self.uploaded_file_name = name
+        self.uploaded_file_extension = extension
         self.uploaded_file = BytesIO(await event.file.read())
         ui.notify(f"Selected '{self.uploaded_file_name}'", type="positive")
         self.refresh_upload_ui()
@@ -575,6 +952,7 @@ class TranslationUI(VoicePageMixin):
         result = self.image_translation_result or {}
         blocks = result.get("translated_blocks", [])
         confidence = result.get("confidence_metadata", {})
+        overlay_png = result.get("overlay_png")
         with self.result_container:
             with ui.column().classes(f"w-full max-w-3xl mx-auto gap-3 p-4 {theme.WELL}"):
                 ui.label(f"Image OCR translation → {language}").classes("p-display text-lg")
@@ -582,6 +960,20 @@ class TranslationUI(VoicePageMixin):
                     f"Confidence avg: {confidence.get('average_confidence', 0)} "
                     f"across {confidence.get('block_count', 0)} blocks"
                 ).classes(theme.DATA)
+                # The translated-in-place picture. This is the answer for
+                # "point your phone at a menu": reading a two-column list of
+                # blocks means holding the phone AND the menu and matching them
+                # up by eye, which is most of the work the feature exists to do.
+                if overlay_png:
+                    encoded = base64.b64encode(overlay_png).decode("ascii")
+                    ui.label("Translated in place").classes("p-data")
+                    ui.image(f"data:image/png;base64,{encoded}")\
+                        .classes("w-full rounded")\
+                        .style("max-height: 70vh; object-fit: contain")
+                    ui.label(
+                        f"{result.get('placed_block_count', 0)} of "
+                        f"{confidence.get('block_count', 0)} blocks positioned"
+                    ).classes(theme.DATA)
                 for idx, block in enumerate(blocks, start=1):
                     with ui.grid(columns=2).classes("w-full gap-2"):
                         with ui.column().classes("w-full gap-1"):
@@ -675,6 +1067,10 @@ class TranslationUI(VoicePageMixin):
             self.job_poll_timer.active = False
             self.job_poll_timer = None
 
+        # Documents run on the session's chosen endpoint too. Until now the
+        # job always used the process default, so "bring your own key" quietly
+        # excluded the surface that costs the most.
+        profile = self.active_profile
         self.active_job_id = self.backend.start_translation_job(
             input_stream=self.uploaded_file,
             file_extension=self.uploaded_file_extension,
@@ -683,6 +1079,7 @@ class TranslationUI(VoicePageMixin):
             font_size=font_size,
             autofit=autofit,
             correlation_id=correlation_id,
+            profile=profile,
         )
 
         def poll_job():
@@ -1071,27 +1468,156 @@ class TranslationUI(VoicePageMixin):
         except RuntimeError:
             return []
 
+    @property
+    def active_profile(self):
+        """This visitor's chosen endpoint, or None for Passage's own default.
+
+        Same session-cookie-scoped storage as recent_threads, for the same
+        reason and one sharper: this may hold the user's own API key, which
+        must never be shared across sessions or written anywhere a second
+        visitor can read. Degrades to None outside a request context so a
+        storage failure falls back to the app default instead of raising on
+        the translation path.
+        """
+        try:
+            raw = app.storage.user.get("provider_profile")
+        except RuntimeError:
+            return None
+        if not raw:
+            return None
+        try:
+            return provider_profiles.from_stored(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def engine_runs(self) -> list:
+        """This session's record of which engine served what. Same
+        session-cookie storage as recent_threads, and degrades to a throwaway
+        list outside a request context — transparency must never be the reason
+        a translation fails."""
+        try:
+            return app.storage.user.setdefault("engine_runs", [])
+        except RuntimeError:
+            return []
+
+    @property
+    def usage_store(self) -> dict:
+        """Metered usage for this session (see passage/usage.py)."""
+        try:
+            return app.storage.user.setdefault("usage", {})
+        except RuntimeError:
+            return {}
+
+    def _record_engine_run(self, *, surface, engine: str, latency_ms: int, chars: int) -> None:
+        try:
+            is_local = engine.startswith("local")
+            engine_ledger.record(
+                self.engine_runs, surface=str(getattr(surface, "value", surface)),
+                engine=engine, is_local=is_local,
+                latency_ms=latency_ms, chars=chars, when=time.time())
+            # Only work Passage paid for reaches the counter — a local or BYO
+            # run is never recorded, not recorded-then-zeroed.
+            # The engine label already records where it actually ran, which is
+            # a stronger signal than what was configured — a hosted fallback
+            # after a local failure IS metered, and asking policy about the
+            # profile alone would miss that.
+            metered = (not is_local) and policy.is_metered(
+                self.active_profile, local_first_model=None)
+            usage.record(self.usage_store, chars=chars, metered=metered)
+        except Exception:  # never let bookkeeping break a translation
+            LOGGER.debug("engine run not recorded", exc_info=True)
+
+    def _set_active_profile(self, profile) -> None:
+        try:
+            if profile is None:
+                app.storage.user.pop("provider_profile", None)
+            else:
+                app.storage.user["provider_profile"] = asdict(profile)
+        except RuntimeError:
+            LOGGER.info("No session storage; provider profile not persisted")
+
     def _record_thread(self, entry: dict) -> None:
         """Newest-first with dedupe: repeating a translation moves its thread
-        to the top instead of stacking duplicates."""
+        to the top instead of stacking duplicates.
+
+        Also collapses live typing into ONE thread. Text mode re-translates on
+        every 350ms typing pause, so composing a single sentence used to emit
+        ~8 separate threads — one per growing prefix ("The", "The quarterly",
+        "The quarterly report"…) — because the dedupe key is the label and a
+        growing prefix never matches itself. Recent Threads filled up with
+        fragments of one sentence, which reads as history but isn't.
+        `_continuation_of` treats a prefix-extension (or a backspace-shortening)
+        of the newest thread as the SAME utterance and updates it in place,
+        keeping its id and original timestamp.
+        """
         entry.setdefault("id", str(uuid.uuid4()))
+        threads = self.recent_threads
+
+        superseded = self._continuation_of(entry, threads)
+        if superseded is not None:
+            # Same utterance still being composed: update in place rather than
+            # stack a new row. Keep the id (so a delete button already rendered
+            # against it still works) and when the utterance started, but let
+            # `when` advance to this edit — it drives both the newest-first sort
+            # and the continuation window, which must measure from the last
+            # keystroke, not from the start (otherwise composing for longer than
+            # the window silently forks a second thread mid-sentence).
+            entry["id"] = superseded.get("id", entry["id"])
+            entry["started"] = superseded.get("started", superseded.get("when"))
+            threads[threads.index(superseded)] = entry
+            return
+
         key = (entry.get("kind"), entry.get("label"), entry.get("language"))
         survivors = [
-            t for t in self.recent_threads
+            t for t in threads
             if (t.get("kind"), t.get("label"), t.get("language")) != key
         ]
-        threads = self.recent_threads
         threads.clear()
         threads.extend(survivors)
         threads.insert(0, entry)
         del threads[20:]
+
+    #: How long after the last keystroke a further edit still counts as the
+    #: same utterance rather than a new one.
+    THREAD_CONTINUATION_WINDOW_S = 180.0
+
+    def _continuation_of(self, entry: dict, threads: list) -> dict | None:
+        """Return the existing thread `entry` is a continuation of, else None.
+
+        Only chat threads continue — a document translation is always its own
+        thread. A continuation must be the most recent thread (you can only be
+        typing in one box at a time), same target language, within the window,
+        and its source text must be a prefix-extension of the stored one or a
+        shortening of it (backspacing mid-sentence must not spawn a new row).
+        """
+        if entry.get("kind") != "chat" or not threads:
+            return None
+        newest = max(threads, key=lambda t: t.get("when", 0))
+        if newest.get("kind") != "chat":
+            return None
+        if newest.get("language") != entry.get("language"):
+            return None
+        if entry.get("when", 0) - newest.get("when", 0) > self.THREAD_CONTINUATION_WINDOW_S:
+            return None
+        old = (newest.get("original") or "").strip()
+        new = (entry.get("original") or "").strip()
+        if not old or not new:
+            return None
+        return newest if (new.startswith(old) or old.startswith(new)) else None
 
     def _delete_thread(self, thread_id: str) -> None:
         threads = self.recent_threads
         threads[:] = [t for t in threads if t.get("id") != thread_id]
         self.show_document_list()
 
-    def _record_chat_thread(self, original: str, translated: str, language: str) -> None:
+    def _record_chat_thread(self, original: str, translated: str, language: str,
+                            surface: policy.Surface = policy.Surface.TEXT) -> None:
+        # Retention is decided in one place (passage/policy.py) rather than by
+        # each call site, because a data-retention rule that drifts is the kind
+        # of bug you hear about from someone else.
+        if not policy.may_persist(surface, "session_history"):
+            return
         self._record_thread({
             "kind": "chat",
             "label": original[:48],
@@ -1162,22 +1688,44 @@ class TranslationUI(VoicePageMixin):
                 language=language,
                 chars=len(cleaned_text),
             )
-            translated = await asyncio.to_thread(
-                self.backend.translate_text,
+            # The keystroke path: prefers a local model when one is reachable
+            # (free, and measurably faster here), hosted otherwise. The engine
+            # comes back with the translation so the UI can show which model
+            # answered rather than leaving the user guessing.
+            started = time.perf_counter()
+            translated, engine = await asyncio.to_thread(
+                self.backend.translate_live,
                 cleaned_text,
                 language,
+                self.active_profile,
             )
+            self._record_engine_run(
+                surface=policy.Surface.LIVE_TEXT, engine=engine,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                chars=len(cleaned_text))
             _log_event(
                 "ui.text_translate_succeeded",
                 correlation_id=correlation_id,
                 language=language,
+                engine=engine,
             )
-            self._record_chat_thread(cleaned_text, translated, language)
+            # LIVE_TEXT keeps a SESSION entry (thread continuation already
+            # collapses one sentence into one row) but is never persisted
+            # durably — see passage/policy.py for the distinction.
+            self._record_chat_thread(cleaned_text, translated, language,
+                                     surface=policy.Surface.LIVE_TEXT)
             return JSONResponse(
                 {
                     "original_text": cleaned_text,
                     "translated_text": translated,
                     "target_language": language,
+                    "engine": engine,
+                    "privacy": policy.describe_privacy(
+                        self.active_profile,
+                        local_first_model=self.backend.choose_local_model()),
+                    "metered": policy.is_metered(
+                        self.active_profile,
+                        local_first_model=self.backend.choose_local_model()),
                 },
                 headers={"X-Correlation-Id": correlation_id},
             )
@@ -1300,6 +1848,27 @@ class TranslationUI(VoicePageMixin):
             return JSONResponse({"authenticated": False, "user_id": None, "email": None})
         return JSONResponse({"authenticated": True, "user_id": user_id, "email": email})
 
+    async def api_health(self, request: Request) -> JSONResponse:
+        """Liveness plus what this instance can actually do right now.
+
+        Commit 546a291 said it added this; its diff was two lines in
+        passage/__init__.py and the route 404'd, so anything health-checking
+        the deploy was checking nothing. Ungated on purpose — a health check
+        that needs a page-issued token is not a health check.
+
+        It reports capability, not just "alive": whether a hosted provider is
+        configured and which local models are reachable, because "up but
+        unable to translate" is the failure worth catching.
+        """
+        local = self.backend.available_local_models()
+        return JSONResponse({
+            "status": "ok",
+            "version": passage_version,
+            "hosted_provider": self.backend.provider is not None,
+            "local_models": local,
+            "local_default": self.backend.choose_local_model(),
+        })
+
 
 def start_ui() -> None:
     """App bootstrap: one shared backend/api_guard for the whole process
@@ -1335,6 +1904,7 @@ def start_ui() -> None:
     # Phase 4 (accounts): identity-only, not gated by the paid-API token —
     # degrades to anonymous with zero config until SUPABASE_URL is set.
     app.add_api_route("/api/me", api_service.api_me, methods=["GET"])
+    app.add_api_route("/api/health", api_service.api_health, methods=["GET"])
 
     # `mode` is a plain FastAPI-style query param (?mode=Document) — NiceGUI
     # wires ui.page function parameters the same way. See main_page()/
@@ -1344,6 +1914,8 @@ def start_ui() -> None:
 
     ui.page("/")(index)
     ui.page("/voice")(lambda: new_page_ui().voice_translation_page())
+    ui.page("/compare")(lambda: new_page_ui().compare_page())
+    ui.page("/engines")(lambda: new_page_ui().engines_page())
     # /mobile is retired — one responsive layout; keep old bookmarks working
     ui.page("/mobile")(lambda: ui.navigate.to("/"))
     app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))

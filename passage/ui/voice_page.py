@@ -121,10 +121,18 @@ window.voiceUx = window.voiceUx || (() => {
                         f'<datalist id="passage_languages">{options}</datalist>'
                     )
                     ui.element("div").classes("flex-grow")
+                    # NO inline event-handler attributes here. NiceGUI 3 renders
+                    # ui.html() through DOMPurify, which strips them, so the
+                    # handler these two buttons used to carry never reached the
+                    # DOM and BOTH were dead for every user on every browser --
+                    # silently, with no console error, the status label simply
+                    # never changing. They are wired by delegated listeners on
+                    # `document` (see the script block below), the same pattern
+                    # the workspace live-translate JS already uses.
                     ui.html('<button id="desktop_voice_start_recording" class="p-btn p-btn-ok px-4 py-2" '
-                            'onclick="startRecording()">● Record</button>')
+                            '>● Record</button>')
                     ui.html('<button id="desktop_voice_stop_recording" class="p-btn p-btn-danger px-4 py-2" '
-                            'onclick="stopRecording()" disabled>■ Stop</button>')
+                            'disabled>■ Stop</button>')
 
                 self._render_voice_status_block("desktop_voice")
 
@@ -387,6 +395,17 @@ window.voiceUx = window.voiceUx || (() => {
 
     window.translateTranscriptFallback = translateTranscriptFallback;
 
+    // Delegated bindings for the Record/Stop buttons. They are rendered by
+    // ui.html(), and NiceGUI 3 pipes that through DOMPurify, which strips
+    // inline handler attributes — so handlers must be attached from script
+    // instead. Delegating on `document` also survives a re-render of the row.
+    document.addEventListener('click', (e) => {
+        const el = e.target && e.target.closest ? e.target.closest('button') : null;
+        if (!el || el.disabled) return;
+        if (el.id === 'desktop_voice_start_recording') { e.preventDefault(); startRecording(); }
+        else if (el.id === 'desktop_voice_stop_recording') { e.preventDefault(); stopRecording(); }
+    });
+
     window.addEventListener('load', () => {
         const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
         const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
@@ -429,22 +448,28 @@ window.voiceUx = window.voiceUx || (() => {
                     media_type="text/plain",
                     headers={"X-Correlation-Id": correlation_id},
                 )
-            original_text, translated_text, mp3_bytes = await asyncio.to_thread(
+            original_text, translated_text, audio_bytes, meta = await asyncio.to_thread(
                 self.backend.translate_audio, data, language
             )
             safe_original = (original_text or "")[:400]
             safe_translated = (translated_text or "")[:400]
             header_orig = quote(safe_original, safe="")
             header_translated = quote(safe_translated, safe="")
+            # Piper returns WAV; the hosted path returns MP3. Sending the wrong
+            # media type leaves the browser guessing at the container.
             return Response(
-                content=mp3_bytes,
-                media_type="audio/mpeg",
+                content=audio_bytes,
+                media_type=meta.get("media_type", "audio/mpeg"),
                 headers={
                     "X-Original-Text": header_orig,
                     "X-Translated-Text": header_translated,
                     "X-Target-Language": language,
                     "X-Correlation-Id": correlation_id,
-                    "Content-Length": str(len(mp3_bytes))
+                    # Voice is where a user most deserves to know whether their
+                    # recording left the machine, so say so explicitly.
+                    "X-Speech-Engine": meta.get("stt", "hosted"),
+                    "X-Voice-Engine": meta.get("tts", "hosted"),
+                    "Content-Length": str(len(audio_bytes))
                 }
             )
         except Exception as e:

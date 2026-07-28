@@ -1,4 +1,5 @@
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -224,6 +225,93 @@ def test_recent_threads_degrades_to_empty_outside_a_request_context():
     assert ui_app.recent_threads == []
 
 
+def test_live_typing_one_sentence_collapses_into_a_single_thread(monkeypatch):
+    """The bug this fixes, reproduced at unit level: Text mode re-translates on
+    every 350ms typing pause, so composing one sentence emitted one thread per
+    growing prefix (live-measured: 8 threads for 8 words). Recent Threads filled
+    with fragments of a single sentence."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    prefixes = [
+        "The", "The quarterly", "The quarterly report",
+        "The quarterly report shows", "The quarterly report shows revenue",
+        "The quarterly report shows revenue grew twelve percent.",
+    ]
+    for p in prefixes:
+        ui_app._record_chat_thread(p, f"<{p}>", "Spanish")
+
+    assert len(ui_app.recent_threads) == 1
+    thread = ui_app.recent_threads[0]
+    assert thread["original"] == prefixes[-1]
+    assert thread["translated"] == f"<{prefixes[-1]}>"
+
+
+def test_continuation_keeps_a_stable_thread_id_and_start_time(monkeypatch):
+    """The row must not churn its identity while you type — a delete button
+    already rendered against it has to keep working."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+    first_id = ui_app.recent_threads[0]["id"]
+    first_when = ui_app.recent_threads[0]["when"]
+
+    ui_app._record_chat_thread("Hello there", "Hola ahí", "Spanish")
+
+    thread = ui_app.recent_threads[0]
+    assert thread["id"] == first_id
+    assert thread["started"] == first_when
+    assert thread["when"] >= first_when
+
+
+def test_backspacing_mid_sentence_does_not_fork_a_new_thread(monkeypatch):
+    """Shortening counts as the same utterance too, otherwise correcting a typo
+    mid-sentence spawns a duplicate row."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Hello therre", "Hola", "Spanish")
+    ui_app._record_chat_thread("Hello the", "Hola", "Spanish")
+    ui_app._record_chat_thread("Hello there", "Hola ahí", "Spanish")
+
+    assert len(ui_app.recent_threads) == 1
+    assert ui_app.recent_threads[0]["original"] == "Hello there"
+
+
+def test_a_genuinely_new_sentence_starts_its_own_thread(monkeypatch):
+    """Continuation must not swallow real history — clearing the box and typing
+    something unrelated is a new thread."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Where is the pharmacy?", "¿Dónde está la farmacia?", "Spanish")
+    ui_app._record_chat_thread("How much does it cost?", "¿Cuánto cuesta?", "Spanish")
+
+    assert len(ui_app.recent_threads) == 2
+
+
+def test_continuation_expires_after_the_window(monkeypatch):
+    """A prefix-extension typed much later is a new utterance, not a continuation."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+    stale = ui_app.recent_threads[0]
+    stale["when"] -= ui_app.THREAD_CONTINUATION_WINDOW_S + 1
+
+    ui_app._record_chat_thread("Hello there", "Hola ahí", "Spanish")
+
+    assert len(ui_app.recent_threads) == 2
+
+
+def test_a_document_thread_never_continues_a_chat_thread(monkeypatch):
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Report", "Informe", "Spanish")
+    ui_app._record_thread({
+        "kind": "document", "label": "Report.pdf",
+        "language": "Spanish", "when": time.time(),
+    })
+
+    assert len(ui_app.recent_threads) == 2
+
+
 def test_delete_thread_removes_only_the_matching_entry(monkeypatch):
     ui_app = _build_mobile_ui()
     _use_fake_thread_storage(monkeypatch, ui_app)
@@ -402,6 +490,21 @@ def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
     assert "document.getElementById('desktop_voice_stop_recording')" in source
 
 
+def test_record_buttons_are_wired_by_delegation_not_inline_onclick():
+    """NiceGUI 3 renders ui.html() through DOMPurify, which strips inline
+    event handlers. The Record/Stop buttons used onclick="startRecording()",
+    so the attribute never reached the DOM and BOTH buttons were dead for
+    every user on every browser — silently, with no console error and no
+    status change. Verified live: the rendered <button> had no onclick
+    attribute and el.onclick was null. Delegated listeners survive the
+    sanitizer, so assert we never regress to the inline form."""
+    source = Path("passage/ui/voice_page.py").read_text(encoding="utf-8")
+
+    assert "onclick=" not in source, "inline onclick is stripped by DOMPurify in NiceGUI 3"
+    assert "el.id === 'desktop_voice_start_recording'" in source
+    assert "el.id === 'desktop_voice_stop_recording'" in source
+
+
 def test_transcript_fallback_js_handler_is_defined_and_exported():
     source = Path("passage/ui/voice_page.py").read_text(encoding="utf-8")
 
@@ -487,3 +590,154 @@ def test_workspace_text_mode_js_discards_stale_responses():
     assert "const token = ++activeRequestToken;" in source
     assert "if (token !== activeRequestToken) return;" in source
     assert "stateLabels = { READY: 'Ready', TRANSLATING: 'Translating…', UPDATED: 'Updated', ERROR: 'Error' }" in source
+
+
+def test_document_upload_rejects_an_unsupported_extension(monkeypatch):
+    """CSV/XLSX aren't implemented (Problems.md roadmap item 8), but the
+    uploader accepted them: picking a finplatform CSV export produced a green
+    "Selected 'anthropic_financials.csv'" toast and "Status: Ready to
+    translate.", and only failed after clicking Translate with "Unsupported
+    file extension: csv". accept= on the input is a picker hint that
+    drag-and-drop ignores, so the check has to live here too."""
+    import asyncio as _asyncio
+
+    ui_app = _build_mobile_ui()
+    notes = []
+    monkeypatch.setattr("TranslationUI.ui.notify", lambda msg, **kw: notes.append((msg, kw.get("type"))))
+    monkeypatch.setattr(ui_app, "refresh_upload_ui", lambda: None)
+
+    class _File:
+        name = "anthropic_financials.csv"
+        async def read(self):  # pragma: no cover - must not be reached
+            raise AssertionError("read an unsupported file")
+
+    class _Event:
+        file = _File()
+
+    _asyncio.run(ui_app.handle_mobile_upload(_Event()))
+
+    assert ui_app.uploaded_file is None
+    assert ui_app.uploaded_file_name is None
+    assert notes and notes[-1][1] == "negative"
+    assert "csv" in notes[-1][0]
+
+
+def test_document_upload_accepts_each_supported_extension(monkeypatch):
+    import asyncio as _asyncio
+    from TranslationBackend import SUPPORTED_DOCUMENT_EXTENSIONS
+
+    for ext in sorted(SUPPORTED_DOCUMENT_EXTENSIONS):
+        ui_app = _build_mobile_ui()
+        monkeypatch.setattr("TranslationUI.ui.notify", lambda msg, **kw: None)
+        monkeypatch.setattr(ui_app, "refresh_upload_ui", lambda: None)
+
+        class _File:
+            name = f"report.{ext}"
+            async def read(self):
+                return b"payload"
+
+        class _Event:
+            file = _File()
+
+        _asyncio.run(ui_app.handle_mobile_upload(_Event()))
+
+        assert ui_app.uploaded_file_extension == ext
+        assert ui_app.uploaded_file is not None
+
+
+def test_provider_profile_never_exposes_the_raw_key():
+    """A BYO profile holds the user's own API key. Only redacted() is safe to
+    render, return over HTTP, or log."""
+    from passage import provider_profiles as pp
+
+    profile = pp.ProviderProfile(label="mine", kind=pp.KIND_BYO,
+                                 base_url="https://api.example.com/v1",
+                                 api_key="sk-supersecret-1234", model="gpt-4o-mini")
+    shown = profile.redacted()
+
+    assert "api_key" not in shown
+    assert shown["api_key_hint"] == "…1234"
+    assert "sk-supersecret-1234" not in str(shown)
+
+
+def test_only_the_hosted_app_profile_is_metered():
+    """BYO means the app isn't paying, so it must not bill. One place decides,
+    so metering can't drift from provider selection."""
+    from passage import provider_profiles as pp
+
+    assert pp.app_default_profile("gpt-5.4-nano").is_metered is True
+    assert pp.local_profile("http://localhost:11434/v1", "qwen2.5:7b").is_metered is False
+    assert pp.ProviderProfile(label="x", kind=pp.KIND_BYO).is_metered is False
+
+
+def test_profile_validation_messages():
+    from passage import provider_profiles as pp
+
+    assert pp.validate("https://a/v1", "sk-x", "") is not None          # no model
+    assert pp.validate("", "sk-x", "m") is not None                     # no base_url
+    assert pp.validate("ftp://a", "sk-x", "m") is not None              # not http(s)
+    assert pp.validate("https://api.example.com/v1", "", "m") is not None  # remote needs a key
+    # A loopback endpoint legitimately needs no key.
+    assert pp.validate("http://localhost:11434/v1", "", "qwen2.5:7b") is None
+    assert pp.validate("https://api.example.com/v1", "sk-x", "gpt-4o-mini") is None
+
+
+def test_test_profile_scrubs_the_key_out_of_error_messages(monkeypatch):
+    """The failure text goes straight into a settings dialog."""
+    import TranslationBackend as tb
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    profile = pp.ProviderProfile(label="mine", kind=pp.KIND_BYO,
+                                 base_url="https://api.example.com/v1",
+                                 api_key="sk-leak-me", model="gpt-4o-mini")
+
+    def boom(**kw):
+        raise RuntimeError("401 unauthorized for key sk-leak-me")
+
+    backend.provider_for_profile(profile).create_chat_completion = boom
+    result = backend.test_profile(profile)
+
+    assert result["ok"] is False
+    assert "sk-leak-me" not in result["error"]
+
+
+def test_explicit_profile_is_honoured_over_local_first(monkeypatch):
+    """Local-first is a default, not an override: if the user picked an
+    endpoint, sending their text somewhere else is exactly the surprise a
+    picker exists to prevent."""
+    import TranslationBackend as tb
+    from types import SimpleNamespace
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    backend._live_local_provider = lambda: (_ for _ in ()).throw(
+        AssertionError("local-first ran despite an explicit profile"))
+    profile = pp.ProviderProfile(label="mine", kind=pp.KIND_BYO,
+                                 base_url="https://api.example.com/v1",
+                                 api_key="sk-x", model="gpt-4o-mini")
+    backend.provider_for_profile(profile).create_chat_completion = lambda **kw: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="Hola"))])
+
+    assert backend.translate_live("Hello", "Spanish", profile) == ("Hola", "byo:gpt-4o-mini")
+
+
+def test_profile_providers_are_cached_by_settings_not_identity(monkeypatch):
+    """Editing a profile must produce a new client, not silently reuse the old
+    endpoint."""
+    import TranslationBackend as tb
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    a = pp.ProviderProfile(label="a", kind=pp.KIND_BYO, base_url="https://one/v1",
+                           api_key="k", model="m")
+    same = pp.ProviderProfile(label="renamed", kind=pp.KIND_BYO, base_url="https://one/v1",
+                              api_key="k", model="m")
+    edited = pp.ProviderProfile(label="a", kind=pp.KIND_BYO, base_url="https://two/v1",
+                                api_key="k", model="m")
+
+    assert backend.provider_for_profile(a) is backend.provider_for_profile(same)
+    assert backend.provider_for_profile(a) is not backend.provider_for_profile(edited)

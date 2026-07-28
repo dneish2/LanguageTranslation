@@ -1,0 +1,15 @@
+# Optional: run speech recognition and synthesis on this machine instead of
+# sending audio to a hosted API. Deliberately NOT in requirements.txt — the
+# deploy image should not carry a speech stack it will never use, and these
+# pull in ~13 packages plus model weights.
+#
+#   VIRTUAL_ENV=.venv uv pip install -r requirements-local-voice.txt
+#   .venv/Scripts/python -m piper.download_voices en_US-lessac-medium \
+#       es_ES-davefx-medium --download-dir models/piper
+#   set PASSAGE_LOCAL_VOICE=1
+#
+# CPU is the default and is fast enough: a 6.6s clip transcribes in ~0.6s and
+# Piper synthesises a sentence in ~0.08s. CUDA needs cublas/cudnn wheels
+# (~700MB) for no useful gain here, and the deploy target has no GPU anyway.
+faster-whisper>=1.2,<2
+piper-tts>=1.6,<2
