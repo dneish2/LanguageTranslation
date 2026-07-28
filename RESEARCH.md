@@ -169,9 +169,21 @@ Ordered by value, with what each depends on.
 3. **Better row detection for coloured headings.** The remaining overlay error
    is concentrated in section headings the detector misses. A per-channel ink
    map (not just greyscale) would catch burgundy-on-cream.
-4. **Local STT/TTS.** Voice is the only modality with no local path, so the
-   "nothing leaves your machine" claim has a hole in it. Whisper.cpp or a
-   Piper voice would close it.
+4. ~~**Local STT/TTS.**~~ **Done.** faster-whisper + Piper, both optional and
+   env-gated (`PASSAGE_LOCAL_VOICE=1`, `requirements-local-voice.txt`).
+   Measured on the same 6.6s clip, cache cleared, 3 runs each:
+
+       LOCAL   median 1.51s   stt=local:base  tts=local:piper
+       HOSTED  median 7.62s   stt=hosted      tts=hosted
+
+   **5x faster and private.** CPU rather than CUDA: ctranslate2 wants
+   `cublas64_12.dll` and the CUDA wheels are ~700MB for a task that already
+   transcribes in 0.6s on CPU — which is also the portable choice, as the
+   deploy target has no GPU. Piper is a VITS model, not a language model, so
+   it structurally cannot answer the text instead of reading it; round-trip
+   fidelity 0.950. The three steps (recognise / translate / speak) choose
+   local or hosted independently, so a missing voice for one language doesn't
+   force the recording off the machine.
 5. **Trace persistence for documents.** Policy already permits it; nothing
    writes it. This is the substrate for per-segment scoring and the per-user
    preference dataset.
@@ -180,6 +192,25 @@ Ordered by value, with what each depends on.
    neither has been checked elsewhere.
 
 ---
+
+## 4a. Decisions waiting on David
+
+Not started, because each needs a call rather than more code.
+
+- **Which Whisper size ships as the default?** `base` transcribes a 6.6s clip
+  in 0.6s and is accurate on clear speech; `small` is slower and better on
+  accents and noise. This is a quality/latency trade with no right answer
+  from here, and it should be measured on real recordings rather than on the
+  synthetic fixture used so far.
+- **Should local voice default ON when the models are present?** It currently
+  defaults off, matching "don't silently change where someone's audio is
+  processed". The argument for on: it is faster AND more private, so the
+  default penalises the better option. The argument for off: model weights
+  are a large implicit download.
+- **Do we ship voices, or fetch them on demand?** Each Piper voice is ~63MB.
+  Bundling a few makes the feature work out of the box; fetching keeps the
+  image small but means the first use of a language is slow and needs network
+   — awkward for a feature whose selling point is not needing the network.
 
 ## 5. Prompt for the next session
 
