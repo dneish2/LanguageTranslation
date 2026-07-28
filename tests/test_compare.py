@@ -212,3 +212,56 @@ def test_privacy_line_distinguishes_local_from_byo_from_hosted():
     assert "not metered" in byo and policy.data_leaves_machine(
         pp.ProviderProfile(label="m", kind=pp.KIND_BYO)) is True
     assert "metered" in hosted
+
+
+def test_privacy_line_accounts_for_local_first_routing():
+    """With no explicit profile the app still routes locally when a model is
+    reachable. Answering from the profile alone claimed "hosted, metered" on a
+    page that simultaneously reported 100% of the text stayed on the machine —
+    a privacy claim contradicting the ledger next to it."""
+    from passage import policy
+
+    assert policy.data_leaves_machine(None, local_first_model="translategemma:4b") is False
+    assert "isn't sent anywhere" in policy.describe_privacy(
+        None, local_first_model="translategemma:4b")
+
+    # No local model installed: it really is hosted.
+    assert policy.data_leaves_machine(None, local_first_model=None) is True
+    assert "hosted" in policy.describe_privacy(None, local_first_model=None)
+
+
+def test_engine_ledger_summarises_by_characters_not_just_runs():
+    """One document is one run but a lot of text; counting runs alone would
+    call a session "mostly local" after sending a whole report out."""
+    from passage import engine_ledger
+
+    store = []
+    engine_ledger.record(store, surface="live_text", engine="local:tg", is_local=True,
+                         latency_ms=100, chars=20, when=1.0)
+    engine_ledger.record(store, surface="document", engine="hosted:gpt", is_local=False,
+                         latency_ms=900, chars=8000, when=2.0)
+
+    summary = engine_ledger.summarise(store)
+    assert summary["total_runs"] == 2
+    assert summary["local"]["runs"] == 1 and summary["remote"]["chars"] == 8000
+    assert summary["local_share_of_chars"] < 0.01, "runs-only would have said 50%"
+
+
+def test_engine_ledger_is_bounded():
+    from passage import engine_ledger
+
+    store = []
+    for i in range(engine_ledger.MAX_ENTRIES + 50):
+        engine_ledger.record(store, surface="live_text", engine="local:x", is_local=True,
+                             latency_ms=1, chars=1, when=float(i))
+    assert len(store) == engine_ledger.MAX_ENTRIES
+    assert store[-1]["when"] == float(engine_ledger.MAX_ENTRIES + 49)
+
+
+def test_local_first_runs_are_not_metered():
+    """Billing for inference that ran on the user's own GPU would be charging
+    for electricity somebody else paid for."""
+    from passage import policy
+
+    assert policy.is_metered(None, local_first_model="translategemma:4b") is False
+    assert policy.is_metered(None, local_first_model=None) is True
