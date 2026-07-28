@@ -590,3 +590,56 @@ def test_workspace_text_mode_js_discards_stale_responses():
     assert "const token = ++activeRequestToken;" in source
     assert "if (token !== activeRequestToken) return;" in source
     assert "stateLabels = { READY: 'Ready', TRANSLATING: 'Translating…', UPDATED: 'Updated', ERROR: 'Error' }" in source
+
+
+def test_document_upload_rejects_an_unsupported_extension(monkeypatch):
+    """CSV/XLSX aren't implemented (Problems.md roadmap item 8), but the
+    uploader accepted them: picking a finplatform CSV export produced a green
+    "Selected 'anthropic_financials.csv'" toast and "Status: Ready to
+    translate.", and only failed after clicking Translate with "Unsupported
+    file extension: csv". accept= on the input is a picker hint that
+    drag-and-drop ignores, so the check has to live here too."""
+    import asyncio as _asyncio
+
+    ui_app = _build_mobile_ui()
+    notes = []
+    monkeypatch.setattr("TranslationUI.ui.notify", lambda msg, **kw: notes.append((msg, kw.get("type"))))
+    monkeypatch.setattr(ui_app, "refresh_upload_ui", lambda: None)
+
+    class _File:
+        name = "anthropic_financials.csv"
+        async def read(self):  # pragma: no cover - must not be reached
+            raise AssertionError("read an unsupported file")
+
+    class _Event:
+        file = _File()
+
+    _asyncio.run(ui_app.handle_mobile_upload(_Event()))
+
+    assert ui_app.uploaded_file is None
+    assert ui_app.uploaded_file_name is None
+    assert notes and notes[-1][1] == "negative"
+    assert "csv" in notes[-1][0]
+
+
+def test_document_upload_accepts_each_supported_extension(monkeypatch):
+    import asyncio as _asyncio
+    from TranslationBackend import SUPPORTED_DOCUMENT_EXTENSIONS
+
+    for ext in sorted(SUPPORTED_DOCUMENT_EXTENSIONS):
+        ui_app = _build_mobile_ui()
+        monkeypatch.setattr("TranslationUI.ui.notify", lambda msg, **kw: None)
+        monkeypatch.setattr(ui_app, "refresh_upload_ui", lambda: None)
+
+        class _File:
+            name = f"report.{ext}"
+            async def read(self):
+                return b"payload"
+
+        class _Event:
+            file = _File()
+
+        _asyncio.run(ui_app.handle_mobile_upload(_Event()))
+
+        assert ui_app.uploaded_file_extension == ext
+        assert ui_app.uploaded_file is not None
