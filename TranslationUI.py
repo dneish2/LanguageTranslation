@@ -273,6 +273,105 @@ class TranslationUI(VoicePageMixin):
                 .classes("p-mode-tab ml-auto")\
                 .tooltip("Choose where translation runs")
 
+    def compare_page(self):
+        """Same sentence, every engine, side by side.
+
+        Answers "I brought my own key — how does it compare?", which no single
+        translation view can. Ranks nothing: there is no reference translation
+        here, so the honest signal is how far each engine sits from the others.
+        """
+        self._inject_theme()
+        self._inject_api_token()
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                ui.button("Workspace", on_click=lambda: ui.navigate.to("/"))\
+                    .props("flat no-caps").classes("p-mode-tab")
+                ui.button("Compare").props("flat no-caps").classes("p-mode-tab p-mode-tab-active")
+
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-5xl gap-3"):
+                ui.label("Compare engines").classes("p-display text-xl")
+                ui.label(
+                    "One sentence, every engine you can reach. Latency and tokens are "
+                    "measured per run. Agreement is how closely each output matches the "
+                    "others — there's no reference translation to score against, so an "
+                    "outlier is a prompt to look, not a verdict."
+                ).classes("text-sm p-muted-text")
+                ui.label(
+                    "Local engines run one at a time — they share a GPU, and running "
+                    "them together measures contention rather than the model. A local "
+                    "model's first run still includes loading it into memory, so read "
+                    "the second run for steady-state speed."
+                ).classes(f"text-xs {theme.DATA}")
+
+                with ui.row().classes(f"w-full items-center gap-3 flex-wrap {theme.WELL} p-3"):
+                    # A default with idiom, a figure and a domain term: engines
+                    # agree trivially on "Where is the pharmacy?", so seeding
+                    # with an easy sentence would make the feature look useless.
+                    source = ui.textarea(
+                        label="Text",
+                        value="The board pushed back on the buyback, arguing it "
+                              "would leave the balance sheet stretched heading "
+                              "into a soft quarter.",
+                    ).props("autogrow rows=2").classes("flex-grow")
+                    target = ui.input("To", value="Spanish").classes("w-40")
+                run_row = ui.row().classes("w-full items-center gap-3")
+                results_box = ui.column().classes("w-full gap-2")
+
+                def render(results) -> None:
+                    results_box.clear()
+                    with results_box:
+                        if not results:
+                            ui.label("No engines available.").classes("text-sm p-muted-text")
+                            return
+                        fastest = min((r.latency_ms for r in results if r.ok), default=None)
+                        for r in sorted(results, key=lambda x: (not x.ok, x.latency_ms or 10**9)):
+                            with ui.column().classes(f"w-full gap-1 p-3 {theme.WELL}"):
+                                with ui.row().classes("w-full items-baseline justify-between gap-2"):
+                                    ui.label(r.label).classes("p-display")
+                                    bits = [r.engine]
+                                    if r.latency_ms is not None:
+                                        fast = " (fastest)" if r.latency_ms == fastest else ""
+                                        bits.append(f"{r.latency_ms} ms{fast}")
+                                    if r.output_tokens is not None:
+                                        bits.append(f"{r.output_tokens} tok")
+                                    bits.append("free" if r.is_local
+                                                else (f"${r.cost_usd:.6f}" if r.cost_usd is not None
+                                                      else "metered · unpriced"))
+                                    if r.agreement is not None:
+                                        bits.append(f"agreement {r.agreement:.2f}")
+                                    ui.label(" · ".join(bits)).classes(theme.DATA)
+                                if r.ok:
+                                    ui.label(r.text).classes(f"w-full p-2 {theme.PANEL_TARGET}")
+                                else:
+                                    ui.label(f"Failed: {r.error}")\
+                                        .classes(f"w-full p-2 {theme.BANNER['negative']}")
+
+                async def run() -> None:
+                    text = (source.value or "").strip()
+                    if not text:
+                        ui.notify("Enter some text to compare.", type="warning")
+                        return
+                    run_row.clear()
+                    with run_row:
+                        ui.spinner(size="sm")
+                        ui.label("Running every engine…").classes(theme.DATA)
+                    candidates = self.backend.comparison_candidates(self.active_profile)
+                    results = await asyncio.to_thread(
+                        self.backend.compare_translations, text, target.value or "Spanish", candidates)
+                    render(results)
+                    run_row.clear()
+                    with run_row:
+                        ui.button("Run comparison", on_click=run).classes(theme.BTN_PRIMARY)
+                        ui.label(f"{sum(1 for r in results if r.ok)}/{len(results)} engines answered")\
+                            .classes(theme.DATA)
+
+                with run_row:
+                    ui.button("Run comparison", on_click=run).classes(theme.BTN_PRIMARY)
+
     def open_engine_settings(self) -> None:
         """Choose where translation runs: Passage's key, a local model, or your
         own endpoint. Session-scoped — see the active_profile property."""
@@ -1587,6 +1686,7 @@ def start_ui() -> None:
 
     ui.page("/")(index)
     ui.page("/voice")(lambda: new_page_ui().voice_translation_page())
+    ui.page("/compare")(lambda: new_page_ui().compare_page())
     # /mobile is retired — one responsive layout; keep old bookmarks working
     ui.page("/mobile")(lambda: ui.navigate.to("/"))
     app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))

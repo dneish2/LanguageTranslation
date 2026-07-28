@@ -28,6 +28,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
 
+from passage import compare
 from passage import provider_profiles as pp
 
 from translation_metrics import MetricsCollector, TranslationMetrics
@@ -1063,6 +1064,64 @@ class TranslationBackend:
             if profile is not None and profile.api_key:
                 message = message.replace(profile.api_key, "…")
             return {"ok": False, "error": message[:300]}
+
+    def available_local_models(self) -> list[str]:
+        """Model tags on the local Ollama, or [] if it isn't reachable."""
+        try:
+            import urllib.request
+            base = OLLAMA_BASE_URL.rstrip("/").removesuffix("/v1")
+            with urllib.request.urlopen(f"{base}/api/tags", timeout=LIVE_PROBE_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            # Embedding models can't translate; offering them would produce
+            # confusing empty rows in a comparison.
+            return [
+                m["name"] for m in payload.get("models", [])
+                if "embed" not in m.get("name", "")
+            ]
+        except Exception as error:
+            logging.info("[Backend] local model list unavailable (%s)", error)
+            return []
+
+    def comparison_candidates(self, profile=None) -> list[dict[str, Any]]:
+        """The engines worth comparing right now: Passage's hosted default, the
+        user's own profile if they set one, and whatever is on their machine."""
+        candidates: list[dict[str, Any]] = []
+        if self.provider is not None:
+            candidates.append({
+                "label": "Passage hosted", "engine": f"hosted:{TEXT_MODEL}",
+                "model": TEXT_MODEL, "is_local": False, "profile": None,
+            })
+        if profile is not None and profile.kind != pp.KIND_APP:
+            candidates.append({
+                "label": f"Yours ({profile.label})", "engine": profile.describe(),
+                "model": profile.model, "is_local": profile.uses_local_inference,
+                "profile": profile,
+            })
+        for tag in self.available_local_models():
+            if profile is not None and profile.model == tag:
+                continue  # already listed as the user's own
+            candidates.append({
+                "label": f"Local {tag}", "engine": f"local:{tag}", "model": tag,
+                "is_local": True,
+                "profile": pp.ProviderProfile(
+                    label=tag, kind=pp.KIND_LOCAL, base_url=OLLAMA_BASE_URL,
+                    api_key="ollama", model=tag),
+            })
+        return candidates
+
+    def compare_translations(self, text: str, target_language: str, candidates: list[dict[str, Any]]):
+        """Translate `text` with every candidate and return scored rows."""
+        def translate_with(candidate: dict[str, Any]) -> str:
+            profile = candidate.get("profile")
+            provider = self.provider_for_profile(profile) if profile else self._require_provider()
+            masked, protected = _mask_protected_spans(text)
+            completion = provider.create_chat_completion(
+                messages=self._live_prompt_messages(masked, target_language), max_tokens=1200,
+            )
+            return _restore_protected_spans(
+                (completion.choices[0].message.content or "").strip(), protected)
+
+        return compare.run_comparison(candidates, translate_with, self.calculate_tokens)
 
     # ───────────────────────── LIVE (KEYSTROKE) PATH ────────────────────── #
 
