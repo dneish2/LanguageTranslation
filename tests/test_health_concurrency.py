@@ -203,14 +203,29 @@ def test_health_against_a_silent_endpoint_leaves_the_loop_responsive(fast_probe)
 
 
 def test_health_against_a_refused_port_leaves_the_loop_responsive(fast_probe):
-    """The second endpoint the auditor measured (8.32 s, loop frozen)."""
+    """The second endpoint the auditor measured (8.32 s, loop frozen).
+
+    The assertion is a RATIO, not a tick floor, because how long a refused
+    connect takes is an OS fact: Windows sits in the probe budget for ~2 s
+    while Linux and macOS refuse in microseconds. A fixed floor encodes the
+    dev machine's timing and fails on a runner that is simply faster — the
+    same class of hidden host assumption this phase exists to delete. What is
+    portable is the SHARE of available ticks the loop actually served: it was
+    0 of ~160 before the fix, and must be most of them after, whatever the
+    wall clock happens to be here.
+    """
     port = _refused_port()
     backend = CountingBackend(f"http://127.0.0.1:{port}")
     payload, ticks, elapsed = asyncio.run(_health_with_heartbeat(backend))
 
     assert payload["status"] == "ok"
-    assert ticks >= 2, (
-        f"event loop blocked: {ticks} heartbeat ticks in {elapsed:.2f}s")
+    possible = elapsed / 0.05
+    assert ticks >= possible * 0.5, (
+        f"event loop blocked: {ticks} heartbeat ticks in {elapsed:.2f}s, "
+        f"where ~{possible:.0f} were possible — blocking I/O is back on the loop")
+    # A request that never waited proves nothing about ticks, so the other
+    # half of the mechanism is pinned unconditionally.
+    assert backend.probe_calls == 1
 
 
 def test_health_costs_exactly_one_probe(fast_probe):

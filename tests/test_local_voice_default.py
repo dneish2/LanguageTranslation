@@ -39,6 +39,22 @@ def _install_fake_models(monkeypatch, tmp_path, *, whisper=True, piper=True, voi
             monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
         else:
             monkeypatch.setitem(sys.modules, name, None)  # import -> ImportError
+
+    # Whisper readiness means the WEIGHTS are on disk, the same standard the
+    # Piper voice below is held to — importability alone was the privacy
+    # overclaim. So the cache is redirected at tmp_path unconditionally,
+    # including when whisper=False: inheriting the host's real HF cache is what
+    # made this suite pass on the dev machine (weights present) and fail
+    # everywhere else. Absence must be simulated, never inherited.
+    cache = tmp_path / "hf"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    monkeypatch.delenv("HF_HOME", raising=False)
+    if whisper:
+        folder = "models--" + local_voice.whisper_repo_id().replace("/", "--")
+        snapshot = cache / folder / "snapshots" / "deadbeef"
+        snapshot.mkdir(parents=True, exist_ok=True)
+        (snapshot / "model.bin").write_bytes(b"stub")
+
     monkeypatch.setattr(local_voice, "VOICE_DIR", tmp_path)
     if voice:
         # A voice is the weights AND the .onnx.json config; the weights alone

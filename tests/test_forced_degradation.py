@@ -186,6 +186,21 @@ def _voice_stack(monkeypatch, tmp_path, *, whisper=True, piper=True, voice=True)
             monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
         else:
             monkeypatch.setitem(sys.modules, name, None)  # import -> ImportError
+
+    # Whisper readiness is weights-on-disk, not importability. The HF cache is
+    # redirected at tmp_path in BOTH directions: pointing it away only when
+    # simulating absence would leave "installed" inheriting the dev machine's
+    # real weights, which is precisely why this file passed here and failed on
+    # every CI runner.
+    cache = tmp_path / "hf"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    monkeypatch.delenv("HF_HOME", raising=False)
+    if whisper:
+        folder = "models--" + local_voice.whisper_repo_id().replace("/", "--")
+        snapshot = cache / folder / "snapshots" / "deadbeef"
+        snapshot.mkdir(parents=True, exist_ok=True)
+        (snapshot / "model.bin").write_bytes(b"stub")
+
     monkeypatch.setattr(local_voice, "VOICE_DIR", tmp_path)
     if voice:
         (tmp_path / "es_ES-davefx-medium.onnx").write_bytes(b"stub")
