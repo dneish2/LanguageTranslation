@@ -108,9 +108,24 @@ sat ~35 px below their text.
    **scale and offset** are needed — a pure shift fixed the top of the page
    and left the bottom wrong, because the error grows with distance down.
 
-Measured, single controlled run: median alignment error **17.5 px → 9.2 px**.
-Still partial — section headings in a lighter colour are missed by the
-detector, so their nearest row is genuinely far away.
+**Measured across 5 runs** (an earlier single-run figure of 17.5 → 9.2 px was
+not representative — the vision model's boxes vary noticeably run to run, and
+one lucky run is not a result):
+
+    median across runs   BEFORE 23.5px   AFTER 20.5px
+    improved in 4/5 runs; run 4 got worse (23.2 -> 28.2)
+
+So the correction is a **modest and mostly-positive** improvement of roughly
+13%, not the halving a single run suggested. It is worth keeping — it is cheap,
+it degrades gracefully, and it helps most of the time — but the honest headline
+is "somewhat better on average", and the residual error is large enough that
+the overlay is still not precise.
+
+A **per-channel ink map** was tried to catch the burgundy section headings the
+greyscale threshold misses (the missed rows being where the residual error
+concentrates). It found one more row but also a spurious band over blank paper,
+and measured no better. Reverted rather than kept for the idea's sake. The
+headings problem is real and still open; the fix is not this.
 
 ---
 
