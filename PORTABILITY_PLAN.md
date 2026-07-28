@@ -98,7 +98,25 @@ already works.**
 | **Apple Silicon** | **GitHub `macos-14`+ runners are arm64** |
 | **Windows, no GPU** | **GitHub `windows-latest` — no GPU at all** |
 
-Current CI is `ubuntu-latest` only, so *none* of this is exercised today.
+CI was `ubuntu-latest` only, so none of this was exercised. The matrix now exists and has run.
+
+### 3.1 What the first matrix run actually showed (run 30395914573)
+
+This section's central claim — that `macos-14` runners are arm64 and therefore make Apple Silicon
+verifiable for free — was a prediction. It is now **CONFIRMED from runner output**: the macOS
+runner's interpreter is `/Users/runner/hostedtoolcache/Python/3.11.9/arm64`. Observed, on that
+run, not inferred from documentation.
+
+Results of that run: `windows-latest` PASS, `ubuntu-latest` FAIL, `macos-14` FAIL. The nightly
+macOS speech job was **skipped** — it is schedule/dispatch only and has not yet run, so nothing
+about real arm64 `faster-whisper`/`piper` execution is known.
+
+The failure is the vindication. `redact_path` reduced a path to its basename using host-specific
+separator semantics, so a Windows-style path was not redacted on POSIX. That is exactly the class
+of defect §2.6 describes — an environment assumption written from the machine the author was
+sitting at — and it was invisible on Windows, which passed. The matrix caught it **on its first
+run**, which settles the question of whether building it was worth the effort. Another agent is
+fixing it; the re-run has not happened and is not claimed green here.
 
 What CI can genuinely verify per tier:
 
@@ -115,6 +133,11 @@ The honest limit: CI runners have no Ollama and no GPU, so **local LLM inference
 stays unverified** until either the expensive job runs or someone runs the harness on a real Mac.
 `passage/model_bench.py` already appends to `data/model_bench.jsonl`, so such a run is directly
 comparable to the 5090 numbers.
+
+Unverified after run 30395914573, and to be labelled as such wherever it is discussed: local LLM
+inference on Apple Silicon; real `faster-whisper`/`piper` execution on arm64; real iOS Safari;
+real Android Chrome; OS-level permission dialogs; actual microphone and camera hardware; and all
+absolute latency numbers on any machine other than the 5090.
 
 ## 4. Browsers: what is testable and what is not
 

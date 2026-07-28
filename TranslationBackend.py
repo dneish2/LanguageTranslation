@@ -1486,7 +1486,7 @@ class TranslationBackend:
         Called from main_page. Doing this lazily on the first translate request
         was useless: the probe, the model load and the user's first keystroke
         all happened at the same instant, so the first response took ~3s and
-        took two more keystrokes to settle. Both the probe (up to 0.6s) and the
+        took two more keystrokes to settle. Both the probe (up to 2.5s) and the
         VRAM load run off the render path here — page render must never wait
         for either.
         """

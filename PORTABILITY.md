@@ -3,8 +3,9 @@
 Short answer: **yes, and the architecture already bends the right way** — but the latency numbers
 in `RESEARCH.md` are one machine's opinion and should not be quoted as portable.
 
-Verified by checking wheel availability and reading the code for platform assumptions. **Not**
-verified by running it on an M1 — nobody has, and this document says so rather than implying
+Verified by checking wheel availability and reading the code for platform assumptions, plus one
+CI run on real arm64 macOS hardware (see "First cross-platform evidence" below). **Not** verified
+by running the app on an M1 — nobody has, and this document says so rather than implying
 otherwise.
 
 ---
@@ -51,8 +52,37 @@ automatically — no config, no code change. And the model that wins the benchma
 smallest of the serious ones (3.3 GB), which is a happy accident of task-specific models beating
 big general ones.
 
-If nothing local is reachable, the live path falls back to hosted with a 0.6 s probe cached for
+If nothing local is reachable, the live path falls back to hosted with a 2.5 s probe cached for
 60 s, so a Mac with no Ollama behaves exactly like a laptop on a plane: slower, still working.
+The probe budget was 0.6 s, which was fitted to this machine and would have read a loaded or
+cold Mac as "no local model installed"; 2.5 s is the current value in `TranslationBackend.py`,
+and it is what a Mac owner should expect to wait, once, before the answer is cached.
+
+## First cross-platform evidence
+
+GitHub Actions run **30395914573** is the first time this project has ever executed outside
+Windows. What it establishes:
+
+- **CONFIRMED, from runner output:** the `macos-14` runner's Python is arm64 —
+  `/Users/runner/hostedtoolcache/Python/3.11.9/arm64`. `PORTABILITY_PLAN.md` §3 predicted this;
+  it is now observed rather than predicted, on that run.
+- **Results:** `windows-latest` PASS, `ubuntu-latest` FAIL, `macos-14` FAIL. The nightly macOS
+  speech job was skipped — it is schedule/dispatch only, so it **has not yet run at all**.
+- **The failure was a genuine hidden host assumption.** `redact_path` reduced a path to its
+  basename using host-specific separator semantics, so a Windows-style path was not redacted on
+  POSIX. Both non-Windows runners caught it on the matrix's *first* run. Another agent is fixing
+  it; there is no green re-run yet, and this document will not claim one.
+
+### Still unverified
+
+Label every one of these unverified until someone produces output:
+
+- local LLM inference on Apple Silicon — the runners have no Ollama and no GPU
+- real `faster-whisper` / `piper` execution on arm64 — the nightly speech job has not run
+- real iOS Safari, real Android Chrome
+- OS-level permission dialogs
+- actual microphone and camera hardware
+- every absolute latency number, on any machine other than the 5090
 
 ## What would actually need attention
 

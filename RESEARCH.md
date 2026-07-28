@@ -279,6 +279,72 @@ study above is deterministic per clip given a fixed model and greedy decoding,
 so N=1 per clip is fine there — what needs the N is the *set of clips*, not
 repeated runs of the same one.
 
+## 4b. What this round measured, as distinct from what it changed
+
+Most of this round was changes, not measurements. Two things were actually measured, and they are
+kept separate here so nobody later reads a change as evidence.
+
+### `/api/health` blocks the event loop
+
+Measured on the Windows dev machine (RTX 5090) by timing a request to `/api/health` while the
+diagnostics probe was reaching for an unreachable local model:
+
+| condition | wall clock | 50 ms heartbeat ticks observed |
+|---|---|---|
+| probe target is a **silent socket** (connect accepted, no response) | **15.31 s** | **0** |
+| probe target is a **refused port** | **8.32 s** | — |
+
+Zero heartbeat ticks over 15.31 s is the finding. The handler is not merely slow; it holds the
+event loop for the whole duration, so nothing else on the server progresses — a silent socket
+anywhere in the probe chain stalls every other request. The refused-port case is faster only
+because the OS answers immediately, and 8.32 s is still far past anything a health endpoint should
+cost. These are single measurements of a deterministic blocking condition, not model-dependent
+sampling, so N=1 is appropriate; the numbers belong to this machine and these two socket
+conditions and should not be quoted as portable.
+
+That is the motivating evidence for the event-loop fix.
+
+#### After the fix — re-measured at integration, N=5 per condition, medians
+
+The fix was measured twice by different parties. The numbers below are the integration
+re-measurement, taken at **production timeouts** (2.5 s probe + 3.0 s refusal check) against the
+same two real socket conditions, 5 runs each, median reported with every run listed. The "before"
+row is the pre-fix route shape reconstructed exactly: four sequential blocking probes from an
+`async def`.
+
+| condition | wall clock (median of 5) | 50 ms heartbeat ticks (median) | probes/request |
+|---|---|---|---|
+| silent socket, **before** | **10.07 s** `[10.07, 10.07, 10.04, 10.09, 10.09]` | **0** `[0,0,0,0,0]` | 4 |
+| silent socket, **after** | **2.53 s** `[2.76, 2.52, 2.53, 2.53, 2.52]` | **41** `[45,41,41,41,41]` | 1 |
+| refused port, **before** | **8.14 s** `[8.14, 8.14, 8.11, 8.15, 8.15]` | **0** `[0,0,0,0,0]` | 4 |
+| refused port, **after** | **2.04 s** `[2.05, 2.04, 2.04, 2.05, 2.04]` | **34** `[34,33,34,34,34]` | 1 |
+
+5/5 runs improved in both conditions. **The wall-clock drop (~4x) is the de-duplication of the four
+probes into one; the number that matters is heartbeat ticks 0 → 41 and 0 → 34** — other clients are
+served throughout, which is the denial-of-service shape actually being fixed. A second request
+inside the 60 s TTL costs zero probes.
+
+The silent-socket "before" figure here is 10.07 s against the 15.31 s recorded above. Same shape,
+different socket timing on a different day; both are reported rather than the more flattering one
+being chosen, and neither is portable off this machine.
+
+### The CI matrix caught a real host assumption
+
+Run 30395914573 was the first execution of this project outside Windows: `windows-latest` PASS,
+`ubuntu-latest` FAIL, `macos-14` FAIL, nightly speech job skipped (it has not run). The failure was
+`redact_path` reducing a path to its basename with host-specific separator semantics, so a
+Windows-style path went unredacted on POSIX. Confirmed from runner output on that run: the
+`macos-14` Python is arm64 (`/Users/runner/hostedtoolcache/Python/3.11.9/arm64`). Everything else
+about Apple Silicon remains unverified — the runners have no Ollama and no GPU. See
+`PORTABILITY.md`.
+
+### What was changed but not measured
+
+Local voice tri-state parsing, Piper fetch-on-demand plus background prefetch, and the single
+complete-pair voice probe are all covered by tests that assert which path ran, but none of them
+carries a before/after latency number. They are correctness changes, and claiming a performance
+result for them would be inventing one.
+
 ## 5. Prompt for the next session
 
 Paste this to continue. It assumes nothing beyond the repo.

@@ -10,7 +10,7 @@ Anything marked **NEEDS DAVID** is genuinely blocked and must not be invented.
 
 ## 1. Whisper model size — `base` vs `small`
 
-**Resolution: keep `base`, and add a documented escape hatch.**
+**Resolution: keep `base`, and add a documented escape hatch. — IMPLEMENTED.**
 
 `base` transcribes a 6.6 s clip in 0.6 s and was accurate on the test audio. `small` is slower and
 better on accents and noise. The honest caveat: every measurement so far used a *synthetic* fixture
@@ -24,9 +24,16 @@ Act on it:
   (accents, background noise, a phone mic) and measure word error rate both ways. That is a
   half-hour of work and would replace an assumption with a fact.
 
+**As implemented:** `WHISPER_MODEL` in `passage/local_voice.py` is the single line that names a
+size anywhere in the app, defaulting to `PASSAGE_WHISPER_MODEL` or `base`. The engine label the
+user sees (`meta["stt"] == f"local:{WHISPER_MODEL}"`) is derived from the same constant, so
+changing the size changes the label with nothing else to keep in sync. The caveat is recorded in
+`RESEARCH.md` §4a, including the protocol for the WER study that would settle it. Still
+unvalidated on real speech.
+
 ## 2. Should local voice default ON when the models are installed?
 
-**Resolution: yes — default on when the models are actually present.**
+**Resolution: yes — default on when the models are actually present. — IMPLEMENTED.**
 
 It is both faster (1.51 s vs 7.62 s) and more private, so defaulting off penalises the better
 option. The original argument for off was "don't silently change where someone's audio is
@@ -42,9 +49,22 @@ Act on it:
 - `/engines` already reports voice privacy; make sure it reflects auto-detection rather than the
   raw env var.
 
+**As implemented, with two changes worth recording:**
+
+1. The tri-state accepts the obvious spellings, not just `1`/`0`. The first cut treated every
+   value other than `1`/`0` as auto, so `PASSAGE_LOCAL_VOICE=false` on a machine with the models
+   installed turned local voice **on** — a config value doing the opposite of what it says.
+   `_TRUTHY`/`_FALSEY` now cover `1/0`, `true/false`, `yes/no`, `y/n`, `on/off`, `t/f`, case- and
+   whitespace-insensitive. An unrecognised value is treated as a typo rather than a mode: it warns
+   once, `status()`/`describe()` surface it as not understood, and behaviour falls back to auto.
+2. The mode is resolved **per call**, not frozen at import. An import-time constant would have made
+   `/engines` stale the moment the fetch-on-demand helper finished a download, and would have
+   stopped tests re-probing after installing a voice.
+
 ## 3. Ship Piper voices, or fetch on demand?
 
-**Resolution: fetch on demand, and pre-fetch the current target language in the background.**
+**Resolution: fetch on demand, and pre-fetch the current target language in the background.
+— IMPLEMENTED.**
 
 Each voice is ~63 MB. Bundling several bloats the image; pure on-demand means the first use of a
 language is slow *and needs the network* — the worst possible failure for a feature whose entire
@@ -55,6 +75,22 @@ Act on it:
 - When the workspace loads and local voice is active, kick off a background fetch for the current
   target language (same pattern as `prewarm_live()` — off the render path, failures silent).
 - Never block a translation on a voice download: if it isn't there yet, use hosted TTS and say so.
+
+**As implemented, with three changes worth recording:**
+
+1. `local_voice.ensure_voice()` downloads into `models/piper/` under a per-voice lock and a
+   timeout, and `prefetch_voice()` is the fire-and-forget background wrapper.
+2. There is exactly **one** voice-presence probe, not a loose one and a strict one. The two-probe
+   version had them disagree about the same directory: `voice_file_for` returned the
+   alphabetically first `.onnx`, so a stale `es_ES-carlfm-x_low.onnx` left by a Ctrl-C'd
+   `piper.download_voices` answered forever for `es_ES-davefx-medium`. The strict probe never went
+   true even after a clean 63 MB download, so the prefetch re-downloaded on every page load while
+   the loose probe handed `synthesize()` the broken file and local TTS failed on every request.
+   The probe now selects the first *complete* `.onnx`/config pair.
+3. Prefetch is triggered from both surfaces. `TranslationUI.request_voice_prefetch()` is the
+   workspace hook (deduped per page load, since a fresh `TranslationUI` is built per load), and
+   `/voice` prefers that hook but falls back to `local_voice.prefetch_voice` directly, so `/voice`
+   cannot be the surface that silently never prefetches.
 
 ## 4. Camera overlay — coloured section headings
 
@@ -99,3 +135,12 @@ parsing) can be measured once — the distinction is whether sampling is in the 
 - **Second-machine benchmarks.** Every latency figure in `RESEARCH.md` is one GPU's opinion. The
   *ranking* should travel; the absolute numbers should not be quoted as portable until someone
   runs the harness elsewhere. See `PORTABILITY.md` for the Apple Silicon analysis.
+- **Local LLM inference on Apple Silicon.** CI run 30395914573 confirmed the `macos-14` runner is
+  arm64, which is the only Apple Silicon fact this project owns. The runners have no Ollama and no
+  GPU, so nothing about local model inference there is verified and none of it can be verified
+  without either a manual Ollama job or a real Mac.
+- **Real arm64 speech.** The nightly macOS `faster-whisper`/`piper` job is schedule/dispatch only
+  and has not yet run once. Until it does, real speech execution on arm64 is unverified.
+- **Real devices.** iOS Safari, Android Chrome, OS-level permission dialogs, and actual microphone
+  and camera hardware cannot be reached from CI or from this machine. `PORTABILITY_PLAN.md` §5
+  Phase E is the cheap unblock: open `/diagnostics` on a phone and on the M1 and paste the output.
