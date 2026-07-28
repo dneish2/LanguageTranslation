@@ -1,0 +1,215 @@
+# Cross-platform CI — PORTABILITY_PLAN.md Phase C.
+#
+# WHY THIS EXISTS
+# ---------------
+# Two of the three target tiers can be verified for free here, and the tier
+# that needs David's hardware is the one that already works:
+#
+#   Windows + GPU   -> David's machine only (the dev environment)
+#   Apple Silicon   -> macos-14 runners (EXPECTED arm64 — see below)
+#   Windows, no GPU -> windows-latest, which has no GPU at all
+#
+# The point is NOT a green tick. A green tick on a machine with no Ollama and
+# no voice models is exactly the false comfort PORTABILITY_PLAN.md §2.2 warns
+# about: every local path falls back to hosted and the app looks perfect. So
+# the first step of every job PRINTS what the runner actually resolved — OS,
+# arch, Python, node, font resolution, capability probes — and copies it into
+# the job summary. The log is the deliverable; the tick is a side effect.
+#
+# UNVERIFIED UNTIL A REAL RUN SAYS OTHERWISE
+# ------------------------------------------
+#   * That macos-14 is arm64. GitHub documents it as such, but this repo has
+#     never seen the output. `platform.machine()` is printed in a banner for
+#     that reason; record the first run's answer in PORTABILITY.md and delete
+#     this paragraph only once it is written down.
+#   * Local LLM inference on Apple Silicon. Runners have no Ollama and no GPU
+#     (§3), so this workflow deliberately does NOT install Ollama and does not
+#     pretend to test it. Faking it would produce precisely the confident,
+#     unverifiable claim §2.1 exists to prevent. It stays UNVERIFIED until
+#     someone runs passage/model_bench.py on a real Mac.
+#
+# The nightly job below installs and runs faster-whisper and piper on the
+# macOS runner. Once it has actually run, local SPEECH on Apple Silicon becomes
+# a measured fact rather than an inference from wheel metadata. It has not run
+# yet — no GitHub Actions run of this file exists as of the commit that adds
+# it — so that tier is still UNVERIFIED too. It never gates a PR.
+#
+# deploy.yml is untouched and still owns the ubuntu test + Cloud Run deploy
+# gate for main; this workflow adds breadth, it does not replace that gate.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 04:17 UTC. Off the hour on purpose: GitHub's scheduler queues heavily at
+    # :00 and a delayed nightly is a nightly nobody reads.
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # one OS failing must not hide the other two
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # ── EVIDENCE, not a tick ────────────────────────────────────────────
+      # Prints before the tests so the answer survives a failing suite.
+      - name: What this runner resolved
+        shell: bash
+        run: |
+          echo "node: $(node --version 2>/dev/null || echo 'ABSENT — the voice-page JS tests will SKIP')"
+          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, platform, sys, sysconfig, tempfile
+
+          bar = "=" * 68
+          # The arm64 question, made unmissable. PORTABILITY_PLAN.md §3 claims
+          # macos-14+ runners are arm64; this line is the only thing that can
+          # turn that claim into a fact for this repo.
+          print(bar)
+          print(f"  platform.machine() = {platform.machine()!r}")
+          print(f"  platform.system()  = {platform.system()!r}")
+          print(f"  platform.release() = {platform.release()!r}")
+          print(f"  is arm64?          = {platform.machine().lower() in ('arm64', 'aarch64')}")
+          print(bar)
+
+          print(f"python            : {sys.version.split()[0]} ({platform.python_implementation()})")
+          print(f"platform.platform : {platform.platform()}")
+          print(f"os.name / sep     : {os.name} / {os.sep!r}")
+          print(f"filesystem enc    : {sys.getfilesystemencoding()}")
+          print(f"stdout enc        : {sys.stdout.encoding}")
+          print(f"tempdir           : {tempfile.gettempdir()}")
+          print(f"platform tag      : {sysconfig.get_platform()}")
+
+          # App-specific probes: what the code ACTUALLY reads, per §2.6 — no
+          # generic "has GPU" guessing, no nvidia-smi on a Mac.
+          sys.path.insert(0, os.getcwd())
+
+          try:
+              import image_compositor
+              report = image_compositor.probe_font(24)
+              print(f"font resolved     : {report['resolved']!r} (kind={report['kind']})")
+              print(f"font FELL BACK    : {report['fallback']}"
+                    + ("   <-- overlay glyphs will be missing here" if report['fallback'] else ""))
+              print(f"font candidates   : {len(report['tried'])} tried")
+          except Exception as error:                       # noqa: BLE001
+              print(f"font probe FAILED : {type(error).__name__}: {error}")
+
+          try:
+              from passage import local_voice
+              state = local_voice.status()
+              print(f"local voice mode  : {state['mode']} (enabled={state['enabled']})")
+              print(f"  stt engine      : {state['stt_engine']}  ready={state['stt_ready']}")
+              print(f"  voices on disk  : {list(state['voices'])}")
+          except Exception as error:                       # noqa: BLE001
+              print(f"local voice probe : {type(error).__name__}: {error}")
+
+          # Expected ABSENT on every runner. Printed so the reason the local
+          # LLM tier is unverified is visible in the log rather than assumed.
+          try:
+              import urllib.request
+              with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1):
+                  print("ollama            : REACHABLE (unexpected on a runner)")
+          except Exception as error:                       # noqa: BLE001
+              print(f"ollama            : unreachable ({type(error).__name__}) "
+                    "-> local LLM inference stays UNVERIFIED here, by design")
+          PY
+
+      - name: Run the suite
+        run: python -m pytest tests/ -q
+
+  # ── Nightly: REAL local speech on Apple Silicon ─────────────────────────
+  # Not on PRs. It downloads model weights and is slow, and a flaky network
+  # must never block a merge. This is the job that turns "faster-whisper and
+  # piper have arm64 wheels" from wheel-metadata reading into an observation.
+  macos-local-speech:
+    name: nightly — local speech on macos-14
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the optional speech stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-local-voice.txt
+          pip install pytest
+
+      - name: Download a Piper voice
+        run: |
+          mkdir -p models/piper
+          python -m piper.download_voices en_US-lessac-medium --download-dir models/piper
+          ls -la models/piper
+
+      - name: Synthesise and transcribe ON THIS MACHINE, and say which engines ran
+        env:
+          PASSAGE_LOCAL_VOICE: "1"     # forced: a fallback to hosted here would
+          PASSAGE_WHISPER_MODEL: base  # be the failure, not an acceptable path
+        run: |
+          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import platform, sys, time
+          sys.path.insert(0, ".")
+          from passage import local_voice
+
+          print("=" * 68)
+          print(f"  platform.machine() = {platform.machine()!r}   (arm64 expected)")
+          print("=" * 68)
+
+          state = local_voice.status()
+          print(f"mode={state['mode']} enabled={state['enabled']} "
+                f"stt_engine={state['stt_engine']} voices={list(state['voices'])}")
+
+          # Fail loudly rather than degrading: the whole purpose of this job is
+          # the LOCAL path, so a hosted fallback here is a failed measurement.
+          assert local_voice.whisper_installed(), "faster-whisper did not import on arm64"
+          assert local_voice.piper_installed(), "piper did not import on arm64"
+          assert local_voice.tts_available("English"), "no usable local English voice"
+          assert local_voice.stt_available(), "local STT not available"
+
+          started = time.time()
+          wav = local_voice.synthesize("The delivery arrives on Tuesday.", language="English")
+          synth_s = time.time() - started
+          assert wav[:4] == b"RIFF", f"piper returned {wav[:8]!r}, not a WAV"
+
+          started = time.time()
+          heard = local_voice.transcribe(wav)
+          stt_s = time.time() - started
+
+          print(f"piper synthesised {len(wav)} bytes in {synth_s:.2f}s")
+          print(f"faster-whisper heard {heard!r} in {stt_s:.2f}s")
+          print(f"ENGINES THAT RAN: tts=local:piper stt=local:{local_voice.WHISPER_MODEL} "
+                f"on {platform.machine()}")
+
+          assert "delivery" in heard.lower(), f"round trip lost the words: {heard!r}"
+          PY
+
+      - name: Voice tests with the real stack installed
+        env:
+          PASSAGE_LOCAL_VOICE: "1"
+        run: python -m pytest tests/test_local_voice.py tests/test_local_voice_default.py tests/test_forced_degradation.py -q
