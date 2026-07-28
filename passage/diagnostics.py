@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import os
 import platform
+import re
+from inspect import signature
 from pathlib import Path
 from typing import Any, Callable
 
@@ -40,30 +42,59 @@ SECTIONS = ("platform", "local_llm", "speech", "font", "browser")
 
 # ──────────────────────────── path hygiene ──────────────────────────── #
 
+#: Both separators, always, on every host. ``pathlib``/``os.path`` understand
+#: only the separator of the machine they run on, which made this function
+#: silently host-dependent: on POSIX, ``Path(r"C:\\Windows\\Fonts\\arial.ttf").name``
+#: is the ENTIRE string, so the "redacted" value leaked the whole path. The CI
+#: matrix caught exactly that on its first run. The fix is not to branch on the
+#: host OS — that is the assumption this phase exists to delete — it is to stop
+#: asking the host and parse both styles unconditionally.
+_SEPARATORS = re.compile(r"[\\/]+")
+
+
+def _path_components(text: str) -> list[str]:
+    """Split on ``/`` and ``\\`` alike, dropping empties and no-op ``.`` parts.
+
+    Separator-agnostic by construction: a Windows path redacts identically on
+    Linux, and a POSIX path redacts identically on Windows.
+    """
+    return [part for part in _SEPARATORS.split(text) if part and part != "."]
+
+
 def redact_path(raw: str | os.PathLike | None) -> str | None:
-    """A path safe to paste into a bug report.
+    """A path safe to paste into a bug report, on any host, in any path style.
 
     A diagnostic is meant to be copied out of a browser and pasted somewhere
     public, so ``C:\\Users\\david.neish\\...`` must never appear in it. Paths
     under the home directory become ``~/…``; anything else is reduced to its
     final component, which is all a reader needs to tell arial.ttf from
     DejaVuSans.ttf.
+
+    The result depends only on the input, never on ``os.sep``. Home matching is
+    case-insensitive so ``C:/Users/David/x`` still collapses to ``~/x`` on
+    Windows, where the same directory is spelled several ways; a false match
+    can only ever redact more, never less.
     """
-    if raw in (None, ""):
+    if raw is None:
         return None
     text = str(raw)
+    if not text:
+        return None
+    parts = _path_components(text)
+    if not parts:
+        # A bare root ("/", "\\", "C:" is not root-only) carries no name and no
+        # secret; there is nothing safe left to say about it.
+        return None
     try:
-        path = Path(text)
-        home = Path.home()
-        try:
-            return "~/" + path.relative_to(home).as_posix()
-        except ValueError:
-            pass
-        if path.name:
-            return path.name
+        home_parts = _path_components(str(Path.home()))
     except Exception:
-        pass
-    return text.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        home_parts = []
+    if home_parts:
+        head = [part.casefold() for part in parts[:len(home_parts)]]
+        if head == [part.casefold() for part in home_parts]:
+            rest = parts[len(home_parts):]
+            return "~/" + "/".join(rest) if rest else "~"
+    return parts[-1]
 
 
 # ────────────────────────────── platform ────────────────────────────── #
@@ -243,7 +274,23 @@ def speech_report(status_fn: Callable[[], dict] | None = None) -> dict[str, Any]
 
 # ──────────────────────────────── font ──────────────────────────────── #
 
-def font_report(size: int = 24) -> dict[str, Any]:
+def _accepts_preferred(delegate: Callable[..., Any]) -> bool:
+    """Can the compositor's probe be told which face to resolve?
+
+    Asked of the object, never assumed: this module does not own
+    image_compositor.py, so the capability is discovered, and its absence is
+    reported rather than papered over.
+    """
+    try:
+        params = signature(delegate).parameters
+    except (TypeError, ValueError):
+        return False
+    if "preferred" in params:
+        return True
+    return any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+def font_report(size: int = 24, preferred: str | None = None) -> dict[str, Any]:
     """The overlay font that WOULD be used, and whether that is a fallback.
 
     This is the section the plan singles out: "this alone would have caught the
@@ -252,13 +299,32 @@ def font_report(size: int = 24) -> dict[str, Any]:
     ``load_default()`` — a bitmap face with no Unicode coverage — and rendered
     "Padrón" as "Padr▯n" while reporting complete success.
 
-    There is exactly ONE font resolution in this codebase:
-    ``image_compositor.probe_font``, the same call the renderer makes. This
-    function only translates its shape into the report's vocabulary. It
-    deliberately does NOT resolve fonts a second way — a diagnostic with its
-    own resolution order can report a face the overlay would never use, which
-    is the precise failure mode this page exists to remove. If the probe is
-    missing, that is reported as an error, not papered over.
+    Font resolution is delegated to ``image_compositor``; this function never
+    resolves a font a second way, because a parallel resolution order can name
+    a face the overlay would never load.
+
+    HONEST SCOPE, and it is narrower than this docstring used to claim. The
+    renderer resolves with the *user's* face:
+    ``resolve_font(size, preferred=self.style.font_family, candidates=_FONT_FALLBACKS)``
+    (``ImageCompositor._font``), and ``font_family`` is user-editable —
+    TranslationUI.py's "Font family" input feeds ``OverlayStyle(font_family=…)``
+    in TranslationBackend.py. An unqualified probe therefore agreed with the
+    renderer only while the configured family equalled ``FONT_CANDIDATES[0]``;
+    set "Arial Black.ttf" and it described a resolution the overlay never
+    performed.
+
+    ``probe_font`` now accepts ``preferred``, so ``preferred`` here means
+    "report the resolution for THIS face" and the answer is the renderer's own.
+    The capability is still DISCOVERED rather than assumed, via
+    ``inspect.signature``: against an older or stubbed ``image_compositor`` that
+    cannot take a face, the report refuses to guess — it names the requested
+    face and reports an error, rather than printing a ``resolved`` value for a
+    resolution nobody ran.
+
+    Still open, and not fixed here: TranslationUI.py / TranslationBackend.py
+    build the compositor per request, so no configured family reaches
+    ``collect()`` yet. ``collect()`` reads ``backend.overlay_font_family`` when
+    a backend chooses to expose it.
     """
     report: dict[str, Any] = {
         "requested": None,
@@ -282,12 +348,28 @@ def font_report(size: int = 24) -> dict[str, Any]:
     # report a face the renderer would never actually use.
     delegate = getattr(ic, "probe_font", None) or getattr(ic, "resolve_overlay_font", None)
     if callable(delegate):
+        kwargs: dict[str, Any] = {}
+        if preferred:
+            if _accepts_preferred(delegate):
+                kwargs["preferred"] = preferred
+            else:
+                # The renderer would resolve `preferred` first. This probe
+                # cannot, and reporting the unqualified answer under the user's
+                # requested name is the exact lie this section exists to kill.
+                report["requested"] = redact_path(preferred)
+                report["probe_source"] = f"image_compositor.{delegate.__name__}"
+                report["error"] = (
+                    f"{delegate.__name__} accepts no 'preferred' face, so the "
+                    f"resolution the overlay performs for {redact_path(preferred)!r} "
+                    "cannot be reported without resolving fonts a second way here"
+                )
+                return report
         try:
-            resolved = dict(delegate(size))
+            resolved = dict(delegate(size, **kwargs))
         except Exception as error:
             report["error"] = str(error)[:200]
             return report
-        requested = resolved.get("requested")
+        requested = preferred or resolved.get("requested")
         if requested is None:
             tried = resolved.get("tried") or []
             requested = tried[0] if tried else ic.OverlayStyle().font_family
@@ -363,7 +445,10 @@ def collect(backend: Any = None) -> dict[str, Any]:
             getattr(backend, "probe_local_llm", None),
         ),
         "speech": speech_report(),
-        "font": font_report(),
+        # If the caller knows which face the overlay is configured with, the
+        # report describes THAT resolution; otherwise it describes the default
+        # one and says so rather than mislabelling it.
+        "font": font_report(preferred=getattr(backend, "overlay_font_family", None)),
         "browser": browser_placeholder(),
     }
 

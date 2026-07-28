@@ -18,6 +18,7 @@ test is meant to be verifying.
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -335,6 +336,173 @@ def test_paths_never_expose_the_home_directory():
     assert redacted.startswith("~/")
     assert diagnostics.redact_path(r"C:\\Windows\\Fonts\\arial.ttf") == "arial.ttf"
     assert diagnostics.redact_path(None) is None
+
+
+# The CI matrix's first run turned this from theory into a recorded fact:
+# windows-latest passed and both ubuntu-latest and macos-14 failed, because
+# redaction was reducing a path to its basename with HOST separator semantics.
+# On POSIX a Windows path contains no recognised separator, so nothing was
+# stripped and the full path leaked into a report meant to be pasted in public.
+# These tests pin the property that killed it: the answer is a function of the
+# INPUT ONLY, never of the machine running the test.
+
+WINDOWS_STYLE = [
+    (r"C:\Windows\Fonts\arial.ttf", "arial.ttf"),
+    (r"\\fileserver\share\fonts\DejaVuSans.ttf", "DejaVuSans.ttf"),
+    (r"C:\Users\david.neish\AppData\Local\x.ttf", "x.ttf"),
+    (r"fonts\arial.ttf", "arial.ttf"),
+]
+POSIX_STYLE = [
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVuSans.ttf"),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", "Arial.ttf"),
+    ("/home/david/.fonts/secret_project.ttf", "secret_project.ttf"),
+    ("fonts/arial.ttf", "arial.ttf"),
+]
+MIXED_STYLE = [
+    (r"C:/Windows\Fonts/arial.ttf", "arial.ttf"),
+    (r"/usr/share\fonts/arial.ttf", "arial.ttf"),
+    (r"C:\\Windows\\Fonts\\arial.ttf", "arial.ttf"),
+]
+
+
+@pytest.mark.parametrize("raw,expected", WINDOWS_STYLE + POSIX_STYLE + MIXED_STYLE)
+def test_redaction_is_identical_whichever_os_style_it_is_handed(raw, expected):
+    """Every one of these must hold on Windows, Linux and macOS alike. The
+    ubuntu/macos CI failure was precisely a Windows-style input surviving
+    unredacted on a POSIX host."""
+    assert diagnostics.redact_path(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", WINDOWS_STYLE + POSIX_STYLE + MIXED_STYLE)
+def test_redaction_never_returns_a_path_shaped_value(raw, expected):
+    """The failure mode was a leak, not a wrong basename: assert the ESCAPE,
+    not just the happy value. Nothing separator-shaped may survive."""
+    out = diagnostics.redact_path(raw)
+    assert "/" not in out and "\\" not in out
+    assert ":" not in out            # no drive letter, no UNC remnant
+    assert "david" not in out.casefold()
+
+
+def test_redaction_does_not_consult_the_host_separator(monkeypatch):
+    """A prompt is not a mechanism, and neither is a comment: prove the code is
+    separator-agnostic by lying about the host separator and demanding the same
+    answers. If anything still branched on os.sep / os.path semantics, one of
+    the two styles would change its answer here."""
+    monkeypatch.setattr(os, "sep", "/")
+    monkeypatch.setattr(os, "altsep", None)
+    assert diagnostics.redact_path(r"C:\Windows\Fonts\arial.ttf") == "arial.ttf"
+    assert diagnostics.redact_path("/usr/share/fonts/arial.ttf") == "arial.ttf"
+    monkeypatch.setattr(os, "sep", "\\")
+    monkeypatch.setattr(os, "altsep", "/")
+    assert diagnostics.redact_path(r"C:\Windows\Fonts\arial.ttf") == "arial.ttf"
+    assert diagnostics.redact_path("/usr/share/fonts/arial.ttf") == "arial.ttf"
+
+
+def test_a_bare_basename_is_left_alone():
+    assert diagnostics.redact_path("DejaVuSans.ttf") == "DejaVuSans.ttf"
+    assert diagnostics.redact_path("Arial Black.ttf") == "Arial Black.ttf"
+
+
+def test_empty_and_rootlike_inputs_are_none_not_a_crash():
+    for raw in (None, "", "/", "\\", "//", "."):
+        assert diagnostics.redact_path(raw) is None
+
+
+@pytest.mark.parametrize("style", ["native", "posix", "windows"])
+def test_a_home_path_becomes_tilde_in_either_path_style(style, monkeypatch):
+    """The home directory is the secret being protected, so it must collapse to
+    '~' whether the path arrives with '/' or '\\' — a Windows app can hand the
+    diagnostic either."""
+    fake_home = Path("C:\\Users\\testuser") if style == "windows" else Path("/home/testuser")
+    monkeypatch.setattr(diagnostics.Path, "home", classmethod(lambda cls: fake_home))
+    raws = {
+        "native": str(fake_home / "fonts" / "x.ttf"),
+        "posix": "/home/testuser/fonts/x.ttf",
+        "windows": r"C:\Users\testuser\fonts\x.ttf",
+    }
+    out = diagnostics.redact_path(raws[style])
+    assert out == "~/fonts/x.ttf"
+    assert "testuser" not in out
+
+
+def test_home_itself_redacts_to_tilde_and_leaks_nothing():
+    assert diagnostics.redact_path(Path.home()) == "~"
+    assert Path.home().name not in diagnostics.redact_path(Path.home())
+
+
+def test_pathlike_and_str_inputs_agree():
+    p = Path.home() / "fonts" / "x.ttf"
+    assert diagnostics.redact_path(p) == diagnostics.redact_path(str(p))
+
+
+# ───────────────────── the font actually in use ─────────────────────── #
+
+def test_font_report_asks_about_the_face_the_overlay_would_actually_use():
+    """The renderer resolves with the USER's font_family (ImageCompositor._font
+    passes preferred=self.style.font_family). A diagnostic that always probes
+    the default face reports a resolution the overlay never performed — the
+    exact bug class this page exists to remove. So when a face is named, either
+    the probe honours it or the report says it could not."""
+    import image_compositor as ic
+
+    report = diagnostics.font_report(preferred="Arial Black.ttf")
+    assert report["requested"] == "Arial Black.ttf"
+    if diagnostics._accepts_preferred(ic.probe_font):
+        truth = ic.probe_font(24, preferred="Arial Black.ttf")
+        assert report["resolved"] == (
+            diagnostics.redact_path(truth["resolved"]) or "PIL.ImageFont.load_default")
+    else:
+        # Honest refusal, not a fabricated answer.
+        assert report["resolved"] is None
+        assert "preferred" in (report["error"] or "")
+
+
+def test_font_report_forwards_the_preferred_face_when_the_probe_accepts_it(monkeypatch):
+    """Mechanism, not intention: prove the preference reaches the resolver."""
+    import image_compositor as ic
+    seen = {}
+
+    def fake_probe(size=24, *, preferred=None):
+        seen["preferred"] = preferred
+        return {"resolved": r"C:\Windows\Fonts\ariblk.ttf", "fallback": False,
+                "kind": "truetype", "tried": [preferred], "size": size}
+
+    monkeypatch.setattr(ic, "probe_font", fake_probe)
+    report = diagnostics.font_report(preferred="Arial Black.ttf")
+    assert seen["preferred"] == "Arial Black.ttf"
+    assert report["requested"] == "Arial Black.ttf"
+    assert report["resolved"] == "ariblk.ttf"
+    assert report["fell_back"] is True     # ariblk.ttf is not what was asked for
+
+
+def test_font_report_refuses_to_answer_for_a_face_the_probe_cannot_resolve(monkeypatch):
+    """When probe_font takes only `size`, reporting its unqualified answer under
+    the user's requested name would claim a resolution nobody ran."""
+    import image_compositor as ic
+
+    monkeypatch.setattr(ic, "probe_font", lambda size=24: {
+        "resolved": "DejaVuSans.ttf", "fallback": False, "kind": "truetype",
+        "tried": ["DejaVuSans.ttf"], "size": size})
+    report = diagnostics.font_report(preferred="Arial Black.ttf")
+    assert report["requested"] == "Arial Black.ttf"
+    assert report["resolved"] is None
+    assert "DejaVuSans" not in json.dumps(report)
+    assert report["error"]
+
+
+def test_font_report_without_a_preference_is_unchanged(monkeypatch):
+    import image_compositor as ic
+
+    report = diagnostics.font_report()
+    assert report["probe_source"] == "image_compositor.probe_font"
+    assert report["error"] is None
+
+
+def test_collect_carries_a_backends_configured_face_into_the_font_report():
+    class Backend:
+        overlay_font_family = "Arial Black.ttf"
+
+    assert diagnostics.collect(Backend())["font"]["requested"] == "Arial Black.ttf"
 
 
 def test_full_report_leaks_no_secrets(monkeypatch):

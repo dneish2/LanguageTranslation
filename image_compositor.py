@@ -91,12 +91,27 @@ def resolve_font(
     }
 
 
-def probe_font(size: int = 24) -> dict[str, Any]:
+def probe_font(
+    size: int = 24,
+    *,
+    preferred: str | None = None,
+    candidates: Sequence[str] = FONT_CANDIDATES,
+) -> dict[str, Any]:
     """Structured font capability report, without the font object.
 
     Importable and side-effect free — this is the shape /diagnostics consumes.
+
+    ``preferred`` exists so the diagnostic can ask about the face the overlay
+    would ACTUALLY use. ``ImageCompositor._font`` resolves with
+    ``preferred=self.style.font_family``, which is user-editable; a probe that
+    could only ask with ``preferred=None`` described a resolution the renderer
+    never performed whenever that field was changed. Same arguments in, same
+    resolution order out — this forwards to ``resolve_font`` rather than
+    reimplementing the search, because a parallel order can name a face the
+    overlay would never load.
     """
-    return {k: v for k, v in resolve_font(size).items() if k != "font"}
+    resolution = resolve_font(size, preferred=preferred, candidates=candidates)
+    return {k: v for k, v in resolution.items() if k != "font"}
 
 
 @dataclass
