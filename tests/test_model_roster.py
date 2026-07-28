@@ -446,3 +446,80 @@ def test_translate_chunk_returns_a_url_fragment_untouched(monkeypatch):
 
     assert backend._translate_chunk("for-struggling-office-market/", "Spanish") == \
         "for-struggling-office-market/"
+
+
+def _tiny_jpeg(width=200, height=100):
+    from io import BytesIO as _B
+    from PIL import Image as _I
+    buf = _B(); _I.new("RGB", (width, height), (255, 255, 255)).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def test_pixel_bbox_scales_fractions_and_rejects_junk():
+    img = _tiny_jpeg(200, 100)
+
+    assert tb._pixel_bbox([0.1, 0.2, 0.5, 0.6], img) == [20, 20, 100, 60]
+    # Already pixels (any value > 1) is passed through, not rescaled.
+    assert tb._pixel_bbox([20, 20, 100, 60], img) == [20, 20, 100, 60]
+    # Swapped corners are normalised rather than dropped.
+    assert tb._pixel_bbox([100, 60, 20, 20], img) == [20, 20, 100, 60]
+    # Junk yields None so the caller simply doesn't draw that block.
+    for junk in (None, [], [1, 2, 3], "0,0,1,1", [0, 0, "x", 1], [0.5, 0.5, 0.5, 0.5]):
+        assert tb._pixel_bbox(junk, img) is None
+
+
+def test_pixel_bbox_clamps_to_the_image():
+    img = _tiny_jpeg(200, 100)
+    assert tb._pixel_bbox([-50, -50, 400, 400], img) == [0, 0, 200, 100]
+
+
+def test_overlay_font_resolves_a_real_face_with_unicode_coverage():
+    """PIL only searches a few system dirs and "DejaVuSans.ttf" is not among
+    them on Windows, so every _font() call fell through to load_default() —
+    a tiny bitmap face that rendered "Padrón" as "Padr▯n" and "€8.50" as
+    "▯8.50". In a translation overlay the glyphs ARE the output."""
+    from image_compositor import ImageCompositor
+
+    font = ImageCompositor()._font(24)
+
+    assert font.__class__.__name__ == "FreeTypeFont", "fell back to the bitmap default face"
+    assert font.getbbox("Padrón €")[2] > 0
+
+
+def test_batched_block_translation_falls_back_per_block_on_a_bad_response(monkeypatch):
+    """One context-carrying call replaced 24 blind ones (the menu heading
+    "ENTRANTES" used to come back as "INSULTS"). If that call returns junk,
+    every block must still get translated."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    backend._create_chat_completion_with_retry = lambda messages: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="not json at all"))])
+    backend.translate_text = lambda text, lang, **kw: f"<{text}>"
+
+    blocks = [{"source_text": "ENTRANTES", "translated_text": ""},
+              {"source_text": "Crema catalana", "translated_text": ""}]
+    backend._translate_blocks_together(blocks, "English")
+
+    assert [b["translated_text"] for b in blocks] == ["<ENTRANTES>", "<Crema catalana>"]
+
+
+def test_batched_block_translation_fills_from_one_call(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    calls = []
+
+    def one_call(messages):
+        calls.append(messages)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content='{"translations":[{"i":0,"text":"STARTERS"},{"i":1,"text":"Catalan cream"}]}'))])
+
+    backend._create_chat_completion_with_retry = one_call
+    backend.translate_text = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("fell back to per-block translation"))
+
+    blocks = [{"source_text": "ENTRANTES", "translated_text": ""},
+              {"source_text": "Crema catalana", "translated_text": ""}]
+    backend._translate_blocks_together(blocks, "English")
+
+    assert len(calls) == 1
+    assert [b["translated_text"] for b in blocks] == ["STARTERS", "Catalan cream"]
