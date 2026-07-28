@@ -6,6 +6,7 @@ import json
 import time
 import secrets
 import uuid
+from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 from threading import Thread
@@ -19,11 +20,13 @@ from starlette.responses import Response, JSONResponse, StreamingResponse
 import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
 from TranslationBackend import (
+    OLLAMA_BASE_URL,
     TranslationBackend,
     TranslationRunState,
     SUPPORTED_DOCUMENT_EXTENSIONS,
 )
 from passage.ui.common import LANGUAGES, log_event as _log_event
+from passage import provider_profiles
 from passage.auth.jwt_verify import identity_from_auth_header
 from passage.ui.voice_page import VoicePageMixin
 
@@ -263,6 +266,110 @@ class TranslationUI(VoicePageMixin):
             ui.button("Voice", on_click=lambda: ui.navigate.to("/voice"))\
                 .props("flat no-caps")\
                 .classes("p-mode-tab")
+            profile = self.active_profile
+            ui.button(profile.describe() if profile else "Engine",
+                      icon="tune", on_click=self.open_engine_settings)\
+                .props("flat no-caps dense")\
+                .classes("p-mode-tab ml-auto")\
+                .tooltip("Choose where translation runs")
+
+    def open_engine_settings(self) -> None:
+        """Choose where translation runs: Passage's key, a local model, or your
+        own endpoint. Session-scoped — see the active_profile property."""
+        current = self.active_profile
+        with ui.dialog() as dialog, ui.card().classes(f"w-full max-w-xl {theme.WELL} p-5 gap-3"):
+            ui.label("Translation engine").classes("p-display text-lg")
+            ui.label(
+                "Bring your own endpoint and key and Passage stops metering the "
+                "work — it isn't paying for it, so it shouldn't bill for it."
+            ).classes("text-sm p-muted-text")
+
+            kind = ui.radio(
+                {
+                    provider_profiles.KIND_APP: "Passage hosted (metered)",
+                    provider_profiles.KIND_LOCAL: "Local model on this machine",
+                    provider_profiles.KIND_BYO: "My own endpoint and key",
+                },
+                value=current.kind if current else provider_profiles.KIND_APP,
+            ).props("inline")
+
+            base_url = ui.input(
+                "Base URL", placeholder="https://api.example.com/v1",
+                value=(current.base_url if current else "") or "",
+            ).classes("w-full")
+            api_key = ui.input(
+                "API key", placeholder="sk-…",
+                value="",
+            ).props("type=password").classes("w-full")
+            if current and current.api_key:
+                ui.label(f"A key is already saved for this session ({current.redacted()['api_key_hint']}). "
+                         "Leave blank to keep it.").classes("text-xs p-muted-text")
+            model = ui.input(
+                "Model", placeholder="qwen2.5:7b",
+                value=(current.model if current else "") or "",
+            ).classes("w-full")
+            status = ui.label("").classes("text-sm")
+
+            def build() -> tuple[Any, str | None]:
+                chosen = kind.value
+                if chosen == provider_profiles.KIND_APP:
+                    return None, None
+                if chosen == provider_profiles.KIND_LOCAL and not base_url.value.strip():
+                    base_url.value = OLLAMA_BASE_URL
+                key = api_key.value.strip() or (current.api_key if current else "")
+                problem = provider_profiles.validate(base_url.value, key, model.value)
+                if problem:
+                    return None, problem
+                return provider_profiles.ProviderProfile(
+                    label=model.value.strip() or "Custom",
+                    kind=chosen,
+                    base_url=base_url.value.strip(),
+                    api_key=key,
+                    model=model.value.strip(),
+                ), None
+
+            async def test() -> None:
+                profile, problem = build()
+                if problem:
+                    status.text = problem
+                    status.classes(replace="text-sm p-banner p-banner-negative")
+                    return
+                if profile is None:
+                    status.text = "Passage's hosted key needs no test."
+                    return
+                status.text = "Testing…"
+                status.classes(replace="text-sm p-muted-text")
+                result = await asyncio.to_thread(self.backend.test_profile, profile)
+                if result.get("ok"):
+                    status.text = (f"Connected — {result['model']} answered in "
+                                   f"{result['latency_ms']} ms: “{result['sample']}”")
+                    status.classes(replace="text-sm p-banner p-banner-positive")
+                else:
+                    status.text = f"Couldn't connect: {result.get('error', 'unknown error')}"
+                    status.classes(replace="text-sm p-banner p-banner-negative")
+
+            def save() -> None:
+                profile, problem = build()
+                if problem:
+                    status.text = problem
+                    status.classes(replace="text-sm p-banner p-banner-negative")
+                    return
+                self._set_active_profile(profile)
+                ui.notify(
+                    "Using Passage's hosted key." if profile is None
+                    else f"Using {profile.describe()} — this session is unmetered.",
+                    type="positive",
+                )
+                dialog.close()
+                # The header chip names the active engine, so it has to
+                # re-render too — refresh_upload_ui only rebuilds the workspace.
+                self._render_mode_tabs()
+                self.refresh_upload_ui()
+
+            with ui.row().classes("w-full justify-end gap-2 mt-1"):
+                ui.button("Test connection", on_click=test).classes(theme.BTN_SECONDARY_SM)
+                ui.button("Save", on_click=save).classes(theme.BTN_PRIMARY)
+        dialog.open()
 
     def set_workspace_mode(self, mode: str) -> None:
         self.input_mode = mode
@@ -1115,6 +1222,37 @@ class TranslationUI(VoicePageMixin):
         except RuntimeError:
             return []
 
+    @property
+    def active_profile(self):
+        """This visitor's chosen endpoint, or None for Passage's own default.
+
+        Same session-cookie-scoped storage as recent_threads, for the same
+        reason and one sharper: this may hold the user's own API key, which
+        must never be shared across sessions or written anywhere a second
+        visitor can read. Degrades to None outside a request context so a
+        storage failure falls back to the app default instead of raising on
+        the translation path.
+        """
+        try:
+            raw = app.storage.user.get("provider_profile")
+        except RuntimeError:
+            return None
+        if not raw:
+            return None
+        try:
+            return provider_profiles.from_stored(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _set_active_profile(self, profile) -> None:
+        try:
+            if profile is None:
+                app.storage.user.pop("provider_profile", None)
+            else:
+                app.storage.user["provider_profile"] = asdict(profile)
+        except RuntimeError:
+            LOGGER.info("No session storage; provider profile not persisted")
+
     def _record_thread(self, entry: dict) -> None:
         """Newest-first with dedupe: repeating a translation moves its thread
         to the top instead of stacking duplicates.
@@ -1268,6 +1406,7 @@ class TranslationUI(VoicePageMixin):
                 self.backend.translate_live,
                 cleaned_text,
                 language,
+                self.active_profile,
             )
             _log_event(
                 "ui.text_translate_succeeded",

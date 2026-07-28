@@ -28,6 +28,8 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
 
+from passage import provider_profiles as pp
+
 from translation_metrics import MetricsCollector, TranslationMetrics
 from image_compositor import ImageCompositor, OverlayStyle
 
@@ -595,6 +597,7 @@ class TranslationBackend:
         # only for the keystroke path. Built lazily so boot never waits on it.
         self._live_provider: BaseTranslationProvider | None = None
         self._live_probe_at: float = 0.0
+        self._profile_providers: dict[tuple, BaseTranslationProvider] = {}
         self._live_reachable: bool = False
         self._jobs_lock = Lock()
         self._jobs: dict[str, TranslationJob] = {}
@@ -1009,6 +1012,58 @@ class TranslationBackend:
             logging.error("[Backend] translate_text error: %s", e, exc_info=True)
             raise
 
+    # ────────────────────────── PROVIDER PROFILES ───────────────────────── #
+
+    def provider_for_profile(self, profile) -> BaseTranslationProvider:
+        """A provider for this session's chosen endpoint.
+
+        Cached by (base_url, key, model) rather than by profile id: two sessions
+        pointing at the same local Ollama should share one client, and editing a
+        profile must produce a new one rather than silently reuse the old
+        settings. The cache holds clients, never decrypted state of its own.
+        """
+        if profile is None or profile.kind == pp.KIND_APP:
+            return self._require_provider()
+        fingerprint = (profile.base_url, profile.api_key, profile.model)
+        cached = self._profile_providers.get(fingerprint)
+        if cached is not None:
+            return cached
+        provider = ChatCompletionsProvider(
+            api_key=profile.api_key or "ollama",
+            base_url=profile.base_url or None,
+            text_model=profile.model or TEXT_MODEL,
+            max_input_chars=OLLAMA_MAX_INPUT_CHARS if profile.uses_local_inference else None,
+        )
+        self._profile_providers[fingerprint] = provider
+        return provider
+
+    def test_profile(self, profile) -> dict[str, Any]:
+        """Round-trip one tiny translation so 'Test connection' means the whole
+        path works — reachable, authorised, and the model actually answers —
+        rather than just that a socket opened."""
+        started = time.time()
+        try:
+            provider = self.provider_for_profile(profile)
+            completion = provider.create_chat_completion(
+                messages=self._live_prompt_messages("hello", "Spanish"), max_tokens=32,
+            )
+            reply = (completion.choices[0].message.content or "").strip()
+            if not reply:
+                return {"ok": False, "error": "The endpoint answered but returned no text."}
+            return {
+                "ok": True,
+                "latency_ms": int((time.time() - started) * 1000),
+                "model": provider.text_model,
+                "sample": reply[:80],
+            }
+        except Exception as error:
+            # Never surface the key, and never dump a raw SDK traceback here —
+            # this message goes straight into a settings dialog.
+            message = str(error)
+            if profile is not None and profile.api_key:
+                message = message.replace(profile.api_key, "…")
+            return {"ok": False, "error": message[:300]}
+
     # ───────────────────────── LIVE (KEYSTROKE) PATH ────────────────────── #
 
     def _live_local_provider(self) -> BaseTranslationProvider | None:
@@ -1094,23 +1149,38 @@ class TranslationBackend:
             {"role": "user", "content": text},
         ]
 
-    def translate_live(self, text: str, target_language: str) -> tuple[str, str]:
+    def translate_live(self, text: str, target_language: str, profile=None) -> tuple[str, str]:
         """Translate for the keystroke path. Returns (translation, engine_label).
 
-        Prefers a local model when one is reachable — free, and measurably
-        faster than hosted here — and falls back to the normal hosted path on
-        any failure so a flaky local endpoint can never break typing. The
-        engine label is returned rather than hidden: the user should be able to
-        see which model answered.
+        With an explicit profile the user has CHOSEN an endpoint, so honour it
+        rather than quietly substituting a local model — "I picked this and got
+        that" is exactly the surprise a provider picker exists to avoid. With no
+        profile, prefer a reachable local model (free, and measurably faster
+        here), falling back to hosted on any failure so a flaky local endpoint
+        can never break typing. Either way the engine label is returned rather
+        than hidden: the user should see which model answered.
         """
         text = text.replace("\t", " ").strip()
         if not text:
             return text, "none"
-        cache_key = self._normalize_cache_key(text, target_language, mode="translate")
+        cache_key = self._normalize_cache_key(
+            text, target_language, mode=f"live:{profile.id if profile else 'auto'}")
         cached = self.translation_cache.get(cache_key)
         if cached is not None:
             self.metrics.record_cache_hit()
             return cached, "cache"
+
+        if profile is not None and profile.kind != pp.KIND_APP:
+            masked, protected = _mask_protected_spans(text)
+            completion = self.provider_for_profile(profile).create_chat_completion(
+                messages=self._live_prompt_messages(masked, target_language), max_tokens=1000,
+            )
+            result = (completion.choices[0].message.content or "").strip()
+            if not result:
+                raise ValueError("The model returned an empty translation.")
+            result = _restore_protected_spans(result, protected)
+            self.translation_cache[cache_key] = result
+            return result, profile.describe()
 
         provider = self._live_local_provider()
         if provider is not None:
