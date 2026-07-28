@@ -132,3 +132,29 @@ def test_comparison_is_capped():
         _candidates(*[(f"m{i}", True) for i in range(20)]), lambda c: "ok")
 
     assert len(results) == compare.MAX_CANDIDATES
+
+
+def test_empty_output_from_a_thinking_model_is_explained():
+    """qwen3:30b and qwen3-vl:8b both showed as silent failures. Probed
+    directly, qwen3-vl reads a menu photo perfectly — its answer just lands in
+    a reasoning channel this endpoint doesn't expose. "returned no text" hides
+    a diagnosable cause."""
+    from types import SimpleNamespace
+
+    thinking = SimpleNamespace(content="", reasoning="Got it, let's list every line…")
+    results = compare.run_comparison(_candidates(("qwen3", True)), lambda c: thinking)
+
+    assert results[0].ok is False
+    assert "thinking model" in results[0].error
+
+
+def test_reasoning_text_is_never_used_as_the_translation():
+    """It is the model's working, not an answer. Passing it off as output is
+    exactly the fluent-but-wrong failure this codebase keeps designing against."""
+    from types import SimpleNamespace
+
+    thinking = SimpleNamespace(content="", reasoning="First, the title is 'LA TABERNA DEL MAR'…")
+    results = compare.run_comparison(_candidates(("qwen3", True)), lambda c: thinking)
+
+    assert results[0].text == ""
+    assert "TABERNA" not in (results[0].text or "")

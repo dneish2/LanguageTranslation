@@ -77,6 +77,27 @@ def estimate_cost(model: str, output_tokens: int | None, *, is_local: bool) -> f
     return rate * output_tokens / 1_000_000
 
 
+def describe_empty_output(message: Any) -> str:
+    """Why an engine returned nothing, when that is knowable.
+
+    The qwen3 family are thinking models. Through Ollama's OpenAI-compatible
+    shim their answer lands in `reasoning` and `content` comes back empty, so
+    qwen3:30b and qwen3-vl:8b both look like silent failures. Probed directly,
+    qwen3-vl reads a menu photo perfectly — the capability is there, it just
+    never reaches the field this app reads.
+
+    The reasoning text is deliberately NOT used as the answer: it is the
+    model's working ("Got it, let's list out every line…"), not a translation,
+    and passing it off as output would be exactly the kind of fluent-but-wrong
+    result this codebase keeps having to design against.
+    """
+    reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+    if reasoning:
+        return ("thinking model — answered in its reasoning channel, which this "
+                "endpoint doesn't expose as output")
+    return "returned no text"
+
+
 def _normalise(text: str) -> str:
     """Compare meaningfully: casing and punctuation spacing shouldn't read as
     disagreement when the words are identical."""
@@ -106,7 +127,7 @@ def score_agreement(results: list[CandidateResult]) -> None:
 
 def run_comparison(
     candidates: list[dict[str, Any]],
-    translate: Callable[[dict[str, Any]], str],
+    translate: Callable[[dict[str, Any]], Any],
     count_tokens: Callable[[str], int] | None = None,
 ) -> list[CandidateResult]:
     """Translate the same input with every candidate and score the results.
@@ -132,10 +153,15 @@ def run_comparison(
         )
         started = time.time()
         try:
-            result.text = (translate(candidate) or "").strip()
+            produced = translate(candidate)
+            # A translate() may hand back the raw message so an empty answer
+            # can be explained rather than just reported.
+            message = produced if not isinstance(produced, str) else None
+            result.text = ((message.content if message is not None else produced) or "").strip()
             result.latency_ms = int((time.time() - started) * 1000)
             if not result.text:
-                result.error = "returned no text"
+                result.error = (describe_empty_output(message) if message is not None
+                                else "returned no text")
             elif count_tokens is not None:
                 result.output_tokens = count_tokens(result.text)
                 result.cost_usd = estimate_cost(
