@@ -9,3 +9,6 @@ __pycache__/
 .nicegui/
 # Local voice models (large binaries, downloaded on demand)
 models/piper/
+
+# Scratch probes
+_*.py
