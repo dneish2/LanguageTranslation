@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import json
@@ -477,7 +478,7 @@ class TranslationUI(VoicePageMixin):
             multiple=False,
             auto_upload=True,
             on_upload=self.handle_mobile_image_upload,
-        ).props("accept=image/* capture=environment").classes("w-full")
+        ).props('accept=".png,.jpg,.jpeg,.webp" capture=environment').classes("w-full")
         if self.image_upload_name:
             ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm p-muted-text")
 
@@ -597,6 +598,7 @@ class TranslationUI(VoicePageMixin):
         result = self.image_translation_result or {}
         blocks = result.get("translated_blocks", [])
         confidence = result.get("confidence_metadata", {})
+        overlay_png = result.get("overlay_png")
         with self.result_container:
             with ui.column().classes(f"w-full max-w-3xl mx-auto gap-3 p-4 {theme.WELL}"):
                 ui.label(f"Image OCR translation → {language}").classes("p-display text-lg")
@@ -604,6 +606,20 @@ class TranslationUI(VoicePageMixin):
                     f"Confidence avg: {confidence.get('average_confidence', 0)} "
                     f"across {confidence.get('block_count', 0)} blocks"
                 ).classes(theme.DATA)
+                # The translated-in-place picture. This is the answer for
+                # "point your phone at a menu": reading a two-column list of
+                # blocks means holding the phone AND the menu and matching them
+                # up by eye, which is most of the work the feature exists to do.
+                if overlay_png:
+                    encoded = base64.b64encode(overlay_png).decode("ascii")
+                    ui.label("Translated in place").classes("p-data")
+                    ui.image(f"data:image/png;base64,{encoded}")\
+                        .classes("w-full rounded")\
+                        .style("max-height: 70vh; object-fit: contain")
+                    ui.label(
+                        f"{result.get('placed_block_count', 0)} of "
+                        f"{confidence.get('block_count', 0)} blocks positioned"
+                    ).classes(theme.DATA)
                 for idx, block in enumerate(blocks, start=1):
                     with ui.grid(columns=2).classes("w-full gap-2"):
                         with ui.column().classes("w-full gap-1"):

@@ -183,6 +183,37 @@ _PROTECTED_SPAN_RE = re.compile(
 _PLACEHOLDER_RE = re.compile(r"\[\[\s*PSG\s*:\s*(\d+)\s*\]\]")
 
 
+def _pixel_bbox(raw: Any, image_bytes: bytes) -> list[int] | None:
+    """Convert a model-reported bbox to pixel coords, or None if unusable.
+
+    The vision model is asked for fractions of width/height, but it is a model:
+    it sometimes answers in pixels anyway, swaps the corners, or returns
+    something that isn't four numbers. Anything that doesn't survive these
+    checks yields None, and the caller simply doesn't draw that block —
+    a missing overlay box is a far better failure than one covering the
+    whole photo.
+    """
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    try:
+        values = [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return None
+    with Image.open(BytesIO(image_bytes)) as img:
+        width, height = img.size
+    # Fractions if everything is within 0..1; otherwise assume pixels already.
+    if all(0.0 <= v <= 1.0 for v in values):
+        values = [values[0] * width, values[1] * height,
+                  values[2] * width, values[3] * height]
+    x0, x1 = sorted((values[0], values[2]))
+    y0, y1 = sorted((values[1], values[3]))
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(width, int(x1)), min(height, int(y1))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    return [x0, y0, x1, y1]
+
+
 #: A whitespace-free token made of URL-path characters, carrying at least one
 #: structural marker (slash, dot, or two-plus hyphens).
 _URL_FRAGMENT_RE = re.compile(
@@ -1024,6 +1055,50 @@ class TranslationBackend:
         partials.append(final_translation)
         return final_translation, partials
 
+    def _translate_blocks_together(self, blocks: list[dict[str, Any]], target_language: str) -> None:
+        """Fill each block's translated_text in one context-carrying call.
+
+        Mutates `blocks` in place. Any entry the model fails to return falls
+        back to a single-block translation, so a malformed batch degrades to
+        the old behaviour instead of losing text.
+        """
+        if not blocks:
+            return
+        numbered = "\n".join(f"{i}. {b['source_text']}" for i, b in enumerate(blocks))
+        masked, protected = _mask_protected_spans(numbered)
+        prompt = (
+            f"The numbered lines below are text blocks read off a single image, "
+            f"in reading order. Translate each into {target_language}, using the "
+            "other lines as context to disambiguate short or ambiguous ones "
+            "(a lone word is usually a heading or a label, not a sentence). "
+            "Keep prices, numbers and proper nouns as they are. Placeholders "
+            "like [[PSG:0]] must be copied through exactly. "
+            'Return JSON of the exact shape {"translations":[{"i":0,"text":"..."}]} '
+            "with one entry per input line and no lines omitted.\n\n"
+            f"{masked}"
+        )
+        try:
+            completion = self._create_chat_completion_with_retry([
+                {"role": "system", "content":
+                    f"You translate to {target_language} and return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ])
+            payload = json.loads((completion.choices[0].message.content or "").strip())
+            by_index = {
+                int(item["i"]): _restore_protected_spans(str(item.get("text", "")), protected)
+                for item in payload.get("translations", [])
+                if str(item.get("i", "")).lstrip("-").isdigit()
+            }
+        except Exception as error:
+            logging.warning("[Backend] batched block translation failed (%s); per-block fallback", error)
+            by_index = {}
+
+        for i, block in enumerate(blocks):
+            text = (by_index.get(i) or "").strip()
+            if not text:
+                text = self.translate_text(block["source_text"], target_language)
+            block["translated_text"] = text
+
     def _translate_text_with_context(
         self,
         text: str,
@@ -1078,10 +1153,19 @@ class TranslationBackend:
             raise ValueError("Image payload is empty.")
 
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        # bbox is requested in NORMALISED coordinates (0-1) so the answer does
+        # not depend on the model knowing the pixel dimensions, and so the same
+        # numbers survive any resize. Without it there is nothing to position an
+        # overlay with, which is why the composed "translated in place" image
+        # could never be built from this path.
         prompt = (
             "Extract all readable text from this image and return JSON with this exact shape: "
-            '{"recognized_blocks":[{"text":"...", "confidence":0.0}]}. '
-            "Confidence must be between 0 and 1."
+            '{"recognized_blocks":[{"text":"...", "confidence":0.0, '
+            '"bbox":[x0,y0,x1,y1]}]}. '
+            "Confidence must be between 0 and 1. bbox is the tight box around "
+            "that text, as fractions of the image width/height between 0 and 1, "
+            "ordered left, top, right, bottom. Group each visual line as one "
+            "block; do not merge separate lines."
         )
         messages = [
             {"role": "system", "content": "You are an OCR extraction assistant. Return valid JSON only."},
@@ -1109,13 +1193,20 @@ class TranslationBackend:
             if not source_text:
                 continue
             confidence = float(block.get("confidence", 0.0))
-            translated_text = self.translate_text(source_text, target_language)
             translated_blocks.append({
                 "source_text": source_text,
-                "translated_text": translated_text,
+                "translated_text": "",  # filled in below, with page context
                 "confidence": confidence,
+                "bbox": _pixel_bbox(block.get("bbox"), image_bytes),
             })
             confidences.append(confidence)
+
+        # Translate every block in ONE call that can see the whole page.
+        # Translating each block alone both cost 24 model calls for a single
+        # photo and produced nonsense on short blocks with no context: the
+        # menu heading "ENTRANTES" came back as "INSULTS", because nothing
+        # told the model it was reading a menu.
+        self._translate_blocks_together(translated_blocks, target_language)
 
         if not translated_blocks:
             raise ValueError("No valid OCR blocks were returned.")
@@ -1123,9 +1214,25 @@ class TranslationBackend:
         if avg_confidence < 0.45:
             raise ValueError("Low OCR confidence. Please retake the image in better lighting.")
 
+        # The "translated in place" image: the whole point of pointing a phone
+        # at a menu. Only blocks with a usable bbox are drawn.
+        placed = [
+            {"bbox": b["bbox"], "original": b["source_text"],
+             "translated": b["translated_text"], "direction": "ltr"}
+            for b in translated_blocks if b.get("bbox")
+        ]
+        overlay_png = None
+        if placed:
+            try:
+                overlay_png = ImageCompositor(OverlayStyle()).compose(image_bytes, placed)
+            except Exception as error:  # never lose the translation over the picture
+                logging.warning("[Backend] overlay composition failed: %s", error)
+
         return {
             "recognized_blocks": recognized_blocks,
             "translated_blocks": translated_blocks,
+            "overlay_png": overlay_png,
+            "placed_block_count": len(placed),
             "confidence_metadata": {
                 "average_confidence": round(avg_confidence, 4),
                 "min_confidence": round(min(confidences), 4),
