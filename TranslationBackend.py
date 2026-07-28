@@ -1111,15 +1111,19 @@ class TranslationBackend:
 
     def compare_translations(self, text: str, target_language: str, candidates: list[dict[str, Any]]):
         """Translate `text` with every candidate and return scored rows."""
-        def translate_with(candidate: dict[str, Any]) -> str:
+        def translate_with(candidate: dict[str, Any]):
             profile = candidate.get("profile")
             provider = self.provider_for_profile(profile) if profile else self._require_provider()
             masked, protected = _mask_protected_spans(text)
             completion = provider.create_chat_completion(
                 messages=self._live_prompt_messages(masked, target_language), max_tokens=1200,
             )
-            return _restore_protected_spans(
-                (completion.choices[0].message.content or "").strip(), protected)
+            message = completion.choices[0].message
+            if not (message.content or "").strip():
+                # Hand the message back so an empty answer can be explained
+                # (thinking models answer in a channel this endpoint hides).
+                return message
+            return _restore_protected_spans(message.content.strip(), protected)
 
         return compare.run_comparison(candidates, translate_with, self.calculate_tokens)
 
