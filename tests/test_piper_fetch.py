@@ -27,6 +27,35 @@ from passage import local_voice
 from TranslationBackend import TranslationBackend
 
 
+@pytest.fixture(autouse=True)
+def _no_test_may_download_whisper_weights(monkeypatch):
+    """No test in this file may pull the 142MB recogniser. Asserted, not hoped.
+
+    `prefetch_voice` used to call `prefetch_whisper()` above its own `enabled()`
+    guard, so the prefetch tests below — which stub `_fetch_url` (Piper) and
+    nothing else — really did leave 142MB of
+    models--Systran--faster-whisper-base on disk, reproduced 3x from an empty
+    HF cache. Worse, it corrupted a fresh-machine verification by making the
+    machine non-fresh partway through the run.
+
+    `_whisper()` IS the download, so it is replaced with a recorder and the
+    recording is asserted at teardown. It cannot be asserted inline: the fetch
+    runs in a daemon thread whose exceptions `prefetch_whisper` swallows by
+    design, so a raising stub would fail silently — the exact shape of the
+    original regression.
+    """
+    loads: list[str] = []
+    monkeypatch.setattr(local_voice, "_whisper", lambda: loads.append("_whisper"))
+    # These are the SYNTHESIS tests; recognition is exercised in
+    # test_stt_readiness.py. Holding the recogniser absent here keeps them
+    # identical on a fresh machine and on this one (whose HF cache really does
+    # hold faster-whisper-base), instead of behaving differently by accident.
+    monkeypatch.setattr(local_voice, "whisper_installed", lambda: False)
+    yield
+    time.sleep(0.1)   # give any daemon fetch thread the chance to be caught
+    assert loads == [], "a voice test reached the Whisper downloader"
+
+
 class _StubProvider:
     """Stands in for the hosted provider, recording that it was the one used."""
 

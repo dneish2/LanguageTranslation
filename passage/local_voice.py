@@ -190,19 +190,56 @@ def whisper_repo_id() -> str:
 def _hf_cache_roots() -> list[Path]:
     """Where Hugging Face may have put the weights, most specific first.
 
-    Read per call, not at import: the tests point HF_HUB_CACHE at an empty
-    directory to simulate a fresh machine, and /engines must re-probe after a
-    download rather than answer from a frozen constant.
+    This MIRRORS huggingface_hub/constants.py exactly — HF_HUB_CACHE, then the
+    legacy HUGGINGFACE_HUB_CACHE, else <HF_HOME>/hub where HF_HOME itself
+    defaults to $XDG_CACHE_HOME/huggingface (and only then ~/.cache/huggingface),
+    with expanduser AND expandvars applied the way HF applies them.
+
+    The earlier version re-derived a SUBSET of that chain and got three things
+    wrong: XDG_CACHE_HOME ignored, legacy HUGGINGFACE_HUB_CACHE ignored, and no
+    expansion, so ``HF_HOME=~/hfcache`` sent this probe to a literal directory
+    named "~". Each divergence has the same consequence, and it is the bad one:
+    faster-whisper loads the weights fine from the real cache, but this probe
+    never sees them, so `whisper_weights_present()` stays False, `stt_state()`
+    stays "not_downloaded", `enabled()`/`stt_available()` stay False, and every
+    recording goes HOSTED forever while /engines explains it is waiting for a
+    download that already happened. A misread cache path is a privacy
+    regression, not a cosmetic one.
+
+    Deliberately NOT `from huggingface_hub import constants`: those constants are
+    frozen at ITS import, so a process (or a test) that sets the variables later
+    would get a stale answer — and on this machine that stale answer is the real
+    cache, which would silently un-simulate every fresh-machine test. The test
+    suite instead reloads hf's own constants under each layout and asserts this
+    function agrees, so the duplication cannot drift again.
+
+    Read per call, not at import, for the same reason: /engines must re-probe
+    after a download rather than answer from a frozen constant.
     """
     roots: list[Path] = []
-    hub = os.getenv("HF_HUB_CACHE")
-    if hub:
-        roots.append(Path(hub))
-    home = os.getenv("HF_HOME")
-    if home:
-        roots.append(Path(home) / "hub")
-    if not roots:
-        roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+    def add(raw: str | os.PathLike[str] | None) -> None:
+        if not raw:
+            return
+        path = Path(os.path.expandvars(os.path.expanduser(str(raw))))
+        if path not in roots:
+            roots.append(path)
+
+    default_home = os.path.join(os.path.expanduser("~"), ".cache")
+    hf_home = os.path.expandvars(os.path.expanduser(os.getenv(
+        "HF_HOME",
+        os.path.join(os.getenv("XDG_CACHE_HOME", default_home), "huggingface"),
+    )))
+    legacy = os.getenv("HUGGINGFACE_HUB_CACHE")
+    default_cache = os.path.join(hf_home, "hub")
+
+    # 1. exactly what huggingface_hub resolves HF_HUB_CACHE to.
+    add(os.getenv("HF_HUB_CACHE") or legacy or default_cache)
+    # 2. tolerant extras: a machine can carry weights fetched under an earlier
+    #    layout, and reading one directory too many can only ever find weights
+    #    that are genuinely on disk — it cannot invent readiness.
+    add(legacy)
+    add(default_cache)
     return roots
 
 
@@ -615,12 +652,20 @@ def prefetch_voice(language: str | None) -> None:
     that translation goes hosted and says so. Nothing blocks on this.
     """
     # Downloads follow the same switch synthesis does — `enabled()`, the
-    # tri-state above — so we can never fetch 63MB for a feature that is off.
+    # tri-state above — so we can never fetch for a feature that is off. That
+    # guard comes FIRST. It briefly did not: `prefetch_whisper()` was called
+    # above this line and its own guards only checked mode()=="off", so a user
+    # with faster_whisper importable, no voices, no weights and the flag unset —
+    # `enabled()` False, every recording hosted — still started a 142MB download
+    # on page render. That quietly turned DECISIONS.md §2 from "on when the
+    # models are present" into "download them to make them present".
+    if not enabled():
+        return
     # Recognition is language-independent, so it is fetched from the same hook
     # rather than waiting for a language the user may never pick. Its own guards
     # make this a no-op whenever the weights are already there.
     prefetch_whisper()
-    if not enabled() or voice_installed(language):
+    if voice_installed(language):
         return
     if VOICE_PREFIXES.get(_lang_key(language)) is None:
         return
@@ -656,7 +701,14 @@ def prefetch_whisper() -> None:
     once this has actually finished.
     """
     global _whisper_prefetch_lock, _whisper_prefetch_started
-    if mode() == _OFF or not whisper_installed() or whisper_weights_present():
+    # `enabled()`, not `mode() != "off"`: the switch that decides whether audio
+    # is processed locally is the same switch that decides whether we may spend
+    # 142MB of someone's bandwidth preparing for it. Enforced HERE, at the
+    # download site, so no future caller can reach the fetch by forgetting a
+    # guard of its own. Under "auto" this means we only pull the recogniser for
+    # a machine where local voice is already a real capability; forced-on
+    # (PASSAGE_LOCAL_VOICE=1) is the explicit opt-in that bootstraps it.
+    if not enabled() or not whisper_installed() or whisper_weights_present():
         return
 
     import threading
