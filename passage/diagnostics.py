@@ -145,6 +145,10 @@ def local_llm_report(
     separately, because the listing is exactly what the app itself uses
     (§2.6: probe what the app uses, not a generic notion of capability).
 
+    ``reachable`` is tri-state: True, False, or ``None`` for "not asked yet"
+    (a probe still in flight, which reports ``outcome: probing``). None is
+    never coerced to False — see the update block below.
+
     An empty list is reported as ``reachable: False`` with ``models: []`` —
     never as an absent section. The plan's §2.3 warning applies here: a 0.6 s
     probe timeout on a loaded machine yields a false negative that looks
@@ -180,8 +184,15 @@ def local_llm_report(
             return report
         models = [m for m in (raw.get("models") or [])
                   if "embed" not in m]
+        # "we have not asked yet" (reachable=None, outcome "probing") is NOT
+        # the same fact as "we asked and nothing answered" (reachable=False),
+        # and bool() used to collapse them — asserting unreachability for the
+        # whole probe budget before a single packet had left the machine. A
+        # probe dict with no ``reachable`` key at all is still False: that is
+        # a degenerate answer, not an unasked question.
+        raw_reachable = raw["reachable"] if "reachable" in raw else False
         report.update({
-            "reachable": bool(raw.get("reachable")),
+            "reachable": None if raw_reachable is None else bool(raw_reachable),
             "models": models,
             "model_count": len(models),
             "outcome": raw.get("outcome"),
@@ -453,6 +464,36 @@ def collect(backend: Any = None) -> dict[str, Any]:
     }
 
 
+def describe_reachable(value: Any) -> str:
+    """How the pasteable block renders a tri-state reachability.
+
+    ``None`` means the probe had not answered when the block was built. It is
+    printed in words, because "False" read on a phone three time zones away is
+    indistinguishable from a real negative result."""
+    if value is None:
+        return "unknown (not asked yet)"
+    return str(bool(value))
+
+
+def describe_probe_freshness(llm: dict[str, Any]) -> str:
+    """The age line the COPY block carries.
+
+    The page renders freshness in its own ui.label, but the label is not what
+    Copy puts on the clipboard — and the clipboard is the artifact designed to
+    leave the machine (PORTABILITY_PLAN Phase E: a human pasting this back from
+    an M1 or a phone). An undated paste is a guess presented as a reading, so
+    the age travels inside the text, not beside it."""
+    if llm.get("pending"):
+        return "probe freshness: probe in flight — no answer yet (cached: False)"
+    age = llm.get("age_seconds")
+    if age is None:
+        return "probe freshness: taken inline for this report (cached: False)"
+    ttl = llm.get("ttl_seconds")
+    return (f"probe freshness: {float(age):.1f}s old"
+            f" (cached: {bool(llm.get('cached'))}"
+            + (f", re-probed after {ttl} s)" if ttl is not None else ")"))
+
+
 def format_text(report: dict[str, Any]) -> str:
     """A copy-pasteable block. Phase E is a human on a phone pasting this back,
     so it has to survive a mobile clipboard: flat ``key: value`` lines, no
@@ -467,11 +508,12 @@ def format_text(report: dict[str, Any]) -> str:
         f"os: {p.get('system')} {p.get('release')} / {p.get('machine')} / {p.get('processor_arch')}",
         f"python: {p.get('python_version')} ({p.get('python_implementation')})"
         + (" in docker" if p.get("in_docker") else ""),
-        f"ollama reachable: {llm.get('reachable')}"
+        f"ollama reachable: {describe_reachable(llm.get('reachable'))}"
         f" (outcome: {llm.get('outcome') or 'n/a'},"
         f" {llm.get('elapsed_ms')} ms, limit {llm.get('timeout_seconds')} s)"
         + (f" — {llm.get('detail') or llm.get('error')}"
            if (llm.get("detail") or llm.get("error")) else ""),
+        describe_probe_freshness(llm),
         f"ollama models ({llm.get('model_count')}): "
         + (", ".join(llm.get("models") or []) or "none"),
         f"chosen local model: {llm.get('chosen_model') or 'none'}",

@@ -115,6 +115,63 @@ def test_local_llm_auto_wires_the_backends_shipped_probe():
     assert isinstance(report["reachable"], bool)
 
 
+def test_a_probe_still_in_flight_is_not_reported_as_unreachable():
+    """"We have not asked yet" and "we asked and nothing answered" are
+    different facts. bool() collapsed the first into the second, so a page
+    rendered "reachable: False" for the whole probe budget against an endpoint
+    nothing had yet tried to reach."""
+    report = diagnostics.local_llm_report(probe=lambda: {
+        "reachable": None, "outcome": "probing", "models": [],
+        "endpoint": None, "timeout_seconds": None, "elapsed_ms": None,
+        "detail": "probe in flight",
+    })
+    assert report["reachable"] is None, "an unasked probe was called unreachable"
+    assert report["outcome"] == "probing"
+    text = diagnostics.format_text({"local_llm": report})
+    assert "ollama reachable: unknown (not asked yet)" in text, text
+    assert "ollama reachable: False" not in text
+
+
+def test_a_landed_negative_probe_is_still_a_hard_False():
+    """The other side of the same invariant: tri-state must not soften a real
+    negative into a shrug."""
+    report = diagnostics.local_llm_report(probe=lambda: {
+        "reachable": False, "outcome": "refused", "models": [],
+    })
+    assert report["reachable"] is False
+    assert "ollama reachable: False" in diagnostics.format_text(
+        {"local_llm": report})
+
+
+def test_format_text_carries_the_probe_age_and_cached_flag():
+    """The COPY block is the artifact designed to leave the machine. The JSON
+    and /engines carried age_seconds/cached; the pasteable block did not, and
+    an undated cache turns a diagnostic into a confident guess."""
+    text = diagnostics.format_text({"local_llm": {
+        "reachable": True, "outcome": "ok", "elapsed_ms": 12,
+        "timeout_seconds": 2.5, "age_seconds": 55.177, "cached": True,
+        "ttl_seconds": 60.0,
+    }})
+    assert "55.2s old" in text, text
+    assert "cached: True" in text, text
+    assert "60.0 s" in text, text
+
+
+def test_format_text_marks_a_fresh_probe_as_not_cached():
+    text = diagnostics.format_text({"local_llm": {
+        "reachable": True, "age_seconds": 0.004, "cached": False,
+        "ttl_seconds": 60.0,
+    }})
+    assert "0.0s old" in text and "cached: False" in text, text
+
+
+def test_format_text_dates_an_unstamped_report_as_taken_inline():
+    """collect() with no snapshot really did probe just now — say that rather
+    than printing nothing, which reads as 'age unknown'."""
+    text = diagnostics.format_text(diagnostics.collect(None))
+    assert "probe freshness: taken inline for this report" in text, text
+
+
 def test_local_llm_with_no_probe_at_all_still_reports_the_field(monkeypatch):
     """A degenerate probe returning nothing must still yield every key."""
     report = diagnostics.local_llm_report(probe=lambda: {})

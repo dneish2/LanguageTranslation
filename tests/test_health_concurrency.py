@@ -179,6 +179,60 @@ async def _health_with_heartbeat(backend, interval: float = 0.05):
     return json.loads(bytes(response.body).decode("utf-8")), during, elapsed
 
 
+#: The heartbeat period and the window the refused-port test measures over.
+#: The window is the fix for a vacuous assertion: a ratio bar (ticks >= half of
+#: what was possible) has no teeth when the request finishes in ~2.6 ms, because
+#: half of 0.05 possible ticks is met by a SINGLE tick landing at the boundary
+#: as an artifact of task-creation order. On a host where refusal is instant the
+#: old form could not tell "loop free" from "loop blocked for 2.6 ms". Repeating
+#: the request until a fixed wall-clock window has passed makes the number of
+#: available ticks a property of the HARNESS, not of the OS's refusal speed, so
+#: an absolute floor becomes portable rather than a hidden host assumption.
+_HEARTBEAT_INTERVAL = 0.05
+_LOOP_WINDOW_SECONDS = 0.5
+
+
+async def _health_with_heartbeat_over_a_window(
+        make_backend, window: float, interval: float = _HEARTBEAT_INTERVAL):
+    """Run /api/health repeatedly for at least `window` seconds with a heartbeat.
+
+    A FRESH backend (and UI) per request, so no request is served from the
+    previous one's cached snapshot — every iteration pays for a real probe
+    against the real dead endpoint.
+
+    Returns (last_payload, ticks, elapsed, requests, probes).
+    """
+    ticks = 0
+    stop = False
+
+    async def heartbeat():
+        nonlocal ticks
+        while not stop:
+            await asyncio.sleep(interval)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    await asyncio.sleep(interval)  # let the heartbeat get going
+    before = ticks
+    started = time.perf_counter()
+    payload, requests, probes = None, 0, 0
+    while time.perf_counter() - started < window:
+        backend = make_backend()
+        response = await ui_module.TranslationUI(backend=backend).api_health(None)
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+        requests += 1
+        probes += backend.probe_calls
+    elapsed = time.perf_counter() - started
+    during = ticks - before
+    stop = True
+    beat.cancel()
+    try:
+        await beat
+    except asyncio.CancelledError:
+        pass
+    return payload, during, elapsed, requests, probes
+
+
 def test_health_against_a_silent_endpoint_leaves_the_loop_responsive(fast_probe):
     """The regression itself. Before the fix this recorded ZERO ticks while
     the loop sat inside urllib; a health check that stops the world is a
@@ -205,27 +259,35 @@ def test_health_against_a_silent_endpoint_leaves_the_loop_responsive(fast_probe)
 def test_health_against_a_refused_port_leaves_the_loop_responsive(fast_probe):
     """The second endpoint the auditor measured (8.32 s, loop frozen).
 
-    The assertion is a RATIO, not a tick floor, because how long a refused
-    connect takes is an OS fact: Windows sits in the probe budget for ~2 s
-    while Linux and macOS refuse in microseconds. A fixed floor encodes the
-    dev machine's timing and fails on a runner that is simply faster — the
-    same class of hidden host assumption this phase exists to delete. What is
-    portable is the SHARE of available ticks the loop actually served: it was
-    0 of ~160 before the fix, and must be most of them after, whatever the
-    wall clock happens to be here.
+    How long a refused connect takes is an OS fact: Windows sits in the probe
+    budget for ~2 s while Linux and macOS refuse in microseconds, so a floor
+    derived from the dev machine's timing would be a hidden host assumption.
+    But a bare ratio was worse: with a 2.6 ms request the bar became "at least
+    0.026 ticks", which a single boundary tick satisfies without proving
+    anything. So the measurement WINDOW is fixed by the harness (requests are
+    repeated until it elapses) and both bars then apply — the portable share of
+    available ticks AND an absolute floor derived from that window. It was 0
+    ticks before the fix, and must be most of them after.
     """
     port = _refused_port()
-    backend = CountingBackend(f"http://127.0.0.1:{port}")
-    payload, ticks, elapsed = asyncio.run(_health_with_heartbeat(backend))
+    payload, ticks, elapsed, requests, probes = asyncio.run(
+        _health_with_heartbeat_over_a_window(
+            lambda: CountingBackend(f"http://127.0.0.1:{port}"),
+            window=_LOOP_WINDOW_SECONDS))
 
     assert payload["status"] == "ok"
-    possible = elapsed / 0.05
-    assert ticks >= possible * 0.5, (
-        f"event loop blocked: {ticks} heartbeat ticks in {elapsed:.2f}s, "
-        f"where ~{possible:.0f} were possible — blocking I/O is back on the loop")
+    # The window is guaranteed by the harness, so this cannot degenerate.
+    assert elapsed >= _LOOP_WINDOW_SECONDS, (
+        f"measurement window collapsed to {elapsed:.3f}s")
+    possible = elapsed / _HEARTBEAT_INTERVAL
+    floor = (_LOOP_WINDOW_SECONDS / _HEARTBEAT_INTERVAL) * 0.5
+    assert ticks >= max(floor, possible * 0.5), (
+        f"event loop blocked: {ticks} heartbeat ticks in {elapsed:.2f}s across "
+        f"{requests} health requests, where ~{possible:.0f} were possible "
+        f"(floor {floor:.0f}) — blocking I/O is back on the loop")
     # A request that never waited proves nothing about ticks, so the other
-    # half of the mechanism is pinned unconditionally.
-    assert backend.probe_calls == 1
+    # half of the mechanism is pinned unconditionally: one probe per request.
+    assert probes == requests, f"{probes} probes for {requests} requests"
 
 
 def test_health_costs_exactly_one_probe(fast_probe):
@@ -319,6 +381,55 @@ def test_page_render_helpers_never_probe_on_the_render_path(fast_probe):
     assert snapshot["pending"] is True
     assert report["local_llm"]["outcome"] == "probing"
     assert "probing" in ui_module.describe_snapshot_age(snapshot)
+    # The invariant _pending_snapshot's docstring claims, now tested: outcome
+    # alone rescued only a careful reader. bool() used to coerce None to False,
+    # so the block asserted UNREACHABILITY for the whole probe budget before
+    # anything had been asked.
+    assert report["local_llm"]["reachable"] is not False, (
+        "'not asked yet' was collapsed into reachable=False")
+    assert report["local_llm"]["reachable"] is None
+
+
+def test_the_pasteable_block_never_calls_an_unasked_probe_unreachable(fast_probe):
+    """F4 at the surface that leaves the machine."""
+    from passage import diagnostics
+
+    port = _refused_port()
+    backend = CountingBackend(f"http://127.0.0.1:{port}")
+    text = diagnostics.format_text(
+        ui_module.collect_diagnostics(ui_module._pending_snapshot()))
+    assert backend.probe_calls == 0
+    assert "ollama reachable: unknown (not asked yet)" in text, text
+    assert "ollama reachable: False" not in text
+
+
+def test_the_pasteable_block_carries_the_probe_age_not_just_the_page(fast_probe):
+    """F3. Freshness used to live in a separate ui.label; Copy puts THIS text on
+    the clipboard, and the page tells the user to paste it back with a report.
+    An undated paste is a guess presented as a reading."""
+    from passage import diagnostics
+
+    port = _refused_port()
+    backend = CountingBackend(f"http://127.0.0.1:{port}")
+    snapshot = ui_module._take_local_snapshot(backend)
+    snapshot["probed_at"] -= 55.0
+
+    text = diagnostics.format_text(ui_module.collect_diagnostics(snapshot))
+    assert "55.0s old" in text, text
+    assert "cached: True" in text, text
+    # And a fresh one is not labelled as a cache.
+    fresh = diagnostics.format_text(
+        ui_module.collect_diagnostics(ui_module._take_local_snapshot(backend)))
+    assert "cached: False" in fresh, fresh
+
+
+def test_the_pasteable_block_says_a_pending_probe_has_no_answer_yet(fast_probe):
+    from passage import diagnostics
+
+    text = diagnostics.format_text(
+        ui_module.collect_diagnostics(ui_module._pending_snapshot()))
+    assert "probe freshness: probe in flight — no answer yet" in text, text
+    assert "cached: True" not in text
 
 
 def test_a_landed_probe_is_labelled_with_its_age_not_presented_as_live(fast_probe):

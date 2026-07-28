@@ -202,6 +202,10 @@ def snapshot_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "age_seconds": round(age, 3),
         "cached": age >= 1.0,
+        # An un-landed probe has an age, but it is the age of the WAIT, not of
+        # an answer. Carried so the pasteable block can say "no answer yet"
+        # instead of dating a reading that does not exist.
+        "pending": bool(snapshot.get("pending")),
         "ttl_seconds": snapshot["ttl_seconds"],
         "outcome": snapshot["probe"].get("outcome"),
         "elapsed_ms": snapshot["probe"].get("elapsed_ms"),
