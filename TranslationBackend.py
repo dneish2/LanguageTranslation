@@ -233,7 +233,169 @@ LIVE_LOCAL_MODEL = os.getenv("PASSAGE_LIVE_LOCAL_MODEL", "")
 #: keystroke path more than once a minute — an unreachable Ollama would
 #: otherwise add its connect timeout to every keystroke.
 LIVE_PROBE_TTL_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TTL", "60"))
-LIVE_PROBE_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TIMEOUT", "0.6"))
+#: How long to wait for a local endpoint to answer a reachability probe.
+#: 0.6s was fitted to this development machine, where Ollama answers in
+#: milliseconds. On a slower or busier machine — a laptop under load, a cold
+#: server — that expires while the endpoint is perfectly alive, and because
+#: every local path falls back to hosted silently, the resulting FALSE
+#: NEGATIVE is indistinguishable from "no local model installed". 2.5s is
+#: still bounded (the probe never runs on the render path: prewarm_live()
+#: runs it on a thread, and the answer is cached for LIVE_PROBE_TTL_SECONDS),
+#: and it is forgiving enough that a present-but-slow Ollama reads as present.
+LIVE_PROBE_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TIMEOUT", "2.5"))
+
+#: Probe outcomes. The point of these is that "we waited and nobody answered"
+#: and "the port actively refused" are DIFFERENT facts with different fixes —
+#: raise the timeout vs. start Ollama — and collapsing both into
+#: "unavailable" is what hid the problem in the first place.
+PROBE_OK = "ok"
+PROBE_TIMEOUT = "timeout"
+PROBE_REFUSED = "refused"
+PROBE_DNS = "dns_error"
+PROBE_HTTP_ERROR = "http_error"
+PROBE_ERROR = "error"
+
+
+def classify_probe_error(error: BaseException) -> str:
+    """Which kind of failure this was: timeout, refusal, DNS, HTTP or other.
+
+    urllib buries the real cause inside URLError.reason, sometimes two deep,
+    so unwrap before deciding. Pure function; no I/O.
+    """
+    import socket
+    import urllib.error
+
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, urllib.error.HTTPError):
+            return PROBE_HTTP_ERROR
+        if isinstance(current, (socket.timeout, TimeoutError)):
+            return PROBE_TIMEOUT
+        if isinstance(current, ConnectionRefusedError):
+            return PROBE_REFUSED
+        if isinstance(current, socket.gaierror):
+            return PROBE_DNS
+        if isinstance(current, ConnectionError):
+            return PROBE_REFUSED
+        reason = getattr(current, "reason", None)
+        current = reason if isinstance(reason, BaseException) else None
+    # Some stacks stringify the timeout rather than raising one.
+    text = str(error).lower()
+    if "timed out" in text or "timeout" in text:
+        return PROBE_TIMEOUT
+    if "refused" in text:
+        return PROBE_REFUSED
+    return PROBE_ERROR
+
+
+def probe_tcp(host: str, port: int, timeout: float) -> str:
+    """Is this port open, refused, or silent? Returns PROBE_OK/REFUSED/TIMEOUT.
+
+    Exists because of a measured Windows behaviour: a *refused* connection on
+    a socket that has a timeout set surfaces from `socket.create_connection`
+    as `TimeoutError('timed out')` after the full timeout elapses, while the
+    same connect with no timeout raises `ConnectionRefusedError(10061)` in
+    ~2s. urllib always sets a timeout, so on Windows "nothing is listening"
+    and "listening but slow" arrive identically — which would defeat the
+    entire point of recording the difference. A non-blocking connect plus a
+    select() on the exception set reports the refusal explicitly instead.
+    (Verified on Windows; the POSIX path already raised ConnectionRefusedError
+    and this agrees with it — behaviour on macOS is UNVERIFIED here.)
+    """
+    import select
+    import socket
+
+    sock = socket.socket()
+    try:
+        sock.setblocking(False)
+        err = sock.connect_ex((host, port))
+        if err == 0:
+            return PROBE_OK
+        readable, writable, exceptional = select.select([], [sock], [sock], timeout)
+        if exceptional:
+            return PROBE_REFUSED
+        if writable:
+            return PROBE_OK if sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_ERROR) == 0 else PROBE_REFUSED
+        return PROBE_TIMEOUT
+    except OSError:
+        return PROBE_REFUSED
+    finally:
+        sock.close()
+
+
+#: Budget for the follow-up "is anything listening at all?" check. Measured
+#: on Windows: a refused loopback connect takes ~2s to be reported (SYN
+#: retries), so a shorter budget would mislabel every refusal as a timeout —
+#: the exact collapse this work removes. Only ever spent when the endpoint has
+#: ALREADY failed, and the answer is then cached for LIVE_PROBE_TTL_SECONDS.
+PROBE_REFUSAL_CHECK_SECONDS = float(os.getenv("PASSAGE_PROBE_REFUSAL_CHECK", "3.0"))
+
+
+def _refine_timeout_outcome(outcome: str, endpoint: str, budget: float) -> str:
+    """Turn an ambiguous timeout into a refusal when the port is simply shut.
+
+    Cheap and bounded: only runs when the first probe already failed, and only
+    ever waits `budget` seconds.
+    """
+    if outcome != PROBE_TIMEOUT:
+        return outcome
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(endpoint)
+    if not parsed.hostname:
+        return outcome
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return PROBE_REFUSED if probe_tcp(
+        parsed.hostname, port, budget) == PROBE_REFUSED else PROBE_TIMEOUT
+
+
+def probe_local_llm(
+    base_url: str | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Ask the local Ollama what it has, and record HOW the answer went.
+
+    Returns a structured, importable report — this is what /diagnostics
+    consumes, and the only place the timeout/refusal distinction is made:
+
+      ``reachable``  bool
+      ``outcome``    one of PROBE_OK / PROBE_TIMEOUT / PROBE_REFUSED /
+                     PROBE_DNS / PROBE_HTTP_ERROR / PROBE_ERROR
+      ``models``     installed model tags (empty unless reachable)
+      ``endpoint``   the URL probed
+      ``timeout_seconds`` / ``elapsed_ms``
+      ``detail``     the error text, or ""
+
+    No global state is touched; safe to call from anywhere.
+    """
+    import urllib.request
+
+    base = (base_url or OLLAMA_BASE_URL).rstrip("/").removesuffix("/v1")
+    limit = LIVE_PROBE_TIMEOUT_SECONDS if timeout is None else float(timeout)
+    endpoint = f"{base}/api/tags"
+    started = time.time()
+    try:
+        with urllib.request.urlopen(endpoint, timeout=limit) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        models = [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
+        outcome, detail, reachable = PROBE_OK, "", True
+    except Exception as error:  # noqa: BLE001 - every failure is a report, not a crash
+        models, reachable = [], False
+        outcome = _refine_timeout_outcome(
+            classify_probe_error(error), endpoint, PROBE_REFUSAL_CHECK_SECONDS)
+        detail = str(error)[:300]
+    return {
+        "reachable": reachable,
+        "outcome": outcome,
+        "models": models,
+        "endpoint": endpoint,
+        "timeout_seconds": limit,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "detail": detail,
+    }
 
 
 def _pixel_bbox(raw: Any, image_bytes: bytes) -> list[int] | None:
@@ -638,6 +800,11 @@ class TranslationBackend:
         # only for the keystroke path. Built lazily so boot never waits on it.
         self._live_provider: BaseTranslationProvider | None = None
         self._live_probe_at: float = 0.0
+        #: Last recorded probe outcomes (see probe_local_llm). Kept so the
+        #: diagnostics surface can say WHY local is unavailable rather than
+        #: only that it is.
+        self.last_live_probe: dict[str, Any] | None = None
+        self.last_local_probe: dict[str, Any] | None = None
         self._profile_providers: dict[tuple, BaseTranslationProvider] = {}
         self._live_reachable: bool = False
         self._jobs_lock = Lock()
@@ -1142,22 +1309,26 @@ class TranslationBackend:
             return {"ok": False, "error": message[:300]}
 
     def available_local_models(self) -> list[str]:
-        """Model tags on the local Ollama, or [] if it isn't reachable."""
-        try:
-            import urllib.request
-            base = OLLAMA_BASE_URL.rstrip("/").removesuffix("/v1")
-            with urllib.request.urlopen(f"{base}/api/tags", timeout=LIVE_PROBE_TIMEOUT_SECONDS) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            # Embedding models can't translate; offering them would produce
-            # confusing empty rows in a comparison.
-            return [
-                m["name"] for m in payload.get("models", [])
-                if "embed" not in m.get("name", "")
-                and ollama_suits_translation(m.get("name", ""))
-            ]
-        except Exception as error:
-            logging.info("[Backend] local model list unavailable (%s)", error)
+        """Model tags on the local Ollama, or [] if it isn't reachable.
+
+        The probe's outcome is recorded on ``self.last_local_probe`` so a
+        caller can tell "the endpoint refused" from "the endpoint was too slow
+        to answer in time" — an empty list alone cannot.
+        """
+        report = probe_local_llm()
+        self.last_local_probe = report
+        if not report["reachable"]:
+            logging.info(
+                "[Backend] local model list unavailable (%s after %dms; %s)",
+                report["outcome"], report["elapsed_ms"], report["detail"],
+            )
             return []
+        # Embedding models can't translate; offering them would produce
+        # confusing empty rows in a comparison.
+        return [
+            name for name in report["models"]
+            if "embed" not in name and ollama_suits_translation(name)
+        ]
 
     def comparison_candidates(self, profile=None) -> list[dict[str, Any]]:
         """The engines worth comparing right now: Passage's hosted default, the
@@ -1250,12 +1421,42 @@ class TranslationBackend:
         try:
             import urllib.request
             base = OLLAMA_BASE_URL.rstrip("/")
-            with urllib.request.urlopen(f"{base}/models", timeout=LIVE_PROBE_TIMEOUT_SECONDS):
-                pass
+            endpoint = f"{base}/models"
+            started = time.time()
+            try:
+                with urllib.request.urlopen(endpoint, timeout=LIVE_PROBE_TIMEOUT_SECONDS):
+                    pass
+            except Exception as probe_error:
+                # Record WHY before re-raising into the shared handler: a
+                # timeout ("present but slow — raise the timeout") and a
+                # refusal ("not running — start Ollama") are different facts,
+                # and collapsing them into "unavailable" is exactly how a
+                # working local model reads as a missing one.
+                self.last_live_probe = {
+                    "reachable": False,
+                    "outcome": _refine_timeout_outcome(
+                        classify_probe_error(probe_error), endpoint,
+                        PROBE_REFUSAL_CHECK_SECONDS),
+                    "endpoint": endpoint,
+                    "timeout_seconds": LIVE_PROBE_TIMEOUT_SECONDS,
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                    "detail": str(probe_error)[:300],
+                }
+                raise
+            self.last_live_probe = {
+                "reachable": True,
+                "outcome": PROBE_OK,
+                "endpoint": endpoint,
+                "timeout_seconds": LIVE_PROBE_TIMEOUT_SECONDS,
+                "elapsed_ms": int((time.time() - started) * 1000),
+                "detail": "",
+            }
             if self._live_provider is None:
                 model = self.choose_local_model()
                 if not model:
                     self._live_reachable = False
+                    self.last_live_probe["reachable"] = False
+                    self.last_live_probe["outcome"] = "no_model_installed"
                     return None
                 # Native /api/chat, not the OpenAI shim: the shim flattens
                 # thinking into the answer and loses it entirely for some
@@ -1272,7 +1473,10 @@ class TranslationBackend:
             self._live_reachable = True
         except Exception as error:
             if self._live_reachable or self._live_probe_at == now:
-                logging.info("[Backend] live-local unreachable (%s); using hosted", error)
+                logging.info(
+                    "[Backend] live-local unreachable (%s: %s); falling back to hosted",
+                    (self.last_live_probe or {}).get("outcome", PROBE_ERROR), error,
+                )
             self._live_reachable = False
         return self._live_provider if self._live_reachable else None
 
