@@ -17,12 +17,40 @@ from api_security import MAX_UPLOAD_BYTES
 from passage.ui.common import LANGUAGES, log_event
 
 
+def format_engine_line(meta: dict) -> str:
+    """One line naming the engines that ACTUALLY served this request.
+
+    Local voice now defaults on when the models are present (DECISIONS.md §2),
+    and an automatic default is only honest if the page says where the audio
+    went — the same argument that justified local-first for text. Built from
+    the meta the backend returns, so it cannot drift from what ran: if local
+    was tried and failed, this says "hosted", because hosted is what ran.
+    """
+    stt = meta.get("stt") or "hosted"
+    tts = meta.get("tts") or "hosted"
+    where = ("this machine" if stt.startswith("local") and tts.startswith("local")
+             else "sent out" if not stt.startswith("local") and not tts.startswith("local")
+             else "partly on this machine")
+    line = f"heard by {stt} · spoken by {tts} — {where}"
+    fell_back = [k for k in ("stt_fallback", "tts_fallback") if meta.get(k)]
+    if fell_back:
+        line += " (local was tried and failed)"
+    return line
+
+
 class VoicePageMixin:
     def _render_voice_status_block(self, scope: str) -> None:
         ui.label("Status").classes(f"{theme.DATA} mt-3")
         ui.label("")\
             .classes("text-base")\
             .props(f"id={scope}_status")
+        # Which engine served THIS request. Always visible (not behind ?debug),
+        # because local voice is now on by default when the models are present
+        # and a silent default is only acceptable if the page names where the
+        # recording actually went.
+        ui.label("")\
+            .classes(f"{theme.DATA} min-h-[20px]")\
+            .props(f"id={scope}_engines")
         # Developer readout — hidden unless the page is opened with ?debug=1
         # (voiceUx.init reveals .p-debug-block); updateDebug still writes to it.
         ui.label("Debug").classes(f"{theme.DATA} mt-1 hidden p-debug-block")
@@ -56,6 +84,11 @@ window.voiceUx = window.voiceUx || (() => {
         if (node) node.textContent = message || '';
     }
 
+    function setEngines(scope, message) {
+        const node = resolve(scope, 'engines');
+        if (node) node.textContent = message || '';
+    }
+
     function setRecordingButtons(scope, recording) {
         const start = resolve(scope, 'start_recording');
         const stop = resolve(scope, 'stop_recording');
@@ -72,6 +105,7 @@ window.voiceUx = window.voiceUx || (() => {
     function init(scope) {
         setStatus(scope, states.READY);
         setDebug(scope, '');
+        setEngines(scope, '');
         setRecordingButtons(scope, false);
     }
 
@@ -82,7 +116,7 @@ window.voiceUx = window.voiceUx || (() => {
         }
     });
 
-    return { states, init, setStatus, setDebug, setRecordingButtons };
+    return { states, init, setStatus, setDebug, setEngines, setRecordingButtons };
 })();
 </script>
         """)
@@ -172,6 +206,9 @@ window.voiceUx = window.voiceUx || (() => {
     }
     function updateDebug(msg) {
         window.voiceUx.setDebug(DESKTOP_SCOPE, msg);
+    }
+    function updateEngines(msg) {
+        window.voiceUx.setEngines(DESKTOP_SCOPE, msg);
     }
     function updateButtons(recording) {
         window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, recording);
@@ -316,6 +353,9 @@ window.voiceUx = window.voiceUx || (() => {
                 if (!value) return '';
                 try { return decodeURIComponent(value); } catch (_err) { return value; }
             };
+            // Name the engines that served THIS request, from the response
+            // headers the backend derives from what actually ran.
+            updateEngines(decodeHeader(resp.headers.get('X-Engine-Summary') || ''));
             const orig = decodeHeader(origHeader);
             const trans = decodeHeader(transHeader);
             document.getElementById('original_text').textContent   = orig;
@@ -469,6 +509,9 @@ window.voiceUx = window.voiceUx || (() => {
                     # recording left the machine, so say so explicitly.
                     "X-Speech-Engine": meta.get("stt", "hosted"),
                     "X-Voice-Engine": meta.get("tts", "hosted"),
+                    # Human-readable version of the two above, rendered on the
+                    # page per request (quoted: it is non-ASCII).
+                    "X-Engine-Summary": quote(format_engine_line(meta), safe=""),
                     "Content-Length": str(len(audio_bytes))
                 }
             )

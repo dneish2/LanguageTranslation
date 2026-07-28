@@ -1530,6 +1530,10 @@ class TranslationBackend:
                 except Exception as error:
                     logging.info("[Backend] local STT failed (%s); using hosted", error)
                     source_text = self._transcribe_hosted(audio_bytes)
+                    # The label stays "hosted" because hosted is what ran — but
+                    # record that local was TRIED, so a broken local model is
+                    # distinguishable from one that was never installed.
+                    meta["stt_fallback"] = str(error)
             else:
                 source_text = self._transcribe_hosted(audio_bytes)
             logging.info("[Backend] Transcription (%s): %s", meta["stt"], source_text[:60] + "…")
@@ -1544,6 +1548,9 @@ class TranslationBackend:
                 except Exception as error:
                     logging.info("[Backend] local TTS failed (%s); using hosted", error)
                     audio_out = self._require_provider().synthesize_speech(text=translated_text)
+                    meta["tts"] = "hosted"
+                    meta["media_type"] = "audio/mpeg"
+                    meta["tts_fallback"] = str(error)
             else:
                 audio_out = self._require_provider().synthesize_speech(text=translated_text)
 

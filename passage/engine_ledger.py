@@ -46,6 +46,27 @@ def record(store: list, *, surface: str, engine: str, is_local: bool,
         del store[:len(store) - MAX_ENTRIES]
 
 
+def voice_state() -> dict[str, Any]:
+    """What /engines should say about voice, from the RESOLVED tri-state.
+
+    Not from the raw env var. Local voice is now on by default when the models
+    are present (DECISIONS.md §2), so `PASSAGE_LOCAL_VOICE` being unset no
+    longer means "hosted" — reading the variable would make the page claim
+    metered hosted speech on a machine where every recording stays put. This
+    page has made exactly that class of mistake before: it once printed
+    "hosted — metered" directly above "100% stayed on this machine".
+    """
+    from passage import local_voice
+    state = local_voice.status()
+    return {
+        "mode": state["mode"],
+        "engine": state["stt_engine"],
+        "is_local": state["stt_ready"],
+        "detail": local_voice.describe(),
+        "forced_but_missing": state["forced_but_missing"],
+    }
+
+
 def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Local vs cloud, in the terms someone would actually ask about.
 

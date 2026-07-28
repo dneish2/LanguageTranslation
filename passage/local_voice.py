@@ -34,10 +34,22 @@ import wave
 from functools import lru_cache
 from pathlib import Path
 
-#: Off unless asked for: this pulls in a speech stack and model weights, and
-#: silently changing where someone's audio is processed is not a default worth
-#: assuming either way.
-ENABLED = os.getenv("PASSAGE_LOCAL_VOICE", "0") == "1"
+#: ``PASSAGE_LOCAL_VOICE`` is TRI-STATE (DECISIONS.md §2):
+#:
+#:   unset -> **auto**: on when the models are actually present. Local voice is
+#:            both faster (1.51s vs 7.62s end to end) and more private, so
+#:            defaulting off penalised the better option. The old argument for
+#:            off was "don't silently move where audio is processed" — but
+#:            installing a speech stack and downloading ~63MB of voice weights
+#:            is already an explicit act. Nobody does that by accident.
+#:   "1"   -> force on. If the models are missing this reports that honestly
+#:            instead of pretending; a forced flag cannot conjure a model.
+#:   "0"   -> force off, even when everything is installed.
+#:
+#: Resolved by CALL, not frozen at import: /engines and the tests must be able
+#: to re-probe after a voice is downloaded, and an import-time constant would
+#: make the page's answer stale the moment the fetch-on-demand helper ran.
+_AUTO, _ON, _OFF = "auto", "on", "off"
 
 #: "base" is the smallest model that transcribes cleanly in testing; tiny
 #: garbles proper nouns badly enough to poison the translation downstream.
@@ -84,14 +96,69 @@ def iso_code(language: str | None) -> str | None:
     return prefix.split("_")[0] if prefix else None
 
 
-def stt_available() -> bool:
-    if not ENABLED:
-        return False
+def mode() -> str:
+    """The tri-state, read fresh each call: "auto", "on" or "off"."""
+    raw = (os.getenv("PASSAGE_LOCAL_VOICE") or "").strip()
+    if raw == "1":
+        return _ON
+    if raw == "0":
+        return _OFF
+    return _AUTO
+
+
+def whisper_installed() -> bool:
+    """Is the recogniser importable at all? Independent of the env flag.
+
+    Deliberately uncached: a cached "no" would survive an install for the life
+    of the process, and this is the probe /engines uses to tell the user what
+    the app can do right now. ``import`` is itself cached by ``sys.modules``.
+    """
     try:
         import faster_whisper  # noqa: F401
     except Exception:
         return False
     return True
+
+
+def piper_installed() -> bool:
+    try:
+        import piper  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def installed_voices() -> list[str]:
+    return sorted(p.stem for p in VOICE_DIR.glob("*.onnx")) if VOICE_DIR.is_dir() else []
+
+
+def enabled() -> bool:
+    """Whether local voice should be USED, after resolving the tri-state.
+
+    "on" here means "permitted and at least one local capability is really
+    present" — never "the flag was set". A flag cannot make a model exist, and
+    reporting otherwise is exactly the lie /engines is supposed to prevent.
+
+    There is deliberately no ``ENABLED`` constant to override any more. The
+    whole point of the tri-state is that enablement is re-resolved per call, so
+    a stored boolean anyone can pin would reintroduce exactly the staleness
+    this replaced — and a pinned "off" is indistinguishable from a genuine
+    absence of models.
+    """
+    current = mode()
+    if current == _OFF:
+        return False
+    if current == _ON:
+        # Forced on: honour the intent for the capabilities that exist, and let
+        # describe() say plainly when the answer is "none of them".
+        return True
+    return whisper_installed() or (piper_installed() and bool(installed_voices()))
+
+
+def stt_available() -> bool:
+    if not enabled():
+        return False
+    return whisper_installed()
 
 
 def voice_file_for(language: str | None) -> Path | None:
@@ -105,11 +172,9 @@ def voice_file_for(language: str | None) -> Path | None:
 
 
 def tts_available(language: str | None) -> bool:
-    if not ENABLED:
+    if not enabled():
         return False
-    try:
-        import piper  # noqa: F401
-    except Exception:
+    if not piper_installed():
         return False
     return voice_file_for(language) is not None
 
@@ -157,12 +222,43 @@ def synthesize(text: str, *, language: str) -> bytes:
     return buffer.getvalue()
 
 
+def status() -> dict:
+    """The RESOLVED state, structured, for /engines and for tests.
+
+    /engines once printed "hosted — metered" directly above "100% stayed on
+    this machine", because the two lines were derived from different things.
+    Everything that describes voice now derives from this one probe, so the
+    page cannot contradict what actually ran.
+    """
+    current = mode()
+    stt = stt_available()
+    voices = installed_voices()
+    return {
+        "mode": current,                      # what was asked for
+        "enabled": enabled(),                 # what was resolved
+        "stt_ready": stt,
+        "stt_engine": f"local:{WHISPER_MODEL}" if stt else "hosted",
+        "piper_ready": enabled() and piper_installed() and bool(voices),
+        "voices": voices,
+        # Forced on with nothing installed is the one case that must not be
+        # allowed to read as success.
+        "forced_but_missing": current == _ON and not (stt or (piper_installed() and voices)),
+    }
+
+
 def describe() -> str:
     """What's actually available, for the engines page."""
-    if not ENABLED:
-        return "off (set PASSAGE_LOCAL_VOICE=1)"
-    parts = []
-    parts.append(f"speech recognition: {'ready' if stt_available() else 'not installed'}")
-    voices = sorted(p.stem for p in VOICE_DIR.glob("*.onnx")) if VOICE_DIR.is_dir() else []
-    parts.append(f"voices: {', '.join(voices) if voices else 'none installed'}")
-    return " · ".join(parts)
+    state = status()
+    if state["mode"] == _OFF:
+        return "off (PASSAGE_LOCAL_VOICE=0) — recordings use the hosted models"
+    detail = " · ".join((
+        f"speech recognition: {'ready' if state['stt_ready'] else 'not installed'}",
+        f"voices: {', '.join(state['voices']) if state['voices'] else 'none installed'}",
+    ))
+    if state["forced_but_missing"]:
+        return ("PASSAGE_LOCAL_VOICE=1 but nothing local is installed — "
+                f"falling back to hosted ({detail})")
+    if not state["enabled"] or not (state["stt_ready"] or state["piper_ready"]):
+        return f"off — nothing local detected ({detail})"
+    how = "forced on" if state["mode"] == _ON else "on (detected automatically)"
+    return f"{how} · {detail}"
