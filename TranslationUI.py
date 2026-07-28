@@ -1073,18 +1073,72 @@ class TranslationUI(VoicePageMixin):
 
     def _record_thread(self, entry: dict) -> None:
         """Newest-first with dedupe: repeating a translation moves its thread
-        to the top instead of stacking duplicates."""
+        to the top instead of stacking duplicates.
+
+        Also collapses live typing into ONE thread. Text mode re-translates on
+        every 350ms typing pause, so composing a single sentence used to emit
+        ~8 separate threads — one per growing prefix ("The", "The quarterly",
+        "The quarterly report"…) — because the dedupe key is the label and a
+        growing prefix never matches itself. Recent Threads filled up with
+        fragments of one sentence, which reads as history but isn't.
+        `_continuation_of` treats a prefix-extension (or a backspace-shortening)
+        of the newest thread as the SAME utterance and updates it in place,
+        keeping its id and original timestamp.
+        """
         entry.setdefault("id", str(uuid.uuid4()))
+        threads = self.recent_threads
+
+        superseded = self._continuation_of(entry, threads)
+        if superseded is not None:
+            # Same utterance still being composed: update in place rather than
+            # stack a new row. Keep the id (so a delete button already rendered
+            # against it still works) and when the utterance started, but let
+            # `when` advance to this edit — it drives both the newest-first sort
+            # and the continuation window, which must measure from the last
+            # keystroke, not from the start (otherwise composing for longer than
+            # the window silently forks a second thread mid-sentence).
+            entry["id"] = superseded.get("id", entry["id"])
+            entry["started"] = superseded.get("started", superseded.get("when"))
+            threads[threads.index(superseded)] = entry
+            return
+
         key = (entry.get("kind"), entry.get("label"), entry.get("language"))
         survivors = [
-            t for t in self.recent_threads
+            t for t in threads
             if (t.get("kind"), t.get("label"), t.get("language")) != key
         ]
-        threads = self.recent_threads
         threads.clear()
         threads.extend(survivors)
         threads.insert(0, entry)
         del threads[20:]
+
+    #: How long after the last keystroke a further edit still counts as the
+    #: same utterance rather than a new one.
+    THREAD_CONTINUATION_WINDOW_S = 180.0
+
+    def _continuation_of(self, entry: dict, threads: list) -> dict | None:
+        """Return the existing thread `entry` is a continuation of, else None.
+
+        Only chat threads continue — a document translation is always its own
+        thread. A continuation must be the most recent thread (you can only be
+        typing in one box at a time), same target language, within the window,
+        and its source text must be a prefix-extension of the stored one or a
+        shortening of it (backspacing mid-sentence must not spawn a new row).
+        """
+        if entry.get("kind") != "chat" or not threads:
+            return None
+        newest = max(threads, key=lambda t: t.get("when", 0))
+        if newest.get("kind") != "chat":
+            return None
+        if newest.get("language") != entry.get("language"):
+            return None
+        if entry.get("when", 0) - newest.get("when", 0) > self.THREAD_CONTINUATION_WINDOW_S:
+            return None
+        old = (newest.get("original") or "").strip()
+        new = (entry.get("original") or "").strip()
+        if not old or not new:
+            return None
+        return newest if (new.startswith(old) or old.startswith(new)) else None
 
     def _delete_thread(self, thread_id: str) -> None:
         threads = self.recent_threads

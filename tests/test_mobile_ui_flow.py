@@ -1,4 +1,5 @@
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -222,6 +223,93 @@ def test_recent_threads_degrades_to_empty_outside_a_request_context():
     ui_app._record_chat_thread("Hello", "Hola", "Spanish")
 
     assert ui_app.recent_threads == []
+
+
+def test_live_typing_one_sentence_collapses_into_a_single_thread(monkeypatch):
+    """The bug this fixes, reproduced at unit level: Text mode re-translates on
+    every 350ms typing pause, so composing one sentence emitted one thread per
+    growing prefix (live-measured: 8 threads for 8 words). Recent Threads filled
+    with fragments of a single sentence."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    prefixes = [
+        "The", "The quarterly", "The quarterly report",
+        "The quarterly report shows", "The quarterly report shows revenue",
+        "The quarterly report shows revenue grew twelve percent.",
+    ]
+    for p in prefixes:
+        ui_app._record_chat_thread(p, f"<{p}>", "Spanish")
+
+    assert len(ui_app.recent_threads) == 1
+    thread = ui_app.recent_threads[0]
+    assert thread["original"] == prefixes[-1]
+    assert thread["translated"] == f"<{prefixes[-1]}>"
+
+
+def test_continuation_keeps_a_stable_thread_id_and_start_time(monkeypatch):
+    """The row must not churn its identity while you type — a delete button
+    already rendered against it has to keep working."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+    first_id = ui_app.recent_threads[0]["id"]
+    first_when = ui_app.recent_threads[0]["when"]
+
+    ui_app._record_chat_thread("Hello there", "Hola ahí", "Spanish")
+
+    thread = ui_app.recent_threads[0]
+    assert thread["id"] == first_id
+    assert thread["started"] == first_when
+    assert thread["when"] >= first_when
+
+
+def test_backspacing_mid_sentence_does_not_fork_a_new_thread(monkeypatch):
+    """Shortening counts as the same utterance too, otherwise correcting a typo
+    mid-sentence spawns a duplicate row."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Hello therre", "Hola", "Spanish")
+    ui_app._record_chat_thread("Hello the", "Hola", "Spanish")
+    ui_app._record_chat_thread("Hello there", "Hola ahí", "Spanish")
+
+    assert len(ui_app.recent_threads) == 1
+    assert ui_app.recent_threads[0]["original"] == "Hello there"
+
+
+def test_a_genuinely_new_sentence_starts_its_own_thread(monkeypatch):
+    """Continuation must not swallow real history — clearing the box and typing
+    something unrelated is a new thread."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Where is the pharmacy?", "¿Dónde está la farmacia?", "Spanish")
+    ui_app._record_chat_thread("How much does it cost?", "¿Cuánto cuesta?", "Spanish")
+
+    assert len(ui_app.recent_threads) == 2
+
+
+def test_continuation_expires_after_the_window(monkeypatch):
+    """A prefix-extension typed much later is a new utterance, not a continuation."""
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Hello", "Hola", "Spanish")
+    stale = ui_app.recent_threads[0]
+    stale["when"] -= ui_app.THREAD_CONTINUATION_WINDOW_S + 1
+
+    ui_app._record_chat_thread("Hello there", "Hola ahí", "Spanish")
+
+    assert len(ui_app.recent_threads) == 2
+
+
+def test_a_document_thread_never_continues_a_chat_thread(monkeypatch):
+    ui_app = _build_mobile_ui()
+    _use_fake_thread_storage(monkeypatch, ui_app)
+    ui_app._record_chat_thread("Report", "Informe", "Spanish")
+    ui_app._record_thread({
+        "kind": "document", "label": "Report.pdf",
+        "language": "Spanish", "when": time.time(),
+    })
+
+    assert len(ui_app.recent_threads) == 2
 
 
 def test_delete_thread_removes_only_the_matching_entry(monkeypatch):
