@@ -12,3 +12,6 @@ models/piper/
 
 # Scratch probes
 _*.py
+
+# Trace records contain user content
+data/traces/
