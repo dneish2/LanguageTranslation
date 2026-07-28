@@ -28,6 +28,7 @@ from TranslationBackend import (
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage import __version__ as passage_version
 from passage import engine_ledger
+from passage import local_voice
 from passage import policy
 from passage import usage
 from passage import provider_profiles
@@ -355,6 +356,12 @@ class TranslationUI(VoicePageMixin):
                         for name, count in summary["engines"].items():
                             ui.label(f"{name} — {count} run{'s' if count != 1 else ''}")\
                                 .classes(theme.DATA)
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Voice").classes(theme.DATA)
+                    ui.label(policy.describe_voice_privacy(
+                        self.current_target_language)).classes("text-base")
+                    ui.label(local_voice.describe()).classes(theme.DATA)
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Metered usage").classes(theme.DATA)

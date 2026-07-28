@@ -146,6 +146,28 @@ def data_leaves_machine(profile, *, local_first_model: str | None = None) -> boo
     return not bool(getattr(profile, "uses_local_inference", False))
 
 
+def voice_stays_local() -> bool:
+    """Whether a recording is processed on this machine.
+
+    Voice deserves its own answer rather than inheriting the text one. It is
+    the most sensitive input the app takes — a recording of someone's actual
+    voice — and until local speech existed, "nothing leaves your machine" was
+    simply false for it no matter which text model was selected.
+    """
+    from passage import local_voice
+    return local_voice.stt_available()
+
+
+def describe_voice_privacy(target_language: str | None = None) -> str:
+    from passage import local_voice
+    if not local_voice.stt_available():
+        return "Recordings are sent to Passage's hosted speech models."
+    if local_voice.tts_available(target_language):
+        return "Recording and playback both run on this machine."
+    return ("Your recording is transcribed on this machine; only the translated "
+            "text is sent out to be spoken.")
+
+
 def describe_privacy(profile, *, local_first_model: str | None = None) -> str:
     """One line a user can act on, for the UI."""
     if not data_leaves_machine(profile, local_first_model=local_first_model):

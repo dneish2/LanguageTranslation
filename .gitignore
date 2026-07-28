@@ -7,3 +7,5 @@ __pycache__/
 # NiceGUI's local storage_secret-backed persistence (app.storage.user/.general) —
 # runtime session data, never source; would otherwise leak real user content into git.
 .nicegui/
+# Local voice models (large binaries, downloaded on demand)
+models/piper/

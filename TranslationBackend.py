@@ -31,6 +31,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
 
 from passage import compare
+from passage import local_voice
 from passage import text_rows
 from passage.ollama_native import (
     NativeOllamaProvider,
@@ -1505,27 +1506,57 @@ class TranslationBackend:
             return self.translate_text(text, target_language)
 
     # ──────────────────────── VOICE (WHISPER + TTS) ────────────────────── #
-    def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, str, bytes]:
-        """
-        1. Transcribe `audio_bytes` (TRANSCRIBE_MODEL).
-        2. Translate resulting text.
-        3. Return TTS MP3 bytes of the translation.
+    def translate_audio(self, audio_bytes: bytes, target_language: str) -> Tuple[str, str, bytes, dict]:
+        """Transcribe, translate, and speak the result.
+
+        Returns (source_text, translated_text, audio_bytes, meta) where meta
+        records which engine did each step and the audio's media type — voice
+        is the one place a user most deserves to know whether their recording
+        left the machine, so it is reported rather than assumed.
+
+        Each of the three steps chooses local or hosted independently: someone
+        may have a local recogniser but no voice for their target language, and
+        transcribing locally is still worth doing in that case — the recording
+        never leaves even if the reply is synthesised elsewhere.
         """
         try:
             logging.info("[Backend] Voice pipeline start → %s (%d bytes)", target_language, len(audio_bytes))
-            audio_file = BytesIO(audio_bytes)
-            audio_file.name = _guess_audio_filename(audio_bytes)
+            meta = {"stt": "hosted", "tts": "hosted", "media_type": "audio/mpeg"}
 
-            source_text = self._require_provider().transcribe_audio(audio_file=audio_file)
-            logging.info("[Backend] Transcription: %s", source_text[:60] + "…")
+            if local_voice.stt_available():
+                try:
+                    source_text = local_voice.transcribe(audio_bytes)
+                    meta["stt"] = f"local:{local_voice.WHISPER_MODEL}"
+                except Exception as error:
+                    logging.info("[Backend] local STT failed (%s); using hosted", error)
+                    source_text = self._transcribe_hosted(audio_bytes)
+            else:
+                source_text = self._transcribe_hosted(audio_bytes)
+            logging.info("[Backend] Transcription (%s): %s", meta["stt"], source_text[:60] + "…")
 
             translated_text = self.translate_text(source_text, target_language)
-            audio_mp3 = self._require_provider().synthesize_speech(text=translated_text)
-            logging.info("[Backend] TTS done (%d bytes)", len(audio_mp3))
-            return source_text, translated_text, audio_mp3
+
+            if local_voice.tts_available(target_language):
+                try:
+                    audio_out = local_voice.synthesize(translated_text, language=target_language)
+                    meta["tts"] = "local:piper"
+                    meta["media_type"] = "audio/wav"
+                except Exception as error:
+                    logging.info("[Backend] local TTS failed (%s); using hosted", error)
+                    audio_out = self._require_provider().synthesize_speech(text=translated_text)
+            else:
+                audio_out = self._require_provider().synthesize_speech(text=translated_text)
+
+            logging.info("[Backend] TTS done via %s (%d bytes)", meta["tts"], len(audio_out))
+            return source_text, translated_text, audio_out, meta
         except Exception as e:
             logging.error("[Backend] translate_audio error: %s", e, exc_info=True)
             raise
+
+    def _transcribe_hosted(self, audio_bytes: bytes) -> str:
+        audio_file = BytesIO(audio_bytes)
+        audio_file.name = _guess_audio_filename(audio_bytes)
+        return self._require_provider().transcribe_audio(audio_file=audio_file)
 
     def translate_image_text_blocks(self, image_bytes: bytes, filename: str, target_language: str) -> dict[str, Any]:
         supported_extensions = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
