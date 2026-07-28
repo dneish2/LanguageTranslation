@@ -3,11 +3,13 @@ import os
 import base64
 import re
 import string
+import sys
 import time
 import uuid
 import json
 import random
 import wave
+from array import array
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from threading import Lock, Thread, Timer
@@ -50,7 +52,17 @@ TEXT_MODEL = os.getenv("PASSAGE_TEXT_MODEL", "gpt-5.4-nano")
 VISION_MODEL = os.getenv("PASSAGE_VISION_MODEL", "gpt-5.4-mini")
 TRANSCRIBE_MODEL = os.getenv("PASSAGE_TRANSCRIBE_MODEL", "gpt-realtime-whisper")
 TRANSCRIBE_REST_MODEL = os.getenv("PASSAGE_TRANSCRIBE_REST_MODEL", "gpt-4o-mini-transcribe")
-TTS_MODEL = os.getenv("PASSAGE_TTS_MODEL", "gpt-audio-mini")
+# A DEDICATED speech model on the /audio/speech endpoint, deliberately not a
+# conversational audio model on chat.completions. `gpt-audio-mini` was the
+# default here and it does not read text out — it ANSWERS it, even under an
+# explicit "you are a text-to-speech engine, never answer" system prompt.
+# Measured by round-tripping TTS output back through transcription: 3 of 3
+# cases spoke a chatbot reply instead of the text. "¿Dónde está la farmacia
+# más cercana?" was voiced as "Claro, te ayudo con eso… ¿Dónde te encuentras
+# ahora exactamente?" — fluent, plausible, and NOT the user's translation,
+# which someone who doesn't speak the language cannot possibly detect.
+# /audio/speech cannot do that: it has no assistant turn to generate.
+TTS_MODEL = os.getenv("PASSAGE_TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.getenv("PASSAGE_TTS_VOICE", "nova")
 REALTIME_STT_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_REALTIME_STT_TIMEOUT", "45"))
 
@@ -99,6 +111,42 @@ def _read_pcm16_wav(data: bytes) -> tuple[bytes, int] | None:
     elif channels != 1:
         return None
     return frames, rate
+
+
+#: The realtime transcription session rejects anything above this
+#: ("Invalid 'session.audio.input.format.rate': ... Expected a value <= 24000").
+REALTIME_MAX_SAMPLE_RATE = 24000
+
+
+def _resample_pcm16(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Linear-interpolation downsample of mono PCM16.
+
+    Deliberately hand-rolled rather than using `audioop.ratecv`: audioop was
+    removed in Python 3.13, and this runs on 3.11 (CI) and 3.12 (dev) today.
+    Linear interpolation is adequate here — the destination rate is 24 kHz and
+    the payload is speech headed for a transcription model, not audio anyone
+    listens to.
+    """
+    if src_rate == dst_rate or not pcm:
+        return pcm
+    src = array("h")
+    src.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    if sys.byteorder == "big":  # WAV frames are little-endian on the wire
+        src.byteswap()
+    out_len = int(len(src) * dst_rate / src_rate)
+    if out_len <= 0:
+        return b""
+    step = len(src) / out_len
+    out = array("h", bytes(2 * out_len))
+    for i in range(out_len):
+        pos = i * step
+        left = int(pos)
+        right = min(left + 1, len(src) - 1)
+        frac = pos - left
+        out[i] = int(src[left] + (src[right] - src[left]) * frac)
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes()
 
 
 def _completion_limit_kwargs(model: str, max_tokens: int) -> dict[str, Any]:
@@ -223,7 +271,23 @@ class ChatCompletionsProvider(BaseTranslationProvider):
         if TRANSCRIBE_MODEL.startswith("gpt-realtime"):
             pcm_wav = _read_pcm16_wav(data)
             if pcm_wav is not None:
-                return self._transcribe_realtime(*pcm_wav)
+                pcm, rate = pcm_wav
+                # The browser recorder ASKS for a 24 kHz AudioContext, but that
+                # is a request, not a guarantee — Safari/iOS ignores the
+                # requested sampleRate and hands back the hardware rate (44.1 or
+                # 48 kHz), and the recorder faithfully encodes the WAV at
+                # whatever it actually got. Sending that straight on made the
+                # realtime session reject the clip outright, so voice failed on
+                # every device that doesn't honour the request. Downsample here
+                # rather than trust the client.
+                if rate > REALTIME_MAX_SAMPLE_RATE:
+                    logging.info(
+                        "[Backend] downsampling %d Hz clip to %d Hz for %s",
+                        rate, REALTIME_MAX_SAMPLE_RATE, TRANSCRIBE_MODEL,
+                    )
+                    pcm = _resample_pcm16(pcm, rate, REALTIME_MAX_SAMPLE_RATE)
+                    rate = REALTIME_MAX_SAMPLE_RATE
+                return self._transcribe_realtime(pcm, rate)
             logging.warning(
                 "[Backend] %s takes PCM16 WAV only; %r falls back to REST %s",
                 TRANSCRIBE_MODEL, name, TRANSCRIBE_REST_MODEL,
