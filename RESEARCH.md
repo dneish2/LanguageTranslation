@@ -169,8 +169,12 @@ Ordered by value, with what each depends on.
 3. **Better row detection for coloured headings.** The remaining overlay error
    is concentrated in section headings the detector misses. A per-channel ink
    map (not just greyscale) would catch burgundy-on-cream.
-4. ~~**Local STT/TTS.**~~ **Done.** faster-whisper + Piper, both optional and
-   env-gated (`PASSAGE_LOCAL_VOICE=1`, `requirements-local-voice.txt`).
+4. ~~**Local STT/TTS.**~~ **Done.** faster-whisper + Piper, both optional
+   (`requirements-local-voice.txt`) and **on by default once the models are
+   actually installed**. `PASSAGE_LOCAL_VOICE` is tri-state (DECISIONS.md §2):
+   unset = auto, truthy (`1`/`true`/`yes`/`on`) forces on, falsey
+   (`0`/`false`/`no`/`off`) forces off. An unrecognised value warns and falls
+   back to auto rather than being silently swallowed.
    Measured on the same 6.6s clip, cache cleared, 3 runs each:
 
        LOCAL   median 1.51s   stt=local:base  tts=local:piper
@@ -195,21 +199,30 @@ Ordered by value, with what each depends on.
 
 ## 4a. Decisions waiting on David
 
-Not started, because each needs a call rather than more code.
+Each needed a call rather than more code. All three have now been made and
+implemented; they are kept here with their reasoning, struck through, because
+the argument matters more than the outcome if any of them is revisited.
 
 - ~~**Which Whisper size ships as the default?**~~ **Decided: keep `base`** —
   see "Whisper size: decided, but on evidence that doesn't count" below. The
   decision is cheap to revisit: `PASSAGE_WHISPER_MODEL` in
   `passage/local_voice.py` is the only place a size is named.
-- **Should local voice default ON when the models are present?** It currently
-  defaults off, matching "don't silently change where someone's audio is
-  processed". The argument for on: it is faster AND more private, so the
-  default penalises the better option. The argument for off: model weights
-  are a large implicit download.
-- **Do we ship voices, or fetch them on demand?** Each Piper voice is ~63MB.
-  Bundling a few makes the feature work out of the box; fetching keeps the
-  image small but means the first use of a language is slow and needs network
-   — awkward for a feature whose selling point is not needing the network.
+- ~~**Should local voice default ON when the models are present?**~~
+  **Decided and shipped: yes** (DECISIONS.md §2). Local voice is both faster
+  (1.51s vs 7.62s) and more private, so defaulting off penalised the better
+  option; and installing a speech stack plus ~63MB of weights is already an
+  explicit act, so "don't silently change where audio is processed" does not
+  bite. `PASSAGE_LOCAL_VOICE` became tri-state — unset = auto (on when the
+  models are really present), truthy = force on, falsey = force off — and
+  every page reports the RESOLVED state, never the flag.
+- ~~**Do we ship voices, or fetch them on demand?**~~ **Decided and shipped:
+  fetch on demand, pre-fetched in the background** (DECISIONS.md §3). Pure
+  on-demand would put a 63MB transfer on the request path, so
+  `local_voice.prefetch_voice` starts the download for the target language as
+  soon as that language is known and nothing ever waits on it: a translation
+  that finds no voice uses hosted TTS and says so in `meta["tts"]`. Downloads
+  publish through `.part` temporaries, config first and weights last, so a
+  killed transfer can never look installed.
 
 ### Whisper size: decided, but on evidence that doesn't count
 

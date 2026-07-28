@@ -58,6 +58,9 @@ def test_synthesis_needs_a_voice_for_that_language(monkeypatch, tmp_path):
     monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "1")
     monkeypatch.setattr(local_voice, "VOICE_DIR", tmp_path)
     (tmp_path / "es_ES-davefx-medium.onnx").write_bytes(b"stub")
+    # Weights alone are not a voice: discovery requires the .onnx.json Piper
+    # loads alongside them.
+    (tmp_path / "es_ES-davefx-medium.onnx.json").write_text("{}", encoding="utf-8")
 
     assert local_voice.voice_file_for("Spanish") is not None
     assert local_voice.voice_file_for("Japanese") is None

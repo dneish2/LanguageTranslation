@@ -41,7 +41,12 @@ def _install_fake_models(monkeypatch, tmp_path, *, whisper=True, piper=True, voi
             monkeypatch.setitem(sys.modules, name, None)  # import -> ImportError
     monkeypatch.setattr(local_voice, "VOICE_DIR", tmp_path)
     if voice:
+        # A voice is the weights AND the .onnx.json config; the weights alone
+        # are what a killed download leaves and are not loadable, so writing
+        # only the .onnx here would be pretending an install happened.
         (tmp_path / "es_ES-davefx-medium.onnx").write_bytes(b"stub")
+        (tmp_path / "es_ES-davefx-medium.onnx.json").write_text("{}", encoding="utf-8")
+    local_voice._warned_settings.clear()
 
 
 def _backend(monkeypatch):
@@ -199,6 +204,73 @@ def test_voice_page_renders_a_per_request_engine_element():
     assert "id={scope}_engines" in source
     assert "X-Engine-Summary" in source
     assert "updateEngines(" in source
+
+
+# ───────────── (d2) the tri-state understands how people spell it ────────── #
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", " True ", "yes", "y", "on", "t"])
+def test_truthy_spellings_force_local_on(monkeypatch, tmp_path, raw):
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", raw)
+    _install_fake_models(monkeypatch, tmp_path)
+
+    assert local_voice.mode() == "on"
+    assert local_voice.status()["unrecognised_setting"] is None
+    assert "forced on" in local_voice.describe()
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "FALSE", " off ", "no", "n", "f"])
+def test_falsey_spellings_force_hosted_even_with_models_present(monkeypatch, tmp_path, raw):
+    """The defect: only "1"/"0" parsed, so PASSAGE_LOCAL_VOICE=false meant auto
+    and turned local voice ON. The assertion is on the ENGINE LABELS - a mode
+    string alone would not prove the local path stayed unused."""
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", raw)
+    _install_fake_models(monkeypatch, tmp_path)
+
+    assert local_voice.mode() == "off"
+    assert local_voice.enabled() is False
+    assert local_voice.status()["unrecognised_setting"] is None
+
+    tb, backend = _backend(monkeypatch)
+
+    def must_not_run(*a, **kw):
+        raise AssertionError(f"local voice ran despite PASSAGE_LOCAL_VOICE={raw}")
+
+    monkeypatch.setattr(tb.local_voice, "transcribe", must_not_run)
+    monkeypatch.setattr(tb.local_voice, "synthesize", must_not_run)
+
+    _, _, _, meta = backend.translate_audio(b"audio", "Spanish")
+    assert meta["stt"] == "hosted" and meta["tts"] == "hosted"
+
+
+def test_an_unrecognised_value_warns_and_is_surfaced_not_swallowed(monkeypatch, tmp_path, caplog):
+    """A typo must not configure the app in silence. It falls back to auto -
+    but says so, in the log AND on the page, instead of describe() cheerfully
+    reporting "on (detected automatically)" as if that had been asked for."""
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "maybe-later")
+    _install_fake_models(monkeypatch, tmp_path)
+
+    with caplog.at_level("WARNING"):
+        assert local_voice.mode() == "auto"
+    assert any("maybe-later" in record.getMessage()
+               and record.levelname == "WARNING" for record in caplog.records)
+
+    state = local_voice.status()
+    assert state["unrecognised_setting"] == "maybe-later"
+    assert state["setting"] == "maybe-later"
+    text = local_voice.describe()
+    assert "maybe-later" in text and "not understood" in text
+
+
+def test_an_empty_or_unset_value_is_plain_auto_with_no_complaint(monkeypatch, tmp_path):
+    _install_fake_models(monkeypatch, tmp_path)
+    for value in (None, "", "   "):
+        if value is None:
+            monkeypatch.delenv("PASSAGE_LOCAL_VOICE", raising=False)
+        else:
+            monkeypatch.setenv("PASSAGE_LOCAL_VOICE", value)
+        assert local_voice.mode() == "auto"
+        assert local_voice.status()["unrecognised_setting"] is None
+        assert "not understood" not in local_voice.describe()
 
 
 # ─────────────────── (e) /engines reflects RESOLVED state ───────────────── #

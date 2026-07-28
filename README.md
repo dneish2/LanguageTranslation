@@ -49,6 +49,32 @@ UI; translation calls fail with a clear error until a provider is configured.
 | `PASSAGE_MAX_TEXT_CHARS` | `8000` | Max characters per text translation |
 | `PASSAGE_MAX_UPLOAD_BYTES` | `8388608` | Max upload size (8 MB) |
 | `LIVE_TEXT_STREAMING` | `false` | Enable SSE streaming for long text translations |
+| `PASSAGE_LOCAL_VOICE` | unset (auto) | Local speech recognition and synthesis — see below |
+| `PASSAGE_WHISPER_MODEL` | `base` | faster-whisper size for local transcription |
+| `PASSAGE_PIPER_VOICE_DIR` | `models/piper` | Where Piper voices are stored and fetched into |
+
+### Local voice (`PASSAGE_LOCAL_VOICE`)
+
+Speech can run entirely on your machine (faster-whisper for recognition, Piper
+for synthesis) instead of going to the hosted provider. Install it with
+`requirements-local-voice.txt`; voices are fetched on demand in the background,
+so nothing needs to be downloaded up front.
+
+The variable is **tri-state**:
+
+| Value | Meaning |
+|-------|---------|
+| unset or empty | **auto** — local voice is used when the models are actually present, hosted otherwise |
+| `1`, `true`, `yes`, `y`, `on`, `t` | force on (case- and whitespace-insensitive) |
+| `0`, `false`, `no`, `n`, `off`, `f` | force off, even with everything installed |
+
+Anything else is treated as a typo, not a mode: it is logged as a warning,
+reported as "not understood" on `/engines`, and behaves as auto.
+
+Forcing it on cannot conjure a model — with nothing installed, `/engines` says
+so and speech falls back to hosted. Whichever engine actually ran is named
+per request (`meta["stt"]` / `meta["tts"]`, and the `X-Engine-Summary` header),
+so a fallback is never mistaken for a private run.
 
 ## API
 

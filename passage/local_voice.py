@@ -42,14 +42,30 @@ from pathlib import Path
 #:            off was "don't silently move where audio is processed" — but
 #:            installing a speech stack and downloading ~63MB of voice weights
 #:            is already an explicit act. Nobody does that by accident.
-#:   "1"   -> force on. If the models are missing this reports that honestly
+#:   truthy -> force on. If the models are missing this reports that honestly
 #:            instead of pretending; a forced flag cannot conjure a model.
-#:   "0"   -> force off, even when everything is installed.
+#:   falsey -> force off, even when everything is installed.
+#:
+#: "Truthy"/"falsey" are the obvious spellings, case- and whitespace-insensitive
+#: (see _TRUTHY/_FALSEY). This used to accept ONLY "1"/"0" and treat every other
+#: value as auto, which meant PASSAGE_LOCAL_VOICE=false on a machine with the
+#: models installed turned local voice ON — a config value silently doing the
+#: opposite of what it says. Anything still unrecognised is a typo, not a mode:
+#: it warns, it is surfaced by status()/describe() as not understood, and the
+#: resolved behaviour falls back to auto rather than guessing an intent.
 #:
 #: Resolved by CALL, not frozen at import: /engines and the tests must be able
 #: to re-probe after a voice is downloaded, and an import-time constant would
 #: make the page's answer stale the moment the fetch-on-demand helper ran.
 _AUTO, _ON, _OFF = "auto", "on", "off"
+
+_TRUTHY = frozenset({"1", "true", "yes", "y", "on", "t"})
+_FALSEY = frozenset({"0", "false", "no", "n", "off", "f"})
+
+#: Values already warned about, so a probe called on every page render doesn't
+#: reprint the same warning forever. Keyed by the raw value, so CHANGING the
+#: variable to a second bad spelling still warns.
+_warned_settings: set[str] = set()
 
 #: "base" is the smallest model that transcribes cleanly in testing; tiny
 #: garbles proper nouns badly enough to poison the translation downstream.
@@ -108,13 +124,40 @@ def iso_code(language: str | None) -> str | None:
     return prefix.split("_")[0] if prefix else None
 
 
+def raw_setting() -> str:
+    """The env var exactly as set, trimmed. "" when unset."""
+    return (os.getenv("PASSAGE_LOCAL_VOICE") or "").strip()
+
+
+def unrecognised_setting() -> str | None:
+    """The raw value if it is set but means nothing, else None.
+
+    A setting nobody can parse must not be swallowed. It is warned once per
+    distinct value and reported by status()/describe(), because the failure
+    mode it replaces was invisible: PASSAGE_LOCAL_VOICE=false read as auto,
+    turned local voice on, and describe() said "on (detected automatically)".
+    """
+    raw = raw_setting()
+    if not raw or raw.casefold() in _TRUTHY or raw.casefold() in _FALSEY:
+        return None
+    if raw not in _warned_settings:
+        _warned_settings.add(raw)
+        logging.warning(
+            "[LocalVoice] PASSAGE_LOCAL_VOICE=%r is not understood; expected one of "
+            "%s (on) or %s (off), or unset for automatic. Falling back to automatic.",
+            raw, "/".join(sorted(_TRUTHY)), "/".join(sorted(_FALSEY)),
+        )
+    return raw
+
+
 def mode() -> str:
     """The tri-state, read fresh each call: "auto", "on" or "off"."""
-    raw = (os.getenv("PASSAGE_LOCAL_VOICE") or "").strip()
-    if raw == "1":
+    raw = raw_setting().casefold()
+    if raw in _TRUTHY:
         return _ON
-    if raw == "0":
+    if raw in _FALSEY:
         return _OFF
+    unrecognised_setting()   # warns once if it is set-but-meaningless
     return _AUTO
 
 
@@ -140,8 +183,27 @@ def piper_installed() -> bool:
     return True
 
 
+def _is_complete(onnx: Path) -> bool:
+    """A voice is its WEIGHTS PLUS its config. One file is not a voice.
+
+    Piper loads `<stem>.onnx` together with `<stem>.onnx.json` (phoneme map,
+    sample rate) and cannot load without the second. So "installed" is defined
+    here, once, and every probe below is derived from it.
+    """
+    return onnx.is_file() and Path(str(onnx) + ".json").is_file()
+
+
 def installed_voices() -> list[str]:
-    return sorted(p.stem for p in VOICE_DIR.glob("*.onnx")) if VOICE_DIR.is_dir() else []
+    """Stems of the COMPLETE voices on disk.
+
+    Incomplete .onnx files are ignored rather than listed: an interrupted
+    `piper.download_voices` (the install path requirements-local-voice.txt
+    documents) leaves weights with no config, and calling that a voice made
+    /engines claim a capability that fails at synthesis time.
+    """
+    if not VOICE_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in VOICE_DIR.glob("*.onnx") if _is_complete(p))
 
 
 def enabled() -> bool:
@@ -174,12 +236,27 @@ def stt_available() -> bool:
 
 
 def voice_file_for(language: str | None) -> Path | None:
-    """The Piper voice for this language, or None if we don't have one."""
+    """A COMPLETE Piper voice for this language, or None if we don't have one.
+
+    Selects the first complete pair, not the first sorted `.onnx`. That
+    distinction is the whole bug: this used to return the alphabetically first
+    match and `voice_installed` then asked whether THAT file had a config. A
+    single stale `es_ES-carlfm-x_low.onnx` — left by a Ctrl-C'd
+    `piper.download_voices`, the install path we document — sorts before
+    `es_ES-davefx-medium` and therefore answered for it forever. The strict
+    probe never became True even after a perfect 63MB download, so the
+    pre-fetch re-downloaded on every page load, and the loose probe handed
+    `synthesize()` the broken file, so local TTS failed on every request.
+
+    There is deliberately no loose/strict split any more: that seam is what let
+    two probes disagree about the same directory.
+    """
     prefix = VOICE_PREFIXES.get(_lang_key(language))
     if not prefix or not VOICE_DIR.is_dir():
         return None
     for candidate in sorted(VOICE_DIR.glob(f"{prefix}-*.onnx")):
-        return candidate
+        if _is_complete(candidate):
+            return candidate
     return None
 
 
@@ -247,6 +324,10 @@ def status() -> dict:
     voices = installed_voices()
     return {
         "mode": current,                      # what was asked for
+        "setting": raw_setting(),             # verbatim, so the UI can quote it
+        # Set-but-meaningless. Never None-and-fine: a value we couldn't parse
+        # has to reach the surface, or it configures the app by accident.
+        "unrecognised_setting": unrecognised_setting(),
         "enabled": enabled(),                 # what was resolved
         "stt_ready": stt,
         "stt_engine": f"local:{WHISPER_MODEL}" if stt else "hosted",
@@ -262,18 +343,25 @@ def describe() -> str:
     """What's actually available, for the engines page."""
     state = status()
     if state["mode"] == _OFF:
-        return "off (PASSAGE_LOCAL_VOICE=0) — recordings use the hosted models"
+        return (f"off (PASSAGE_LOCAL_VOICE={state['setting']}) — "
+                "recordings use the hosted models")
     detail = " · ".join((
         f"speech recognition: {'ready' if state['stt_ready'] else 'not installed'}",
         f"voices: {', '.join(state['voices']) if state['voices'] else 'none installed'}",
     ))
     if state["forced_but_missing"]:
-        return ("PASSAGE_LOCAL_VOICE=1 but nothing local is installed — "
+        return (f"PASSAGE_LOCAL_VOICE={state['setting']} but nothing local is installed — "
                 f"falling back to hosted ({detail})")
+    # A value we could not parse is reported before anything else it affected:
+    # it silently chose this behaviour, so the page must not present the result
+    # as if it had been asked for.
+    bad = state["unrecognised_setting"]
+    prefix = (f"PASSAGE_LOCAL_VOICE={bad} is not understood (expected 1/0, true/false, "
+              "yes/no or on/off) — using automatic detection · ") if bad else ""
     if not state["enabled"] or not (state["stt_ready"] or state["piper_ready"]):
-        return f"off — nothing local detected ({detail})"
+        return f"{prefix}off — nothing local detected ({detail})"
     how = "forced on" if state["mode"] == _ON else "on (detected automatically)"
-    return f"{how} · {detail}"
+    return f"{prefix}{how} · {detail}"
 
 
 # --------------------- VOICE DOWNLOAD (fetch on demand) ---------------------
@@ -282,7 +370,9 @@ def describe() -> str:
 # means the first use of a language is slow AND needs the network - the worst
 # possible failure for a feature whose entire selling point is not needing the
 # network. So: fetch on demand, and pre-fetch the current target language in
-# the background at workspace load (see TranslationUI._prefetch_local_voice).
+# the background as soon as the real target language is known (see
+# TranslationUI.request_voice_prefetch, called from the "To" input's change
+# handler on both the workspace and /voice).
 #
 # Nothing here is ever on the critical path of a translation. `ensure_voice`
 # raises nothing and returns None on any failure; the caller then uses hosted
@@ -322,14 +412,13 @@ _download_locks: dict = {}
 def voice_installed(language: str | None) -> bool:
     """Is a COMPLETE voice on disk for this language?
 
-    Stricter than `voice_file_for`, which only looks for the .onnx: Piper needs
-    the companion .onnx.json (phoneme map, sample rate) and cannot load without
-    it. A half-fetched pair with the weights but no config looks installed to a
-    glob and then fails at synthesis time - which gets reported as "local voice
-    broke" rather than the truth, "it has not finished downloading".
+    Now exactly `voice_file_for(...) is not None` — the same question, asked
+    once. It used to be the "strict" half of a two-probe split (glob for the
+    .onnx here, check the .json there) and the two could disagree about the
+    same directory; see `voice_file_for`. Kept as a name because it reads
+    better at the call sites that are asking about state rather than a path.
     """
-    path = voice_file_for(language)
-    return path is not None and Path(str(path) + ".json").is_file()
+    return voice_file_for(language) is not None
 
 
 def _fetch_url(url: str, destination: Path, *, timeout: float) -> None:

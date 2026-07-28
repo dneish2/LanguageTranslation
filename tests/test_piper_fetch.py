@@ -62,21 +62,31 @@ def _install_voice(directory: Path, stem: str = "es_ES-davefx-medium") -> Path:
 
 
 def _wire_local_tts_to_disk(monkeypatch):
-    """Make the local-TTS gate depend on what is actually on disk.
+    """Let the PRODUCTION gate decide, with only the library import faked.
 
-    `piper` is not installed in CI, so its import check would veto everything
-    and the disk-presence mechanism - the thing under test - would never run.
-    These stubs keep the mechanism (is the voice file there?) and drop only the
-    library import.
+    `piper` is not installed in CI, so `piper_installed()` would veto
+    everything and the disk-presence mechanism - the thing under test - would
+    never run. So we satisfy that one import with a stub module and leave
+    `tts_available` / `voice_file_for` alone.
+
+    This used to monkeypatch `tts_available` to BE `voice_installed`, which is
+    precisely what hid the stale-stem defect: the two probes disagreed in
+    production and the tests forced them to agree. Never substitute the probe
+    you are trying to verify.
+
+    `synthesize` is still replaced, because real Piper would have to load a
+    real 63MB VITS model - but the replacement re-checks the same production
+    probe, so a voice the app thinks is installed and cannot actually load
+    still raises here.
     """
-    monkeypatch.setattr(
-        local_voice, "tts_available",
-        lambda language: local_voice.voice_installed(language),
-    )
+    monkeypatch.setitem(sys.modules, "piper", types.ModuleType("piper"))
+
     def _synthesize(text, *, language):
-        if not local_voice.voice_installed(language):
+        path = local_voice.voice_file_for(language)
+        if path is None or not Path(str(path) + ".json").is_file():
             raise RuntimeError(f"No local voice installed for {language}.")
         return b"RIFF-LOCAL-WAV"
+
     monkeypatch.setattr(local_voice, "synthesize", _synthesize)
 
 
@@ -184,24 +194,39 @@ def test_a_failing_prefetch_never_raises_into_the_ui(monkeypatch, tmp_path):
     assert local_voice.ensure_voice("Spanish") is None
 
 
-def test_ui_workspace_load_prefetches_the_current_target_language(monkeypatch):
-    """The hook exists on the UI object, passes the CURRENT target language,
-    and survives a prefetch that explodes synchronously."""
+def test_ui_prefetches_the_language_it_is_handed(monkeypatch):
+    """The hook passes the language it is GIVEN (never a stale default), asks
+    once per language, and survives a prefetch that explodes synchronously.
+
+    Built through the real constructor. The previous version of this test used
+    `TranslationUI.__new__` and then hand-assigned the attributes it was
+    checking, so it would have passed in a world where __init__ never set them
+    up at all - a bypass, not a test.
+    """
     import TranslationUI
 
-    ui_obj = TranslationUI.TranslationUI.__new__(TranslationUI.TranslationUI)
-    ui_obj.current_target_language = "French"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    ui_obj = TranslationUI.TranslationUI()
 
     asked = []
     monkeypatch.setattr(TranslationUI.local_voice, "prefetch_voice", asked.append)
-    ui_obj._prefetch_local_voice()
+    ui_obj.request_voice_prefetch("French")
     assert asked == ["French"]
+
+    ui_obj.request_voice_prefetch("french")     # same language, already asked
+    ui_obj.request_voice_prefetch("")           # nothing to fetch
+    assert asked == ["French"]
+
+    # Omitted entirely, it falls back to the current target rather than
+    # guessing - and that is a DIFFERENT language, so it does fire.
+    ui_obj.request_voice_prefetch()
+    assert asked == ["French", ui_obj.current_target_language]
 
     def _explode(_language):
         raise RuntimeError("thread pool exhausted")
 
     monkeypatch.setattr(TranslationUI.local_voice, "prefetch_voice", _explode)
-    ui_obj._prefetch_local_voice()   # must not raise into page render
+    ui_obj.request_voice_prefetch("German")     # must not raise into page render
 
 
 # ──────────── (c) an interrupted download leaves nothing "installed" ─────────
@@ -230,16 +255,115 @@ def test_interrupted_download_leaves_nothing_a_probe_calls_installed(monkeypatch
 
 def test_a_partial_pair_without_its_json_is_not_installed(monkeypatch, tmp_path):
     """Weights without the companion .onnx.json cannot be loaded by Piper, so
-    the stricter probe must not call that installed even though the glob finds
-    a file."""
+    NO probe may call that a voice - including the one that returns the path
+    synthesis would load."""
     voice_dir = tmp_path / "piper"
     voice_dir.mkdir()
     (voice_dir / "es_ES-davefx-medium.onnx").write_bytes(b"weights-only")
     monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "1")
     monkeypatch.setattr(local_voice, "VOICE_DIR", voice_dir)
 
-    assert local_voice.voice_file_for("Spanish") is not None
+    assert local_voice.voice_file_for("Spanish") is None
     assert local_voice.voice_installed("Spanish") is False
+    assert local_voice.installed_voices() == []
+
+
+# ───────────── (c2) a stale incomplete stem must not answer for a good one ───
+
+STALE = "es_ES-carlfm-x_low"      # sorts BEFORE es_ES-davefx-medium
+GOOD = "es_ES-davefx-medium"      # what VOICE_ASSETS actually fetches
+
+
+def _stale_stem(voice_dir: Path) -> Path:
+    """What a Ctrl-C'd `piper.download_voices` leaves behind.
+
+    requirements-local-voice.txt documents that command, so this is on the
+    supported install path, not an exotic state.
+    """
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    stale = voice_dir / f"{STALE}.onnx"
+    stale.write_bytes(b"truncated-weights")
+    return stale
+
+
+def test_a_stale_incomplete_stem_does_not_answer_for_the_language(monkeypatch, tmp_path):
+    """Discovery must find a COMPLETE voice, not the first sorted .onnx.
+
+    With only the stale stem present there is no usable voice at all, and both
+    probes have to say so - the loose one especially, because it is what hands
+    `synthesize()` a file to load.
+    """
+    voice_dir = tmp_path / "piper"
+    _stale_stem(voice_dir)
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "1")
+    monkeypatch.setattr(local_voice, "VOICE_DIR", voice_dir)
+    _wire_local_tts_to_disk(monkeypatch)
+
+    assert local_voice.voice_file_for("Spanish") is None
+    assert local_voice.voice_installed("Spanish") is False
+    assert local_voice.tts_available("Spanish") is False
+    assert STALE not in local_voice.installed_voices()
+
+
+def test_a_stale_stem_is_skipped_in_favour_of_the_complete_voice(monkeypatch, tmp_path):
+    """Both on disk: the complete pair wins even though the stale stem sorts
+    first. The path returned is the one Piper can actually load."""
+    voice_dir = tmp_path / "piper"
+    _stale_stem(voice_dir)
+    good = _install_voice(voice_dir, GOOD)
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "1")
+    monkeypatch.setattr(local_voice, "VOICE_DIR", voice_dir)
+
+    assert local_voice.voice_file_for("Spanish") == good
+    assert local_voice.voice_installed("Spanish") is True
+    assert local_voice.installed_voices() == [GOOD]
+
+
+def test_a_stale_stem_does_not_cause_a_permanent_redownload_loop(monkeypatch, tmp_path):
+    """The reported defect, end to end.
+
+    Stale stem present -> ONE download completes -> the probe reports installed
+    -> meta["tts"] names the LOCAL engine -> a second prefetch downloads
+    NOTHING. Before the fix, discovery answered with the stale stem forever:
+    ensure_voice returned None even after a perfect fetch, every page load
+    re-pulled ~63MB, and local TTS failed on every request while the loose
+    probe still claimed it was available.
+    """
+    voice_dir = tmp_path / "piper"
+    _stale_stem(voice_dir)
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "1")
+    monkeypatch.setattr(local_voice, "VOICE_DIR", voice_dir)
+    monkeypatch.setattr(local_voice, "stt_available", lambda: False)
+    _wire_local_tts_to_disk(monkeypatch)
+    backend, provider = _backend_with_hosted_stub(monkeypatch)
+
+    # Before: nothing loadable, so hosted serves it AND says so.
+    assert backend.translate_audio(b"\x00\x01", "Spanish")[3]["tts"] == "hosted"
+
+    downloads = []
+
+    def _fetch(url, destination, *, timeout):
+        downloads.append(url)
+        destination.write_bytes(b"downloaded-bytes")
+
+    monkeypatch.setattr(local_voice, "_fetch_url", _fetch)
+
+    assert local_voice.ensure_voice("Spanish") == voice_dir / f"{GOOD}.onnx"
+    assert local_voice.voice_installed("Spanish") is True
+    first_round = len(downloads)
+    assert first_round == 2                      # the .onnx.json and the .onnx
+
+    # After: the SAME call now names the local engine.
+    meta = backend.translate_audio(b"\x00\x02", "Spanish")[3]
+    assert meta["tts"] == "local:piper"           # would fail if local never ran
+    assert meta["media_type"] == "audio/wav"
+    assert provider.synthesize_calls == 1         # only the first, hosted, call
+
+    # And nothing re-downloads: not the helper, not the background pre-fetch.
+    assert local_voice.ensure_voice("Spanish") == voice_dir / f"{GOOD}.onnx"
+    local_voice.prefetch_voice("Spanish")
+    time.sleep(0.2)
+    assert len(downloads) == first_round
 
 
 def test_a_good_voice_is_never_shadowed_by_a_refetch(monkeypatch, tmp_path):
