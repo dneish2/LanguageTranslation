@@ -27,6 +27,7 @@ from TranslationBackend import (
 )
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage import __version__ as passage_version
+from passage import engine_ledger
 from passage import policy
 from passage import provider_profiles
 from passage.auth.jwt_verify import identity_from_auth_header
@@ -278,11 +279,118 @@ class TranslationUI(VoicePageMixin):
                 .props("flat no-caps")\
                 .classes("p-mode-tab")
             profile = self.active_profile
+            ui.button("Engines", icon="insights",
+                      on_click=lambda: ui.navigate.to("/engines"))                .props("flat no-caps dense").classes("p-mode-tab ml-auto")                .tooltip("Where your text goes")
             ui.button(profile.describe() if profile else "Engine",
                       icon="tune", on_click=self.open_engine_settings)\
                 .props("flat no-caps dense")\
                 .classes("p-mode-tab ml-auto")\
                 .tooltip("Choose where translation runs")
+
+    def engines_page(self):
+        """Where your text has actually been going.
+
+        Deliberately not a settings screen. It answers "what happened to my
+        text this session, and what could this machine do instead", which is
+        the question the engine picker creates and nothing else answers.
+        """
+        self._inject_theme()
+        self._inject_api_token()
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                ui.button("Workspace", on_click=lambda: ui.navigate.to("/"))\
+                    .props("flat no-caps").classes("p-mode-tab")
+                ui.button("Compare", on_click=lambda: ui.navigate.to("/compare"))\
+                    .props("flat no-caps").classes("p-mode-tab")
+                ui.button("Engines").props("flat no-caps")\
+                    .classes("p-mode-tab p-mode-tab-active")
+
+        profile = self.active_profile
+        summary = engine_ledger.summarise(self.engine_runs)
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-5xl gap-4"):
+                ui.label("Where your text goes").classes("p-display text-xl")
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Right now").classes(theme.DATA)
+                    local_default = self.backend.choose_local_model()
+                    ui.label(policy.describe_privacy(
+                        profile, local_first_model=local_default)).classes("text-base")
+                    bits = [f"engine: {profile.describe() if profile else 'auto (local first)'}"]
+                    bits.append("metered" if policy.is_metered(
+                        profile, local_first_model=local_default) else "not metered")
+                    bits.append(f"local default: {local_default or 'none installed'}")
+                    ui.label(" · ".join(bits)).classes(theme.DATA)
+                    ui.button("Change engine", on_click=self.open_engine_settings)\
+                        .classes(f"{theme.BTN_SECONDARY_SM} mt-1")
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("This session").classes(theme.DATA)
+                    if not summary["total_runs"]:
+                        ui.label("Nothing translated yet.").classes("text-sm p-muted-text")
+                    else:
+                        local, remote = summary["local"], summary["remote"]
+                        share = int(summary["local_share_of_chars"] * 100)
+                        ui.label(f"{share}% of your text stayed on this machine")\
+                            .classes("text-base")
+                        # A bar, because a ratio is the whole point and a
+                        # number makes you do the comparison yourself.
+                        with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
+                                .style("background: var(--p-rule, #d6cbb4)"):
+                            if share:
+                                ui.element("div").classes("h-full")\
+                                    .style(f"width:{share}%; background: var(--p-ok, #3F6B4A)")
+                        ui.label(
+                            f"local: {local['runs']} runs · {local['chars']} chars"
+                            + (f" · {local['median_ms']} ms median" if local["median_ms"] is not None else "")
+                        ).classes(theme.DATA)
+                        ui.label(
+                            f"sent out: {remote['runs']} runs · {remote['chars']} chars"
+                            + (f" · {remote['median_ms']} ms median" if remote["median_ms"] is not None else "")
+                        ).classes(theme.DATA)
+                        for name, count in summary["engines"].items():
+                            ui.label(f"{name} — {count} run{'s' if count != 1 else ''}")\
+                                .classes(theme.DATA)
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Models on this machine").classes(theme.DATA)
+                    bench = self._load_bench_rows()
+                    installed = self.backend.available_local_models()
+                    if not installed:
+                        ui.label("No local models reachable — everything runs hosted.")\
+                            .classes("text-sm p-muted-text")
+                    for name in installed:
+                        row = bench.get(name)
+                        detail = "not benchmarked yet"
+                        if row:
+                            detail = (f"{row.get('size_gb', 0):.1f} GB · {row.get('median_ms')} ms"
+                                      f" · agreement {row.get('consensus')}")
+                        marker = " (default)" if name == self.backend.choose_local_model() else ""
+                        ui.label(f"{name}{marker} — {detail}").classes(theme.DATA)
+                    ui.label(
+                        "Agreement is how closely a model matches the others on a fixed "
+                        "suite; it rewards the mainstream reading, so a low score is a "
+                        "reason to look rather than proof of error."
+                    ).classes("text-xs p-muted-text")
+
+    def _load_bench_rows(self) -> dict[str, dict]:
+        """Latest benchmark row per model from data/model_bench.jsonl."""
+        rows: dict[str, dict] = {}
+        path = Path(__file__).resolve().parent / "data" / "model_bench.jsonl"
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    rows[row.get("model", "?")] = row      # later runs win
+        except (OSError, ValueError):
+            return {}
+        return rows
 
     def compare_page(self):
         """Same sentence, every engine, side by side.
@@ -1354,6 +1462,26 @@ class TranslationUI(VoicePageMixin):
         except (TypeError, ValueError):
             return None
 
+    @property
+    def engine_runs(self) -> list:
+        """This session's record of which engine served what. Same
+        session-cookie storage as recent_threads, and degrades to a throwaway
+        list outside a request context — transparency must never be the reason
+        a translation fails."""
+        try:
+            return app.storage.user.setdefault("engine_runs", [])
+        except RuntimeError:
+            return []
+
+    def _record_engine_run(self, *, surface, engine: str, latency_ms: int, chars: int) -> None:
+        try:
+            engine_ledger.record(
+                self.engine_runs, surface=str(getattr(surface, "value", surface)),
+                engine=engine, is_local=engine.startswith("local"),
+                latency_ms=latency_ms, chars=chars, when=time.time())
+        except Exception:  # never let bookkeeping break a translation
+            LOGGER.debug("engine run not recorded", exc_info=True)
+
     def _set_active_profile(self, profile) -> None:
         try:
             if profile is None:
@@ -1518,12 +1646,17 @@ class TranslationUI(VoicePageMixin):
             # (free, and measurably faster here), hosted otherwise. The engine
             # comes back with the translation so the UI can show which model
             # answered rather than leaving the user guessing.
+            started = time.perf_counter()
             translated, engine = await asyncio.to_thread(
                 self.backend.translate_live,
                 cleaned_text,
                 language,
                 self.active_profile,
             )
+            self._record_engine_run(
+                surface=policy.Surface.LIVE_TEXT, engine=engine,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                chars=len(cleaned_text))
             _log_event(
                 "ui.text_translate_succeeded",
                 correlation_id=correlation_id,
@@ -1541,8 +1674,12 @@ class TranslationUI(VoicePageMixin):
                     "translated_text": translated,
                     "target_language": language,
                     "engine": engine,
-                    "privacy": policy.describe_privacy(self.active_profile),
-                    "metered": policy.is_metered(self.active_profile),
+                    "privacy": policy.describe_privacy(
+                        self.active_profile,
+                        local_first_model=self.backend.choose_local_model()),
+                    "metered": policy.is_metered(
+                        self.active_profile,
+                        local_first_model=self.backend.choose_local_model()),
                 },
                 headers={"X-Correlation-Id": correlation_id},
             )
@@ -1732,6 +1869,7 @@ def start_ui() -> None:
     ui.page("/")(index)
     ui.page("/voice")(lambda: new_page_ui().voice_translation_page())
     ui.page("/compare")(lambda: new_page_ui().compare_page())
+    ui.page("/engines")(lambda: new_page_ui().engines_page())
     # /mobile is retired — one responsive layout; keep old bookmarks working
     ui.page("/mobile")(lambda: ui.navigate.to("/"))
     app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))

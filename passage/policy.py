@@ -113,34 +113,45 @@ def may_persist(surface: Surface, field: str) -> bool:
     return bool(getattr(policy, field))
 
 
-def is_metered(profile) -> bool:
+def is_metered(profile, *, local_first_model: str | None = None) -> bool:
     """Whether this run should count against a quota.
 
     A single question with a single answer: did Passage pay for the inference?
     Local models and a user's own key both mean no. Metering must read this
     rather than inspect provider details itself, so billing cannot drift away
     from routing.
+
+    `local_first_model` is part of that answer, not a detail: with no explicit
+    profile the live path still runs locally when a model is reachable, and
+    billing for inference that happened on the user's own GPU would be
+    charging for electricity someone else paid for.
     """
     if profile is None:
-        return True                     # Passage's own hosted key
+        return local_first_model is None
     return bool(getattr(profile, "is_metered", True))
 
 
-def data_leaves_machine(profile) -> bool:
+def data_leaves_machine(profile, *, local_first_model: str | None = None) -> bool:
     """Whether text is sent off this machine at all.
 
-    True for hosted and for a remote BYO endpoint; False only when inference is
-    local. This is what makes a real "nothing leaves your machine" claim
-    checkable instead of marketing.
+    `local_first_model` matters and was originally missed: with no explicit
+    profile the app still routes the live path to a local model when one is
+    reachable, so answering purely from the profile claimed "hosted, metered"
+    on a page that simultaneously reported 100% of the text had stayed on the
+    machine. A privacy line that contradicts the ledger beside it is worse
+    than none — this is the one claim that has to be right.
     """
     if profile is None:
-        return True
+        return local_first_model is None
     return not bool(getattr(profile, "uses_local_inference", False))
 
 
-def describe_privacy(profile) -> str:
+def describe_privacy(profile, *, local_first_model: str | None = None) -> str:
     """One line a user can act on, for the UI."""
-    if not data_leaves_machine(profile):
+    if not data_leaves_machine(profile, local_first_model=local_first_model):
+        if profile is None:
+            return (f"Runs on {local_first_model} on this machine — text isn't sent "
+                    "anywhere unless that model is unavailable.")
         return "Runs on your machine — text isn't sent anywhere."
     if not is_metered(profile):
         return "Runs on your own endpoint — not metered by Passage."
