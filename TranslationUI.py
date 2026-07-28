@@ -21,6 +21,7 @@ import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
 from TranslationBackend import (
     OLLAMA_BASE_URL,
+    TEXT_MODEL,
     TranslationBackend,
     TranslationRunState,
     SUPPORTED_DOCUMENT_EXTENSIONS,
@@ -30,6 +31,7 @@ from passage import __version__ as passage_version
 from passage import engine_ledger
 from passage import local_voice
 from passage import policy
+from passage import traces
 from passage import usage
 from passage import provider_profiles
 from passage.auth.jwt_verify import identity_from_auth_header
@@ -89,6 +91,9 @@ class TranslationUI(VoicePageMixin):
         # a private, real object (never None) so nothing falls through to the
         # ambient default.
         self.document_run_state: TranslationRunState = TranslationRunState()
+        #: Trace for the document currently open, so a segment edit knows which
+        #: run it is correcting. None until a document completes.
+        self.document_trace_id: str | None = None
 
         # ── DRAWER & ADVANCED MODE ──────────────────────────────────────
         self.drawer = None
@@ -1135,6 +1140,27 @@ class TranslationUI(VoicePageMixin):
                 self.original_segments_map[seg_id] = seg_info["original"]
                 self.translated_segments_map[seg_id] = seg_info["translated"]
 
+            # Open a trace for this run and record what the model produced, so
+            # any later human edit has something to be a correction OF. Policy
+            # decides whether these are written at all (documents: yes).
+            if not processed:
+                profile = self.active_profile
+                engine = profile.describe() if profile else f"hosted:{TEXT_MODEL}"
+                self.document_trace_id = traces.record_trace(traces.Trace(
+                    name=self.uploaded_file_name or "document",
+                    target_language=target_language,
+                    engine=engine,
+                    segment_count=len(seg_map),
+                    metadata={"extension": self.uploaded_file_extension},
+                ))
+                for seg_id, seg_info in seg_map.items():
+                    traces.record_generation(
+                        trace_id=self.document_trace_id, segment_id=seg_id,
+                        source=seg_info.get("original", ""),
+                        output=seg_info.get("translated", ""),
+                        engine=engine,
+                    )
+
             if not processed and self.uploaded_file_name:
                 self._record_thread({
                     "kind": "document",
@@ -1302,6 +1328,10 @@ class TranslationUI(VoicePageMixin):
     def update_segment_callback(self, seg_id, textarea, refine_input):
         try:
             instructions = refine_input.value or None
+            # Captured before the call: this is the machine's output, and the
+            # difference between it and what the human settles on is the only
+            # ground truth this app ever gets.
+            machine_output = self.translated_segments_map.get(seg_id, "")
             updated = self.backend.update_segment(
                 seg_id, textarea.value, self.current_target_language, instructions,
                 run_state=self.document_run_state,
@@ -1309,6 +1339,10 @@ class TranslationUI(VoicePageMixin):
             textarea.value = updated
             self.translated_segments_map[seg_id] = updated
             refine_input.value = ""
+            traces.record_edit(
+                trace_id=self.document_trace_id, segment_id=seg_id,
+                before=machine_output, after=updated,
+            )
             ui.notify("Segment updated successfully!", type="positive")
         except Exception as ex:
             logging.error(f"[UI] Error updating segment {seg_id}: {ex}", exc_info=True)
