@@ -228,6 +228,28 @@ class TranslationUI(VoicePageMixin):
 
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
+    def _prefetch_local_voice(self) -> None:
+        """Fetch the Piper voice for the CURRENT target language, in the
+        background, at workspace load.
+
+        Same shape as `backend.prewarm_live()`, for the same reason: a voice is
+        ~63MB, so doing it lazily at the moment someone presses speak would put
+        a minutes-long download on the request path. Here nobody is waiting.
+
+        Deliberately non-blocking and deliberately silent. `prefetch_voice`
+        returns immediately, spawns a daemon thread, no-ops when local voice is
+        off / the voice is already installed / the language has no Piper voice,
+        and swallows its own failures. Page render must never wait on it, and a
+        failed download must never reach the UI - a translation that finds no
+        voice simply uses hosted TTS and names it in meta["tts"].
+        """
+        try:
+            local_voice.prefetch_voice(self.current_target_language)
+        except Exception as error:
+            # Belt and braces: even the act of *starting* the prefetch must not
+            # be able to take the page down.
+            logging.info("[UI] voice prefetch skipped (%s)", error)
+
     def main_page(self, mode: str | None = None):
         # A fresh instance per page load (see start_ui) has no memory of what
         # mode was active on /voice — carry it across the navigation via
@@ -241,6 +263,9 @@ class TranslationUI(VoicePageMixin):
         # Get the local live model into VRAM while the user is still reading
         # the page, not on their first keystroke. Fire-and-forget.
         self.backend.prewarm_live()
+        # And, on the same principle, get the Piper voice for the language they
+        # are actually translating INTO onto disk before they ask for audio.
+        self._prefetch_local_voice()
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):

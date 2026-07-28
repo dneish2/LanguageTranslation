@@ -262,3 +262,161 @@ def describe() -> str:
         return f"off — nothing local detected ({detail})"
     how = "forced on" if state["mode"] == _ON else "on (detected automatically)"
     return f"{how} · {detail}"
+
+
+# --------------------- VOICE DOWNLOAD (fetch on demand) ---------------------
+#
+# Each Piper voice is ~63MB. Bundling several bloats the image; pure on-demand
+# means the first use of a language is slow AND needs the network - the worst
+# possible failure for a feature whose entire selling point is not needing the
+# network. So: fetch on demand, and pre-fetch the current target language in
+# the background at workspace load (see TranslationUI._prefetch_local_voice).
+#
+# Nothing here is ever on the critical path of a translation. `ensure_voice`
+# raises nothing and returns None on any failure; the caller then uses hosted
+# TTS and says so via meta["tts"].
+
+#: Where voices are fetched from. Piper's published voices live in the
+#: rhasspy/piper-voices repo on Hugging Face; overridable for mirrors, and for
+#: tests, which must never pull 63MB.
+VOICE_DOWNLOAD_BASE = os.getenv(
+    "PASSAGE_PIPER_VOICE_URL",
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main",
+)
+
+#: Voice-file prefix -> (repo path under the base URL, voice file stem).
+#: Explicit rather than derived: the repo layout is lang/locale/speaker/quality
+#: and the speaker name cannot be computed from the locale.
+VOICE_ASSETS = {
+    "en_US": ("en/en_US/lessac/medium", "en_US-lessac-medium"),
+    "es_ES": ("es/es_ES/davefx/medium", "es_ES-davefx-medium"),
+    "fr_FR": ("fr/fr_FR/siwis/medium", "fr_FR-siwis-medium"),
+    "de_DE": ("de/de_DE/thorsten/medium", "de_DE-thorsten-medium"),
+    "it_IT": ("it/it_IT/riccardo/x_low", "it_IT-riccardo-x_low"),
+    "pt_BR": ("pt/pt_BR/faber/medium", "pt_BR-faber-medium"),
+    "nl_NL": ("nl/nl_NL/mls/medium", "nl_NL-mls-medium"),
+    "pl_PL": ("pl/pl_PL/darkman/medium", "pl_PL-darkman-medium"),
+}
+
+#: A voice download is ~63MB; a stalled socket must not pin a thread forever.
+DOWNLOAD_TIMEOUT = float(os.getenv("PASSAGE_PIPER_DOWNLOAD_TIMEOUT", "60"))
+
+#: Guards two page loads racing to fetch the same voice. Per-process only - a
+#: second process would redo the work, which is wasteful but still correct,
+#: because publication is an atomic rename either way.
+_download_locks: dict = {}
+
+
+def voice_installed(language: str | None) -> bool:
+    """Is a COMPLETE voice on disk for this language?
+
+    Stricter than `voice_file_for`, which only looks for the .onnx: Piper needs
+    the companion .onnx.json (phoneme map, sample rate) and cannot load without
+    it. A half-fetched pair with the weights but no config looks installed to a
+    glob and then fails at synthesis time - which gets reported as "local voice
+    broke" rather than the truth, "it has not finished downloading".
+    """
+    path = voice_file_for(language)
+    return path is not None and Path(str(path) + ".json").is_file()
+
+
+def _fetch_url(url: str, destination: Path, *, timeout: float) -> None:
+    """Stream one URL to a path. Isolated so tests can replace the network."""
+    from urllib.request import urlopen
+    with urlopen(url, timeout=timeout) as response:  # noqa: S310 - fixed base URL
+        with open(destination, "wb") as handle:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                handle.write(chunk)
+
+
+def ensure_voice(language: str | None, *, timeout: float | None = None) -> Path | None:
+    """Return a usable voice path for `language`, downloading it if missing.
+
+    Never raises, and never partially shadows a good voice:
+
+    * both files stream into dot-prefixed `.part` temporaries first, so a
+      killed download leaves nothing that `voice_file_for`'s `*.onnx` glob can
+      mistake for an installed voice;
+    * the .onnx.json is renamed into place BEFORE the .onnx, because the .onnx
+      is what the probe looks for - publishing it last means the voice becomes
+      visible only once it is complete;
+    * an already-complete voice short-circuits, so a re-fetch can never replace
+      a working file with a truncated one.
+
+    This is slow by nature (~63MB) and must only be called off the request
+    path, from the background pre-fetch. A translation that finds no voice uses
+    hosted TTS and reports it rather than waiting for this.
+    """
+    if voice_installed(language):
+        return voice_file_for(language)
+
+    prefix = VOICE_PREFIXES.get(_lang_key(language))
+    asset = VOICE_ASSETS.get(prefix or "")
+    if asset is None:
+        logging.info("[LocalVoice] no downloadable voice for %s", language)
+        return None
+    repo_path, stem = asset
+
+    import threading
+    lock = _download_locks.setdefault(stem, threading.Lock())
+    with lock:
+        # Another thread may have finished while this one waited for the lock.
+        if voice_installed(language):
+            return voice_file_for(language)
+
+        target_dir = VOICE_DIR
+        onnx = target_dir / (stem + ".onnx")
+        config = target_dir / (stem + ".onnx.json")
+        # Dot-prefixed and NOT ending in .onnx: invisible to the install probe.
+        temp_onnx = target_dir / ("." + stem + ".onnx.part")
+        temp_config = target_dir / ("." + stem + ".onnx.json.part")
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            wait = DOWNLOAD_TIMEOUT if timeout is None else timeout
+            logging.info("[LocalVoice] fetching voice %s (~63MB)", stem)
+            _fetch_url(VOICE_DOWNLOAD_BASE + "/" + repo_path + "/" + stem + ".onnx.json",
+                       temp_config, timeout=wait)
+            _fetch_url(VOICE_DOWNLOAD_BASE + "/" + repo_path + "/" + stem + ".onnx",
+                       temp_onnx, timeout=wait)
+            if temp_onnx.stat().st_size == 0 or temp_config.stat().st_size == 0:
+                raise RuntimeError("empty voice download")
+            os.replace(temp_config, config)   # config first...
+            os.replace(temp_onnx, onnx)       # ...weights last: now it is installed
+            logging.info("[LocalVoice] voice ready: %s", stem)
+            return onnx if voice_installed(language) else None
+        except Exception as error:
+            logging.info("[LocalVoice] voice fetch failed for %s (%s)", language, error)
+            for leftover in (temp_onnx, temp_config):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            return None
+
+
+def prefetch_voice(language: str | None) -> None:
+    """Kick off a voice download in the background. Fire-and-forget.
+
+    Same shape as `TranslationBackend.prewarm_live`: off the render path, in a
+    daemon thread, failures swallowed and logged, never awaited by the UI. If
+    it finishes in time the next translation speaks locally; if it does not,
+    that translation goes hosted and says so. Nothing blocks on this.
+    """
+    # Downloads follow the same switch synthesis does — `enabled()`, the
+    # tri-state above — so we can never fetch 63MB for a feature that is off.
+    if not enabled() or voice_installed(language):
+        return
+    if VOICE_PREFIXES.get(_lang_key(language)) is None:
+        return
+
+    def fetch() -> None:
+        try:
+            ensure_voice(language)
+        except Exception as error:  # ensure_voice swallows already; belt and braces
+            logging.info("[LocalVoice] background prefetch skipped (%s)", error)
+
+    import threading
+    threading.Thread(target=fetch, daemon=True).start()
