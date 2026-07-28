@@ -643,3 +643,101 @@ def test_document_upload_accepts_each_supported_extension(monkeypatch):
 
         assert ui_app.uploaded_file_extension == ext
         assert ui_app.uploaded_file is not None
+
+
+def test_provider_profile_never_exposes_the_raw_key():
+    """A BYO profile holds the user's own API key. Only redacted() is safe to
+    render, return over HTTP, or log."""
+    from passage import provider_profiles as pp
+
+    profile = pp.ProviderProfile(label="mine", kind=pp.KIND_BYO,
+                                 base_url="https://api.example.com/v1",
+                                 api_key="sk-supersecret-1234", model="gpt-4o-mini")
+    shown = profile.redacted()
+
+    assert "api_key" not in shown
+    assert shown["api_key_hint"] == "…1234"
+    assert "sk-supersecret-1234" not in str(shown)
+
+
+def test_only_the_hosted_app_profile_is_metered():
+    """BYO means the app isn't paying, so it must not bill. One place decides,
+    so metering can't drift from provider selection."""
+    from passage import provider_profiles as pp
+
+    assert pp.app_default_profile("gpt-5.4-nano").is_metered is True
+    assert pp.local_profile("http://localhost:11434/v1", "qwen2.5:7b").is_metered is False
+    assert pp.ProviderProfile(label="x", kind=pp.KIND_BYO).is_metered is False
+
+
+def test_profile_validation_messages():
+    from passage import provider_profiles as pp
+
+    assert pp.validate("https://a/v1", "sk-x", "") is not None          # no model
+    assert pp.validate("", "sk-x", "m") is not None                     # no base_url
+    assert pp.validate("ftp://a", "sk-x", "m") is not None              # not http(s)
+    assert pp.validate("https://api.example.com/v1", "", "m") is not None  # remote needs a key
+    # A loopback endpoint legitimately needs no key.
+    assert pp.validate("http://localhost:11434/v1", "", "qwen2.5:7b") is None
+    assert pp.validate("https://api.example.com/v1", "sk-x", "gpt-4o-mini") is None
+
+
+def test_test_profile_scrubs_the_key_out_of_error_messages(monkeypatch):
+    """The failure text goes straight into a settings dialog."""
+    import TranslationBackend as tb
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    profile = pp.ProviderProfile(label="mine", kind=pp.KIND_BYO,
+                                 base_url="https://api.example.com/v1",
+                                 api_key="sk-leak-me", model="gpt-4o-mini")
+
+    def boom(**kw):
+        raise RuntimeError("401 unauthorized for key sk-leak-me")
+
+    backend.provider_for_profile(profile).create_chat_completion = boom
+    result = backend.test_profile(profile)
+
+    assert result["ok"] is False
+    assert "sk-leak-me" not in result["error"]
+
+
+def test_explicit_profile_is_honoured_over_local_first(monkeypatch):
+    """Local-first is a default, not an override: if the user picked an
+    endpoint, sending their text somewhere else is exactly the surprise a
+    picker exists to prevent."""
+    import TranslationBackend as tb
+    from types import SimpleNamespace
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    backend._live_local_provider = lambda: (_ for _ in ()).throw(
+        AssertionError("local-first ran despite an explicit profile"))
+    profile = pp.ProviderProfile(label="mine", kind=pp.KIND_BYO,
+                                 base_url="https://api.example.com/v1",
+                                 api_key="sk-x", model="gpt-4o-mini")
+    backend.provider_for_profile(profile).create_chat_completion = lambda **kw: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="Hola"))])
+
+    assert backend.translate_live("Hello", "Spanish", profile) == ("Hola", "byo:gpt-4o-mini")
+
+
+def test_profile_providers_are_cached_by_settings_not_identity(monkeypatch):
+    """Editing a profile must produce a new client, not silently reuse the old
+    endpoint."""
+    import TranslationBackend as tb
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    a = pp.ProviderProfile(label="a", kind=pp.KIND_BYO, base_url="https://one/v1",
+                           api_key="k", model="m")
+    same = pp.ProviderProfile(label="renamed", kind=pp.KIND_BYO, base_url="https://one/v1",
+                              api_key="k", model="m")
+    edited = pp.ProviderProfile(label="a", kind=pp.KIND_BYO, base_url="https://two/v1",
+                                api_key="k", model="m")
+
+    assert backend.provider_for_profile(a) is backend.provider_for_profile(same)
+    assert backend.provider_for_profile(a) is not backend.provider_for_profile(edited)
