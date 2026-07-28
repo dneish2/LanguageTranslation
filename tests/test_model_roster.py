@@ -1,6 +1,7 @@
 """The model roster: GPT-5-family models need max_completion_tokens (not
 max_tokens) and get reasoning_effort pinned to "none" for latency; legacy
 models keep max_tokens so PASSAGE_TEXT_MODEL can roll back without code."""
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -618,3 +619,68 @@ def test_live_local_can_be_disabled_by_env(monkeypatch):
     backend = _live_backend(monkeypatch)
 
     assert backend._live_local_provider() is None
+
+
+def test_native_provider_reserves_budget_for_thinking(monkeypatch):
+    """num_predict caps the WHOLE generation and a thinking model spends it on
+    deliberation FIRST — qwen3:30b asked for a one-line translation with
+    num_predict=200 produced 754 chars of thinking and empty content, which
+    looks exactly like a broken model."""
+    from passage import ollama_native as on
+
+    sent = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"message":{"content":"Hola","thinking":"..."}}'
+
+    def fake_urlopen(request, timeout=None):
+        sent.update(json.loads(request.data.decode()))
+        return _Resp()
+
+    monkeypatch.setattr(on.urllib.request, "urlopen", fake_urlopen)
+
+    on.NativeOllamaProvider(base_url="http://x/v1", text_model="qwen3:30b").chat(
+        [{"role": "user", "content": "hi"}], max_tokens=200)
+    assert sent["options"]["num_predict"] == 200 + on.THINKING_RESERVE_TOKENS
+
+    on.NativeOllamaProvider(base_url="http://x/v1", text_model="translategemma:4b").chat(
+        [{"role": "user", "content": "hi"}], max_tokens=200)
+    assert sent["options"]["num_predict"] == 200
+
+
+def test_native_provider_keeps_thinking_out_of_the_answer(monkeypatch):
+    """The shim flattens both channels into one and loses the answer; the
+    native endpoint keeps them apart. Deliberation must never be presented as
+    output."""
+    from passage import ollama_native as on
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return json.dumps({"message": {"content": "La junta rechazó la recompra.",
+                                           "thinking": "Okay, let me think about this…"}}).encode()
+
+    monkeypatch.setattr(on.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    provider = on.NativeOllamaProvider(base_url="http://x/v1", text_model="qwen3:30b")
+
+    message = provider.create_chat_completion(
+        messages=[{"role": "user", "content": "hi"}]).choices[0].message
+
+    assert message.content == "La junta rechazó la recompra."
+    assert "Okay" not in message.content
+    assert message.reasoning.startswith("Okay")
+
+
+def test_thinking_models_are_kept_out_of_translation_rosters():
+    """Translation is transduction, not reasoning. qwen3:30b spent 8,786
+    characters deliberating a one-line translation and still produced no
+    answer, even with a 2,048-token reserve."""
+    from passage import ollama_native as on
+
+    assert on.suits_translation("qwen3:30b") is False
+    assert on.suits_translation("qwen3-vl:8b") is False
+    assert on.suits_translation("translategemma:4b") is True
+    assert on.suits_translation("qwen2.5:7b") is True

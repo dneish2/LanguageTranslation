@@ -29,6 +29,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
 
 from passage import compare
+from passage import text_rows
 from passage import provider_profiles as pp
 
 from translation_metrics import MetricsCollector, TranslationMetrics
@@ -1487,6 +1488,27 @@ class TranslationBackend:
         avg_confidence = sum(confidences) / len(confidences)
         if avg_confidence < 0.45:
             raise ValueError("Low OCR confidence. Please retake the image in better lighting.")
+
+        # Correct the model's vertical placement against the actual ink. Its
+        # boxes sat ~35px low on this menu, so every overlay covered the line
+        # BELOW its text and left the original showing above.
+        try:
+            with Image.open(BytesIO(image_bytes)) as page:
+                rows = text_rows.detect_text_rows(page.convert("RGB"))
+            if rows:
+                boxed = [b["bbox"] for b in translated_blocks if b.get("bbox")]
+                scale, offset = text_rows.fit_vertical_correction(boxed, rows)
+                page_height = Image.open(BytesIO(image_bytes)).height
+                if (scale, offset) != (1.0, 0.0):
+                    for block in translated_blocks:
+                        if block.get("bbox"):
+                            block["bbox"] = text_rows.apply_vertical_correction(
+                                block["bbox"], scale, offset, page_height)
+                logging.info(
+                    "[Backend] %d text rows detected; overlay corrected y*%.3f%+.1f",
+                    len(rows), scale, offset)
+        except Exception as error:  # geometry is an improvement, never a gate
+            logging.info("[Backend] row detection skipped (%s)", error)
 
         # The "translated in place" image: the whole point of pointing a phone
         # at a menu. Only blocks with a usable bbox are drawn.
