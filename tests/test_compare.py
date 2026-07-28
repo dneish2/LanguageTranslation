@@ -158,3 +158,57 @@ def test_reasoning_text_is_never_used_as_the_translation():
 
     assert results[0].text == ""
     assert "TABERNA" not in (results[0].text or "")
+
+
+def test_policy_keeps_session_history_separate_from_durable_storage():
+    """The decision was "documents go to the cloud, camera and live typing stay
+    local". Reading that as "live typing persists nothing" would have silently
+    deleted the Recent Threads drawer, which is session-scoped and thrown away
+    when the session ends — a different thing entirely."""
+    from passage import policy
+
+    live = policy.retention_for(policy.Surface.LIVE_TEXT)
+    assert live.session_history is True, "would have removed Recent Threads"
+    assert live.persists_durably is False
+
+    document = policy.retention_for(policy.Surface.DOCUMENT)
+    assert document.durable_segments is True and document.durable_traces is True
+    assert document.durable_original_file is False, "storing uploads adds liability, not product"
+
+
+def test_no_surface_may_durably_store_the_original_file():
+    from passage import policy
+
+    for surface in policy.Surface:
+        assert policy.retention_for(surface).durable_original_file is False
+
+
+def test_camera_and_voice_never_persist_durably():
+    from passage import policy
+
+    for surface in (policy.Surface.IMAGE, policy.Surface.VOICE):
+        assert policy.retention_for(surface).persists_durably is False
+
+
+def test_metering_is_one_question_with_one_answer():
+    """Did Passage pay for the inference? Billing must read this rather than
+    inspect provider details, so it can't drift away from routing."""
+    from passage import policy, provider_profiles as pp
+
+    assert policy.is_metered(None) is True                       # hosted default
+    assert policy.is_metered(pp.local_profile("http://localhost:11434/v1", "x")) is False
+    assert policy.is_metered(pp.ProviderProfile(label="mine", kind=pp.KIND_BYO)) is False
+
+
+def test_privacy_line_distinguishes_local_from_byo_from_hosted():
+    from passage import policy, provider_profiles as pp
+
+    local = policy.describe_privacy(pp.local_profile("http://localhost:11434/v1", "x"))
+    byo = policy.describe_privacy(pp.ProviderProfile(label="m", kind=pp.KIND_BYO))
+    hosted = policy.describe_privacy(None)
+
+    assert "your machine" in local and policy.data_leaves_machine(
+        pp.local_profile("http://localhost:11434/v1", "x")) is False
+    assert "not metered" in byo and policy.data_leaves_machine(
+        pp.ProviderProfile(label="m", kind=pp.KIND_BYO)) is True
+    assert "metered" in hosted

@@ -26,6 +26,8 @@ from TranslationBackend import (
     SUPPORTED_DOCUMENT_EXTENSIONS,
 )
 from passage.ui.common import LANGUAGES, log_event as _log_event
+from passage import __version__ as passage_version
+from passage import policy
 from passage import provider_profiles
 from passage.auth.jwt_verify import identity_from_auth_header
 from passage.ui.voice_page import VoicePageMixin
@@ -234,6 +236,11 @@ class TranslationUI(VoicePageMixin):
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
+                # The only way into Recent Threads on a phone.
+                ui.button(icon="menu", on_click=lambda: self.drawer.toggle())\
+                    .props("flat round dense")\
+                    .classes("p-mode-tab")\
+                    .tooltip("Recent threads")
                 ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
                     .on("click", lambda: ui.navigate.to("/"))
                 ui.element("div").classes("p-header-sep")
@@ -241,7 +248,11 @@ class TranslationUI(VoicePageMixin):
                 self._render_mode_tabs()
 
         # Recent Threads drawer (renders itself into self.drawer)
-        self.drawer = ui.drawer(side='left').classes(theme.DRAWER)
+        # show-if-above keeps the drawer open on wide screens and closed on a
+        # phone, where it is opened by the header's menu button. Without that
+        # button the drawer was simply unreachable at 390px: the page's only
+        # controls were the mode tabs, swap and Translate.
+        self.drawer = ui.drawer(side='left').props("show-if-above").classes(theme.DRAWER)
         self.show_document_list()
 
         # Default workspace page
@@ -1426,7 +1437,13 @@ class TranslationUI(VoicePageMixin):
         threads[:] = [t for t in threads if t.get("id") != thread_id]
         self.show_document_list()
 
-    def _record_chat_thread(self, original: str, translated: str, language: str) -> None:
+    def _record_chat_thread(self, original: str, translated: str, language: str,
+                            surface: policy.Surface = policy.Surface.TEXT) -> None:
+        # Retention is decided in one place (passage/policy.py) rather than by
+        # each call site, because a data-retention rule that drifts is the kind
+        # of bug you hear about from someone else.
+        if not policy.may_persist(surface, "session_history"):
+            return
         self._record_thread({
             "kind": "chat",
             "label": original[:48],
@@ -1513,13 +1530,19 @@ class TranslationUI(VoicePageMixin):
                 language=language,
                 engine=engine,
             )
-            self._record_chat_thread(cleaned_text, translated, language)
+            # LIVE_TEXT keeps a SESSION entry (thread continuation already
+            # collapses one sentence into one row) but is never persisted
+            # durably — see passage/policy.py for the distinction.
+            self._record_chat_thread(cleaned_text, translated, language,
+                                     surface=policy.Surface.LIVE_TEXT)
             return JSONResponse(
                 {
                     "original_text": cleaned_text,
                     "translated_text": translated,
                     "target_language": language,
                     "engine": engine,
+                    "privacy": policy.describe_privacy(self.active_profile),
+                    "metered": policy.is_metered(self.active_profile),
                 },
                 headers={"X-Correlation-Id": correlation_id},
             )
@@ -1642,6 +1665,27 @@ class TranslationUI(VoicePageMixin):
             return JSONResponse({"authenticated": False, "user_id": None, "email": None})
         return JSONResponse({"authenticated": True, "user_id": user_id, "email": email})
 
+    async def api_health(self, request: Request) -> JSONResponse:
+        """Liveness plus what this instance can actually do right now.
+
+        Commit 546a291 said it added this; its diff was two lines in
+        passage/__init__.py and the route 404'd, so anything health-checking
+        the deploy was checking nothing. Ungated on purpose — a health check
+        that needs a page-issued token is not a health check.
+
+        It reports capability, not just "alive": whether a hosted provider is
+        configured and which local models are reachable, because "up but
+        unable to translate" is the failure worth catching.
+        """
+        local = self.backend.available_local_models()
+        return JSONResponse({
+            "status": "ok",
+            "version": passage_version,
+            "hosted_provider": self.backend.provider is not None,
+            "local_models": local,
+            "local_default": self.backend.choose_local_model(),
+        })
+
 
 def start_ui() -> None:
     """App bootstrap: one shared backend/api_guard for the whole process
@@ -1677,6 +1721,7 @@ def start_ui() -> None:
     # Phase 4 (accounts): identity-only, not gated by the paid-API token —
     # degrades to anonymous with zero config until SUPABASE_URL is set.
     app.add_api_route("/api/me", api_service.api_me, methods=["GET"])
+    app.add_api_route("/api/health", api_service.api_health, methods=["GET"])
 
     # `mode` is a plain FastAPI-style query param (?mode=Document) — NiceGUI
     # wires ui.page function parameters the same way. See main_page()/
