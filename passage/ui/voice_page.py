@@ -14,6 +14,7 @@ from starlette.responses import Response
 
 import theme
 from api_security import MAX_UPLOAD_BYTES
+from passage import local_voice
 from passage.ui.common import LANGUAGES, log_event
 
 
@@ -38,28 +39,44 @@ def format_engine_line(meta: dict) -> str:
     return line
 
 
-class VoicePageMixin:
-    def _render_voice_status_block(self, scope: str) -> None:
-        ui.label("Status").classes(f"{theme.DATA} mt-3")
-        ui.label("")\
-            .classes("text-base")\
-            .props(f"id={scope}_status")
-        # Which engine served THIS request. Always visible (not behind ?debug),
-        # because local voice is now on by default when the models are present
-        # and a silent default is only acceptable if the page names where the
-        # recording actually went.
-        ui.label("")\
-            .classes(f"{theme.DATA} min-h-[20px]")\
-            .props(f"id={scope}_engines")
-        # Developer readout — hidden unless the page is opened with ?debug=1
-        # (voiceUx.init reveals .p-debug-block); updateDebug still writes to it.
-        ui.label("Debug").classes(f"{theme.DATA} mt-1 hidden p-debug-block")
-        ui.label("")\
-            .classes(f"{theme.DATA} min-h-[20px] hidden p-debug-block")\
-            .props(f"id={scope}_debug")
+#: What the engine line says while a request is in flight. The line names the
+#: engines that served ONE request, so it must never survive into the next one:
+#: a stale "spoken by local:piper — this machine" sitting above a transcript
+#: translation that produced no audio at all is a false privacy claim, not a
+#: cosmetic bug. Every entry point clears to this first.
+ENGINE_LINE_PENDING = "engines: waiting for this request to report what ran"
 
-    def _inject_voice_frontend_helpers(self) -> None:
-        ui.add_head_html("""
+#: Audio finished but the backend sent no summary header.
+ENGINE_LINE_AUDIO_UNREPORTED = (
+    "engines: this recording finished but the server did not name what ran"
+)
+
+#: Audio failed. Nothing was translated, so nothing may be claimed.
+ENGINE_LINE_AUDIO_FAILED = (
+    "engines: unknown — this recording failed, nothing was translated or spoken"
+)
+
+#: The transcript path calls the TEXT endpoint. No microphone, no speech
+#: synthesis: naming any audio engine here would be a lie by copy-paste.
+ENGINE_LINE_TEXT_UNREPORTED = (
+    "text only — no audio was heard or spoken · "
+    "the server did not name the translation engine"
+)
+ENGINE_LINE_TEXT_FAILED = (
+    "engines: unknown — this transcript translation failed · "
+    "no audio was heard or spoken"
+)
+
+
+def format_text_engine_line(engine: str) -> str:
+    """The engine line for the transcript path, which runs TEXT only."""
+    if not engine:
+        return ENGINE_LINE_TEXT_UNREPORTED
+    where = "this machine" if engine.startswith("local") else "sent out"
+    return f"translated by {engine} — {where} · text only, no audio was heard or spoken"
+
+
+VOICE_UX_JS = """
 <script>
 window.voiceUx = window.voiceUx || (() => {
     const states = {
@@ -119,80 +136,11 @@ window.voiceUx = window.voiceUx || (() => {
     return { states, init, setStatus, setDebug, setEngines, setRecordingButtons };
 })();
 </script>
-        """)
+"""
 
-    def _go_workspace(self, mode: str) -> None:
-        # main_page() runs on a FRESH TranslationUI() instance (see
-        # start_ui) — setting self.input_mode here would be discarded, so
-        # the mode travels via the URL instead.
-        ui.navigate.to(f"/?mode={quote(mode)}")
 
-    def voice_translation_page(self):
-        self._inject_theme()
-        self._inject_api_token()
-        self._inject_voice_frontend_helpers()
 
-        # Same header as the workspace; Voice is the active tab.
-        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
-            with ui.row().classes("w-full items-center gap-3"):
-                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
-                    .on("click", lambda: ui.navigate.to("/"))
-                ui.element("div").classes("p-header-sep")
-                with ui.row().classes("items-center gap-0"):
-                    for label, mode in (("Text", "Text"), ("Document", "Document"), ("Image", "Image/Camera")):
-                        ui.button(label, on_click=lambda _, m=mode: self._go_workspace(m))\
-                            .props("flat no-caps").classes("p-mode-tab")
-                    ui.button("Voice").props("flat no-caps").classes("p-mode-tab p-mode-tab-active")
-
-        with ui.column().classes("w-full items-center p-4"):
-            with ui.column().classes("w-full max-w-3xl gap-3"):
-                with ui.row().classes(f"w-full items-center gap-3 flex-wrap {theme.WELL} p-3"):
-                    ui.label("To").classes(theme.DATA)
-                    options = "".join(f'<option value="{lang}"></option>' for lang in LANGUAGES)
-                    ui.html(
-                        f'<input id="language_select" list="passage_languages" value="Spanish" '
-                        f'placeholder="Type a language…" class="px-3 py-2 p-well">'
-                        f'<datalist id="passage_languages">{options}</datalist>'
-                    )
-                    ui.element("div").classes("flex-grow")
-                    # NO inline event-handler attributes here. NiceGUI 3 renders
-                    # ui.html() through DOMPurify, which strips them, so the
-                    # handler these two buttons used to carry never reached the
-                    # DOM and BOTH were dead for every user on every browser --
-                    # silently, with no console error, the status label simply
-                    # never changing. They are wired by delegated listeners on
-                    # `document` (see the script block below), the same pattern
-                    # the workspace live-translate JS already uses.
-                    ui.html('<button id="desktop_voice_start_recording" class="p-btn p-btn-ok px-4 py-2" '
-                            '>● Record</button>')
-                    ui.html('<button id="desktop_voice_stop_recording" class="p-btn p-btn-danger px-4 py-2" '
-                            'disabled>■ Stop</button>')
-
-                self._render_voice_status_block("desktop_voice")
-
-                with ui.grid(columns=2).classes("w-full gap-3"):
-                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_SOURCE}"):
-                        ui.label("Original").classes(theme.DATA)
-                        ui.label("").classes("min-h-[60px]").props("id=original_text")
-                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_TARGET}"):
-                        ui.label("Translation").classes(theme.DATA)
-                        ui.label("").classes("min-h-[60px]").props("id=translated_text")
-
-                ui.audio(src="data:audio/wav;base64,")\
-                  .props("id=out_audio controls")\
-                  .classes("w-full")
-
-                with ui.expansion("No microphone? Paste a transcript instead").classes(f"w-full {theme.WELL}"):
-                    ui.textarea(
-                        placeholder="Paste text here if your browser cannot record audio.",
-                    ).props("for=desktop_voice_transcript autogrow").classes("w-full")
-                    ui.button("Translate transcript", on_click=lambda: ui.run_javascript("translateTranscriptFallback()"))\
-                        .classes(f"{theme.BTN_PRIMARY} mt-2 mb-2")
-
-        # Raw string: the SSE parser below needs literal \n in the JS —
-        # a plain triple-quote turned it into a real newline, which was a
-        # SyntaxError that silently killed this whole script block.
-        ui.add_head_html(r"""
+_VOICE_PAGE_JS_TEMPLATE = r"""
 <script>
     // PCM16 WAV capture via Web Audio (24 kHz): feeds the realtime
     // transcription models directly — no webm container, no transcoding.
@@ -209,6 +157,29 @@ window.voiceUx = window.voiceUx || (() => {
     }
     function updateEngines(msg) {
         window.voiceUx.setEngines(DESKTOP_SCOPE, msg);
+    }
+    // ── engine line lifecycle ────────────────────────────────────────────
+    // The line names the engines that served ONE request. It used to be
+    // written in exactly one place (audio success) and cleared nowhere, so a
+    // recording's "spoken by local:piper — this machine" stayed on screen
+    // above a later transcript translation that produced no audio at all, and
+    // above failed recordings. Every entry point below now clears it FIRST and
+    // writes an honest line on both success and failure.
+    const ENGINE_PENDING = 'ENGINE_LINE_PENDING';
+    const ENGINE_AUDIO_UNREPORTED = 'ENGINE_LINE_AUDIO_UNREPORTED';
+    const ENGINE_AUDIO_FAILED = 'ENGINE_LINE_AUDIO_FAILED';
+    const ENGINE_TEXT_UNREPORTED = 'ENGINE_LINE_TEXT_UNREPORTED';
+    const ENGINE_TEXT_FAILED = 'ENGINE_LINE_TEXT_FAILED';
+
+    function beginEngineLine() {
+        updateEngines(ENGINE_PENDING);
+    }
+    // The transcript path runs the TEXT endpoint: no microphone was opened and
+    // nothing was synthesised, so it must never name an STT or TTS engine.
+    function textEngineLine(engine) {
+        if (!engine) return ENGINE_TEXT_UNREPORTED;
+        const where = engine.indexOf('local') === 0 ? 'this machine' : 'sent out';
+        return `translated by ${engine} — ${where} · text only, no audio was heard or spoken`;
     }
     function updateButtons(recording) {
         window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, recording);
@@ -332,6 +303,9 @@ window.voiceUx = window.voiceUx || (() => {
             return;
         }
         window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.STOPPING);
+        // Clear before the request, not after: whatever is on screen describes
+        // the PREVIOUS request and is already wrong.
+        beginEngineLine();
         updateButtons(false);
         const sampleRate = audioCtx.sampleRate;
         const captured = pcmChunks;
@@ -355,7 +329,8 @@ window.voiceUx = window.voiceUx || (() => {
             };
             // Name the engines that served THIS request, from the response
             // headers the backend derives from what actually ran.
-            updateEngines(decodeHeader(resp.headers.get('X-Engine-Summary') || ''));
+            updateEngines(decodeHeader(resp.headers.get('X-Engine-Summary') || '')
+                          || ENGINE_AUDIO_UNREPORTED);
             const orig = decodeHeader(origHeader);
             const trans = decodeHeader(transHeader);
             document.getElementById('original_text').textContent   = orig;
@@ -369,6 +344,9 @@ window.voiceUx = window.voiceUx || (() => {
         } catch(e) {
             window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
             window.voiceUx.setDebug(DESKTOP_SCOPE, e.message);
+            // A failed recording must not leave the last successful
+            // recording's "this machine" claim standing over an empty result.
+            updateEngines(ENGINE_AUDIO_FAILED);
         }
     }
 
@@ -382,6 +360,9 @@ window.voiceUx = window.voiceUx || (() => {
         }
         window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.TRANSLATING_TEXT);
         window.voiceUx.setDebug(DESKTOP_SCOPE, `chars=${cleaned.length}`);
+        // Drop any audio engine line from a previous recording BEFORE this
+        // text-only request starts.
+        beginEngineLine();
         try {
             const resp = await fetch('/api/text_translate_stream', {
                 method: 'POST',
@@ -389,6 +370,9 @@ window.voiceUx = window.voiceUx || (() => {
                 body: new URLSearchParams({ text: cleaned, language: lang }),
             });
             const contentType = resp.headers.get('Content-Type') || '';
+            // The text endpoint names its engine when it can. If it does not,
+            // we say so — we do not borrow the audio path's label.
+            const textEngine = resp.headers.get('X-Text-Engine') || '';
             if (contentType.includes('text/event-stream')) {
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();
@@ -426,12 +410,17 @@ window.voiceUx = window.voiceUx || (() => {
                 document.getElementById('original_text').textContent = data.original_text || cleaned;
                 document.getElementById('translated_text').textContent = data.translated_text || '';
             }
+            updateEngines(textEngineLine(textEngine));
             window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
         } catch (e) {
             window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
             window.voiceUx.setDebug(DESKTOP_SCOPE, e.message || 'unknown error');
+            updateEngines(ENGINE_TEXT_FAILED);
         }
     }
+
+    window.stopRecording = stopRecording;
+    window.startRecording = startRecording;
 
     window.translateTranscriptFallback = translateTranscriptFallback;
 
@@ -461,7 +450,162 @@ window.voiceUx = window.voiceUx || (() => {
         updateDebug(`pcm-wav secure=${secureOk} getUserMedia=${hasGetUserMedia} webAudio=${hasWebAudio}`);
     });
 </script>
-        """)
+"""
+
+#: The placeholders in the template are filled from the Python constants
+#: above, so what the page shows and what the tests assert cannot drift.
+VOICE_PAGE_JS = (
+    _VOICE_PAGE_JS_TEMPLATE
+    .replace('ENGINE_LINE_PENDING', ENGINE_LINE_PENDING)
+    .replace('ENGINE_LINE_AUDIO_UNREPORTED', ENGINE_LINE_AUDIO_UNREPORTED)
+    .replace('ENGINE_LINE_AUDIO_FAILED', ENGINE_LINE_AUDIO_FAILED)
+    .replace('ENGINE_LINE_TEXT_UNREPORTED', ENGINE_LINE_TEXT_UNREPORTED)
+    .replace('ENGINE_LINE_TEXT_FAILED', ENGINE_LINE_TEXT_FAILED)
+)
+
+
+class VoicePageMixin:
+    def _render_voice_status_block(self, scope: str) -> None:
+        ui.label("Status").classes(f"{theme.DATA} mt-3")
+        ui.label("")\
+            .classes("text-base")\
+            .props(f"id={scope}_status")
+        # Which engine served THIS request. Always visible (not behind ?debug),
+        # because local voice is now on by default when the models are present
+        # and a silent default is only acceptable if the page names where the
+        # recording actually went.
+        ui.label("")\
+            .classes(f"{theme.DATA} min-h-[20px]")\
+            .props(f"id={scope}_engines")
+        # Developer readout — hidden unless the page is opened with ?debug=1
+        # (voiceUx.init reveals .p-debug-block); updateDebug still writes to it.
+        ui.label("Debug").classes(f"{theme.DATA} mt-1 hidden p-debug-block")
+        ui.label("")\
+            .classes(f"{theme.DATA} min-h-[20px] hidden p-debug-block")\
+            .props(f"id={scope}_debug")
+
+    def _inject_voice_frontend_helpers(self) -> None:
+        ui.add_head_html(VOICE_UX_JS)
+
+    def _prefetch_voice_for(self, language: str | None) -> None:
+        """Start the background Piper-voice download for `language`.
+
+        Prefers the workspace's own hook (`TranslationUI.request_voice_prefetch`)
+        so both surfaces share one policy — including its per-page dedupe — and
+        so a language typed on /voice is not fetched twice when the user then
+        walks back into the workspace. Falls back to the underlying
+        `local_voice.prefetch_voice` when that hook is not present, because
+        /voice must not be the surface that silently never prefetches. Never
+        blocks and never raises: prefetch_voice spawns a daemon thread, no-ops
+        when local voice is off / already installed / the language has no
+        Piper voice, and a failed download must not reach the UI.
+
+        The hook takes the language as an argument. It deliberately does NOT
+        read `self.current_target_language`: the argument-less version of this
+        call is the exact defect (DEFECT 1) that made every page load fetch the
+        `__init__` default instead of the user's real target.
+        """
+        try:
+            # bind_value fires on_change once at construction, so the initial
+            # language would otherwise be requested twice per page load.
+            if getattr(self, "_last_prefetched_voice_language", None) == language:
+                return
+            self._last_prefetched_voice_language = language
+            hook = getattr(self, "request_voice_prefetch", None)
+            if callable(hook):
+                hook(language)
+                return
+            local_voice.prefetch_voice(language)
+        except Exception as error:
+            logging.info("[Voice] voice prefetch skipped (%s)", error)
+
+    def _on_voice_language_change(self, value: str | None) -> None:
+        """Target language changed on /voice → fetch that voice now."""
+        if not value:
+            return
+        self.current_target_language = value
+        self._prefetch_voice_for(value)
+
+    def _go_workspace(self, mode: str) -> None:
+        # main_page() runs on a FRESH TranslationUI() instance (see
+        # start_ui) — setting self.input_mode here would be discarded, so
+        # the mode travels via the URL instead.
+        ui.navigate.to(f"/?mode={quote(mode)}")
+
+    def voice_translation_page(self):
+        self._inject_theme()
+        self._inject_api_token()
+        self._inject_voice_frontend_helpers()
+
+        # Same header as the workspace; Voice is the active tab.
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                with ui.row().classes("items-center gap-0"):
+                    for label, mode in (("Text", "Text"), ("Document", "Document"), ("Image", "Image/Camera")):
+                        ui.button(label, on_click=lambda _, m=mode: self._go_workspace(m))\
+                            .props("flat no-caps").classes("p-mode-tab")
+                    ui.button("Voice").props("flat no-caps").classes("p-mode-tab p-mode-tab-active")
+
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-3xl gap-3"):
+                with ui.row().classes(f"w-full items-center gap-3 flex-wrap {theme.WELL} p-3"):
+                    ui.label("To").classes(theme.DATA)
+                    # A real bound input, not a raw <input>. The raw one was
+                    # disconnected from `current_target_language`, so /voice —
+                    # the one surface that actually needs a Piper voice — could
+                    # never tell the app which voice to fetch, and the ~63MB
+                    # download landed on the request path (or never happened).
+                    self.voice_language_input = ui.input(
+                        placeholder="Type a language…",
+                        autocomplete=LANGUAGES,
+                        on_change=lambda e: self._on_voice_language_change(e.value),
+                    ).bind_value(self, "current_target_language")\
+                     .props("for=language_select").classes("min-w-[180px]")
+                    # Fetch the voice for the language the page opens on, in
+                    # the background, before anyone presses Record.
+                    self._prefetch_voice_for(self.current_target_language)
+                    ui.element("div").classes("flex-grow")
+                    # NO inline event-handler attributes here. NiceGUI 3 renders
+                    # ui.html() through DOMPurify, which strips them, so the
+                    # handler these two buttons used to carry never reached the
+                    # DOM and BOTH were dead for every user on every browser --
+                    # silently, with no console error, the status label simply
+                    # never changing. They are wired by delegated listeners on
+                    # `document` (see the script block below), the same pattern
+                    # the workspace live-translate JS already uses.
+                    ui.html('<button id="desktop_voice_start_recording" class="p-btn p-btn-ok px-4 py-2" '
+                            '>● Record</button>')
+                    ui.html('<button id="desktop_voice_stop_recording" class="p-btn p-btn-danger px-4 py-2" '
+                            'disabled>■ Stop</button>')
+
+                self._render_voice_status_block("desktop_voice")
+
+                with ui.grid(columns=2).classes("w-full gap-3"):
+                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_SOURCE}"):
+                        ui.label("Original").classes(theme.DATA)
+                        ui.label("").classes("min-h-[60px]").props("id=original_text")
+                    with ui.column().classes(f"w-full p-4 gap-2 {theme.PANEL_TARGET}"):
+                        ui.label("Translation").classes(theme.DATA)
+                        ui.label("").classes("min-h-[60px]").props("id=translated_text")
+
+                ui.audio(src="data:audio/wav;base64,")\
+                  .props("id=out_audio controls")\
+                  .classes("w-full")
+
+                with ui.expansion("No microphone? Paste a transcript instead").classes(f"w-full {theme.WELL}"):
+                    ui.textarea(
+                        placeholder="Paste text here if your browser cannot record audio.",
+                    ).props("for=desktop_voice_transcript autogrow").classes("w-full")
+                    ui.button("Translate transcript", on_click=lambda: ui.run_javascript("translateTranscriptFallback()"))\
+                        .classes(f"{theme.BTN_PRIMARY} mt-2 mb-2")
+
+        # Raw string: the SSE parser below needs literal \n in the JS —
+        # a plain triple-quote turned it into a real newline, which was a
+        # SyntaxError that silently killed this whole script block.
+        ui.add_head_html(VOICE_PAGE_JS)
 
     async def api_voice_translate(
         self,
