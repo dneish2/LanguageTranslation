@@ -490,6 +490,21 @@ def test_desktop_voice_js_uses_desktop_voice_controls_and_voiceux_path():
     assert "document.getElementById('desktop_voice_stop_recording')" in source
 
 
+def test_record_buttons_are_wired_by_delegation_not_inline_onclick():
+    """NiceGUI 3 renders ui.html() through DOMPurify, which strips inline
+    event handlers. The Record/Stop buttons used onclick="startRecording()",
+    so the attribute never reached the DOM and BOTH buttons were dead for
+    every user on every browser — silently, with no console error and no
+    status change. Verified live: the rendered <button> had no onclick
+    attribute and el.onclick was null. Delegated listeners survive the
+    sanitizer, so assert we never regress to the inline form."""
+    source = Path("passage/ui/voice_page.py").read_text(encoding="utf-8")
+
+    assert "onclick=" not in source, "inline onclick is stripped by DOMPurify in NiceGUI 3"
+    assert "el.id === 'desktop_voice_start_recording'" in source
+    assert "el.id === 'desktop_voice_stop_recording'" in source
+
+
 def test_transcript_fallback_js_handler_is_defined_and_exported():
     source = Path("passage/ui/voice_page.py").read_text(encoding="utf-8")
 
