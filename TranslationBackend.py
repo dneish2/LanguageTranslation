@@ -30,6 +30,10 @@ from pptx.util import Pt
 
 from passage import compare
 from passage import text_rows
+from passage.ollama_native import (
+    NativeOllamaProvider,
+    suits_translation as ollama_suits_translation,
+)
 from passage import provider_profiles as pp
 
 from translation_metrics import MetricsCollector, TranslationMetrics
@@ -193,7 +197,35 @@ _PLACEHOLDER_RE = re.compile(r"\[\[\s*PSG\s*:\s*(\d+)\s*\]\]")
 #: 616ms — local is both FREE and 3.8x faster, which makes the live path the
 #: single best place to prefer a local model. Opt out with PASSAGE_LIVE_LOCAL=0.
 LIVE_LOCAL_ENABLED = os.getenv("PASSAGE_LIVE_LOCAL", "1") != "0"
-LIVE_LOCAL_MODEL = os.getenv("PASSAGE_LIVE_LOCAL_MODEL", "qwen2.5:7b")
+
+#: Preference order for the local model, best first, chosen by measurement
+#: rather than by size. Benchmarked on this machine over a fixed suite
+#: (passage/model_bench.py, results in data/model_bench.jsonl):
+#:
+#:   translategemma:4b    3.3GB   368ms   consensus 0.788
+#:   gemma3:12b           8.2GB   582ms   consensus 0.787
+#:   translategemma:12b   8.1GB   495ms   consensus 0.779
+#:   qwen2.5:7b           4.7GB   237ms   consensus 0.763
+#:   translategemma:27b  17.4GB   679ms   consensus 0.734
+#:   gemma3:1b           0.8GB   334ms   consensus 0.668
+#:
+#: Two things that ordering makes clear. A model built for translation beats
+#: general models several times its size — the 4B TranslateGemma outscores the
+#: 27B one while being five times smaller and twice as fast. And the smallest
+#: general model is not a cheap approximation of a big one, it is wrong:
+#: gemma3:1b rendered "pushed back on the buyback" as "reguló la compra de
+#: acciones" ("regulated the share purchase").
+#: Consensus measures agreement with the other models, so it rewards the
+#: mainstream reading — a low score is a prompt to look, not proof of error.
+LIVE_LOCAL_PREFERENCE = tuple(
+    m.strip() for m in os.getenv(
+        "PASSAGE_LIVE_LOCAL_PREFERENCE",
+        "translategemma:4b,translategemma:12b,gemma3:12b,qwen2.5:7b,gemma3:1b",
+    ).split(",") if m.strip()
+)
+#: Explicit override; when unset the best INSTALLED model from the order above
+#: is chosen at runtime, so pulling a better model is enough to switch to it.
+LIVE_LOCAL_MODEL = os.getenv("PASSAGE_LIVE_LOCAL_MODEL", "")
 #: How long a reachability answer is trusted. The probe must never run on the
 #: keystroke path more than once a minute — an unreachable Ollama would
 #: otherwise add its connect timeout to every keystroke.
@@ -1078,6 +1110,7 @@ class TranslationBackend:
             return [
                 m["name"] for m in payload.get("models", [])
                 if "embed" not in m.get("name", "")
+                and ollama_suits_translation(m.get("name", ""))
             ]
         except Exception as error:
             logging.info("[Backend] local model list unavailable (%s)", error)
@@ -1130,6 +1163,34 @@ class TranslationBackend:
 
     # ───────────────────────── LIVE (KEYSTROKE) PATH ────────────────────── #
 
+    def choose_local_model(self) -> str | None:
+        """The best INSTALLED local model, by measured preference order.
+
+        Resolved at runtime rather than pinned, so pulling a better model is
+        enough to start using it — no config change, no code change. An
+        explicit PASSAGE_LIVE_LOCAL_MODEL always wins, because someone who
+        names a model means it.
+        """
+        if LIVE_LOCAL_MODEL:
+            return LIVE_LOCAL_MODEL
+        installed = {m["name"] for m in self.available_local_models_detailed()}
+        for candidate in LIVE_LOCAL_PREFERENCE:
+            if candidate in installed:
+                return candidate
+        # Nothing from the ranked list: fall back to any installed model that
+        # is sensible for translation, rather than refusing to run locally.
+        for name in sorted(installed):
+            if "embed" not in name and ollama_suits_translation(name):
+                return name
+        return None
+
+    def available_local_models_detailed(self) -> list[dict[str, Any]]:
+        try:
+            return NativeOllamaProvider(
+                base_url=OLLAMA_BASE_URL, text_model="").list_models()
+        except Exception:
+            return []
+
     def _live_local_provider(self) -> BaseTranslationProvider | None:
         """A local provider for the live path, or None if it isn't reachable.
 
@@ -1149,9 +1210,16 @@ class TranslationBackend:
             with urllib.request.urlopen(f"{base}/models", timeout=LIVE_PROBE_TIMEOUT_SECONDS):
                 pass
             if self._live_provider is None:
-                self._live_provider = ChatCompletionsProvider(
-                    api_key="ollama", base_url=OLLAMA_BASE_URL,
-                    text_model=LIVE_LOCAL_MODEL, max_input_chars=OLLAMA_MAX_INPUT_CHARS,
+                model = self.choose_local_model()
+                if not model:
+                    self._live_reachable = False
+                    return None
+                # Native /api/chat, not the OpenAI shim: the shim flattens
+                # thinking into the answer and loses it entirely for some
+                # models (see passage/ollama_native.py).
+                self._live_provider = NativeOllamaProvider(
+                    base_url=OLLAMA_BASE_URL, text_model=model,
+                    max_input_chars=OLLAMA_MAX_INPUT_CHARS,
                 )
                 # Ollama loads a model into VRAM on first use. Measured in the
                 # browser, that landed on the user's FIRST keystroke as a 963ms
