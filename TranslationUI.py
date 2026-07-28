@@ -29,6 +29,7 @@ from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage import __version__ as passage_version
 from passage import engine_ledger
 from passage import policy
+from passage import usage
 from passage import provider_profiles
 from passage.auth.jwt_verify import identity_from_auth_header
 from passage.ui.voice_page import VoicePageMixin
@@ -354,6 +355,21 @@ class TranslationUI(VoicePageMixin):
                         for name, count in summary["engines"].items():
                             ui.label(f"{name} — {count} run{'s' if count != 1 else ''}")\
                                 .classes(theme.DATA)
+
+                with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
+                    ui.label("Metered usage").classes(theme.DATA)
+                    used = usage.summary(self.usage_store)
+                    ui.label(usage.describe(used)).classes("text-base")
+                    if used.metered_runs:
+                        with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
+                                .style("background: var(--p-rule, #d6cbb4)"):
+                            ui.element("div").classes("h-full")\
+                                .style(f"width:{int(used.share_used * 100)}%; "
+                                       "background: var(--p-accent, #802F3D)")
+                    ui.label(
+                        "Only work Passage paid for is counted. Anything that ran on this "
+                        "machine or on your own key never reaches the counter."
+                    ).classes("text-xs p-muted-text")
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Models on this machine").classes(theme.DATA)
@@ -1044,6 +1060,10 @@ class TranslationUI(VoicePageMixin):
             self.job_poll_timer.active = False
             self.job_poll_timer = None
 
+        # Documents run on the session's chosen endpoint too. Until now the
+        # job always used the process default, so "bring your own key" quietly
+        # excluded the surface that costs the most.
+        profile = self.active_profile
         self.active_job_id = self.backend.start_translation_job(
             input_stream=self.uploaded_file,
             file_extension=self.uploaded_file_extension,
@@ -1052,6 +1072,7 @@ class TranslationUI(VoicePageMixin):
             font_size=font_size,
             autofit=autofit,
             correlation_id=correlation_id,
+            profile=profile,
         )
 
         def poll_job():
@@ -1473,12 +1494,30 @@ class TranslationUI(VoicePageMixin):
         except RuntimeError:
             return []
 
+    @property
+    def usage_store(self) -> dict:
+        """Metered usage for this session (see passage/usage.py)."""
+        try:
+            return app.storage.user.setdefault("usage", {})
+        except RuntimeError:
+            return {}
+
     def _record_engine_run(self, *, surface, engine: str, latency_ms: int, chars: int) -> None:
         try:
+            is_local = engine.startswith("local")
             engine_ledger.record(
                 self.engine_runs, surface=str(getattr(surface, "value", surface)),
-                engine=engine, is_local=engine.startswith("local"),
+                engine=engine, is_local=is_local,
                 latency_ms=latency_ms, chars=chars, when=time.time())
+            # Only work Passage paid for reaches the counter — a local or BYO
+            # run is never recorded, not recorded-then-zeroed.
+            # The engine label already records where it actually ran, which is
+            # a stronger signal than what was configured — a hosted fallback
+            # after a local failure IS metered, and asking policy about the
+            # profile alone would miss that.
+            metered = (not is_local) and policy.is_metered(
+                self.active_profile, local_first_model=None)
+            usage.record(self.usage_store, chars=chars, metered=metered)
         except Exception:  # never let bookkeeping break a translation
             LOGGER.debug("engine run not recorded", exc_info=True)
 

@@ -135,12 +135,22 @@ detector, so their nearest row is genuinely far away.
 
 Ordered by value, with what each depends on.
 
-1. **Per-profile document routing.** Documents still run on the process
-   default, so BYO doesn't cover the surface that costs the most. Needs the
-   async job to carry the profile. *Do this alongside real metering, not
-   before it.*
-2. **Real metering on the policy hook.** `is_metered()` exists and nothing
-   reads it yet. Charge for durable storage and traces, not inference.
+1. ~~**Per-profile document routing.**~~ **Done.** The session's endpoint now
+   travels by `ContextVar` (`TranslationBackend.using_profile`) rather than
+   through every signature — document translation runs through half a dozen
+   layers, and one missed call site would have silently sent a BYO user's
+   document to the app's own key. A ContextVar rather than an attribute
+   because the backend is shared across clients. Verified by setting
+   `provider = None` so any leak to hosted would raise, then translating a
+   27-segment DOCX entirely through a local profile.
+2. ~~**Real metering on the policy hook.**~~ **Done.** `passage/usage.py`
+   counts characters (not requests — live typing fires ~8 requests per
+   sentence while a document is one request carrying thousands). Only metered
+   work reaches the counter, so no later billing change can start charging for
+   inference somebody else paid for. The free allowance is reported, not
+   enforced: a quota that starts refusing work the day it ships is a bad
+   surprise. Metering reads where the work ACTUALLY ran, not what was
+   configured — a hosted fallback after a local failure is metered.
 3. **Better row detection for coloured headings.** The remaining overlay error
    is concentrated in section headings the detector misses. A per-channel ink
    map (not just greyscale) would catch burgundy-on-cream.

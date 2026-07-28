@@ -10,6 +10,8 @@ import json
 import random
 import wave
 from array import array
+from contextlib import contextmanager
+from contextvars import ContextVar
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from threading import Lock, Thread, Timer
@@ -365,6 +367,10 @@ SUPPORTED_DOCUMENT_EXTENSIONS = frozenset({"docx", "pptx", "pdf"})
 SUPPORTED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp"})
 
 
+#: Per-request provider override (see TranslationBackend._require_provider).
+#: ContextVar, not an attribute: the backend is shared by every client.
+_active_provider: ContextVar[Any] = ContextVar("passage_active_provider", default=None)
+
 JOB_STATE_QUEUED = "queued"
 JOB_STATE_RUNNING = "running"
 JOB_STATE_SUCCEEDED = "succeeded"
@@ -639,11 +645,43 @@ class TranslationBackend:
         self._result_handle_to_job_id: dict[str, str] = {}
 
     def _require_provider(self) -> BaseTranslationProvider:
+        """The provider this piece of work should run on.
+
+        A per-request override takes precedence over the process default so a
+        session's chosen endpoint reaches code that never asked for one.
+        Document translation runs through half a dozen layers
+        (translate_file -> process_pdf -> _translate_segment_text ->
+        translate_text -> _translate_chunk), and threading a profile down all
+        of them would have meant changing every signature and every call site,
+        with a real chance of missing one and silently sending a BYO user's
+        document to the app's own key. A context variable can't be missed:
+        it's set once for the duration of the work.
+
+        It is a ContextVar rather than an attribute precisely because the
+        backend is SHARED across every connected client — an attribute here
+        would be the same cross-user bug class this codebase has already had
+        to fix three times.
+        """
+        override = _active_provider.get()
+        if override is not None:
+            return override
         if self.provider is None:
             raise RuntimeError(
                 "No translation provider configured. Set OPENAI_API_KEY and restart the service."
             )
         return self.provider
+
+    @contextmanager
+    def using_profile(self, profile):
+        """Run the enclosed work on `profile`'s endpoint."""
+        if profile is None or getattr(profile, "kind", None) == pp.KIND_APP:
+            yield
+            return
+        token = _active_provider.set(self.provider_for_profile(profile))
+        try:
+            yield
+        finally:
+            _active_provider.reset(token)
 
     @property
     def segment_map(self) -> dict[str, dict]:
@@ -724,6 +762,7 @@ class TranslationBackend:
         font_size: int | None = None,
         autofit: bool = False,
         correlation_id: str | None = None,
+        profile=None,
     ) -> str:
         job_id = self.generate_segment_id()
         job = TranslationJob(
@@ -743,16 +782,19 @@ class TranslationBackend:
             self._run_states[job_id] = TranslationRunState()
 
         def worker():
-            self._run_translation_job(
-                job_id=job_id,
-                input_stream=input_stream,
-                file_extension=file_extension,
-                target_language=target_language,
-                processed=processed,
-                font_size=font_size,
-                autofit=autofit,
-                correlation_id=correlation_id,
-            )
+            # ContextVars do NOT propagate into a new thread, so the override
+            # is established inside the worker rather than assumed.
+            with self.using_profile(profile):
+                self._run_translation_job(
+                    job_id=job_id,
+                    input_stream=input_stream,
+                    file_extension=file_extension,
+                    target_language=target_language,
+                    processed=processed,
+                    font_size=font_size,
+                    autofit=autofit,
+                    correlation_id=correlation_id,
+                )
 
         Thread(target=worker, daemon=True).start()
         return job_id

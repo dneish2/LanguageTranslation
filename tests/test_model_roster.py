@@ -684,3 +684,43 @@ def test_thinking_models_are_kept_out_of_translation_rosters():
     assert on.suits_translation("qwen3-vl:8b") is False
     assert on.suits_translation("translategemma:4b") is True
     assert on.suits_translation("qwen2.5:7b") is True
+
+
+def test_provider_override_is_context_scoped_not_an_attribute(monkeypatch):
+    """Document translation runs through half a dozen layers, so the session's
+    endpoint travels by ContextVar rather than through every signature — one
+    missed call site would have silently sent a BYO user's document to the
+    app's own key. It must be a ContextVar and not an attribute, because the
+    backend is SHARED across clients."""
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    default = backend._require_provider()
+    profile = pp.ProviderProfile(label="mine", kind=pp.KIND_BYO,
+                                 base_url="https://api.example.com/v1",
+                                 api_key="sk-x", model="gpt-4o-mini")
+
+    with backend.using_profile(profile):
+        assert backend._require_provider() is backend.provider_for_profile(profile)
+    # Restored afterwards — an override that leaked would affect other clients.
+    assert backend._require_provider() is default
+
+
+def test_provider_override_is_a_no_op_for_the_app_profile(monkeypatch):
+    from passage import provider_profiles as pp
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = tb.TranslationBackend()
+    with backend.using_profile(pp.app_default_profile("gpt-5.4-nano")):
+        assert backend._require_provider() is backend.provider
+
+
+def test_document_jobs_carry_the_profile(monkeypatch):
+    """Until now the job always used the process default, so "bring your own
+    key" quietly excluded the surface that costs the most."""
+    import inspect
+
+    source = inspect.getsource(tb.TranslationBackend.start_translation_job)
+    assert "profile=None" in source
+    assert "using_profile(profile)" in source

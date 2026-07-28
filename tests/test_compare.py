@@ -265,3 +265,55 @@ def test_local_first_runs_are_not_metered():
 
     assert policy.is_metered(None, local_first_model="translategemma:4b") is False
     assert policy.is_metered(None, local_first_model=None) is True
+
+
+def test_only_metered_work_reaches_the_counter():
+    """"Bring your own key and it's free" was a promise the code made and never
+    kept — policy.is_metered() existed and nothing read it. Local and BYO runs
+    are not counted at all, rather than counted-then-zeroed, so no later
+    billing change can start charging for inference somebody else paid for."""
+    from passage import usage
+
+    store = {}
+    usage.record(store, chars=5000, metered=False)   # local
+    usage.record(store, chars=3000, metered=False)   # BYO
+    assert store == {}, "unmetered work reached the counter"
+
+    usage.record(store, chars=1200, metered=True)
+    summary = usage.summary(store)
+    assert summary.metered_chars == 1200 and summary.metered_runs == 1
+
+
+def test_usage_counts_characters_not_requests():
+    """Live typing fires ~8 requests for one sentence; a document is one
+    request carrying thousands of characters. Counting requests would bill
+    those exactly the wrong way round."""
+    from passage import usage
+
+    typing, document = {}, {}
+    for _ in range(8):
+        usage.record(typing, chars=55, metered=True)
+    usage.record(document, chars=8000, metered=True)
+
+    assert usage.summary(typing).metered_runs == 8
+    assert usage.summary(document).metered_runs == 1
+    assert usage.summary(document).metered_chars > usage.summary(typing).metered_chars
+
+
+def test_free_allowance_is_reported_not_enforced():
+    """A quota that starts refusing work the day it ships is a bad surprise."""
+    from passage import usage
+
+    store = {}
+    usage.record(store, chars=usage.FREE_CHARS + 1, metered=True)
+    summary = usage.summary(store)
+
+    assert summary.over_free_allowance is True
+    assert summary.remaining_chars == 0
+    assert "over the" in usage.describe(summary)
+
+
+def test_usage_describes_a_fully_local_session_plainly():
+    from passage import usage
+
+    assert "Nothing metered" in usage.describe(usage.summary({}))
