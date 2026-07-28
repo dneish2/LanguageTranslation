@@ -183,6 +183,20 @@ _PROTECTED_SPAN_RE = re.compile(
 _PLACEHOLDER_RE = re.compile(r"\[\[\s*PSG\s*:\s*(\d+)\s*\]\]")
 
 
+#: Text-mode live translation re-runs on every 350ms typing pause, so the same
+#: sentence is translated ~8 times while it is being composed. Measured on this
+#: machine: local qwen2.5:7b answers in 163ms p50 against hosted gpt-5.4-nano's
+#: 616ms — local is both FREE and 3.8x faster, which makes the live path the
+#: single best place to prefer a local model. Opt out with PASSAGE_LIVE_LOCAL=0.
+LIVE_LOCAL_ENABLED = os.getenv("PASSAGE_LIVE_LOCAL", "1") != "0"
+LIVE_LOCAL_MODEL = os.getenv("PASSAGE_LIVE_LOCAL_MODEL", "qwen2.5:7b")
+#: How long a reachability answer is trusted. The probe must never run on the
+#: keystroke path more than once a minute — an unreachable Ollama would
+#: otherwise add its connect timeout to every keystroke.
+LIVE_PROBE_TTL_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TTL", "60"))
+LIVE_PROBE_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TIMEOUT", "0.6"))
+
+
 def _pixel_bbox(raw: Any, image_bytes: bytes) -> list[int] | None:
     """Convert a model-reported bbox to pixel coords, or None if unusable.
 
@@ -577,6 +591,11 @@ class TranslationBackend:
         self.retry_base_delay = 0.5
         self.retry_max_delay = 8.0
         self.metrics: TranslationMetrics = MetricsCollector()
+        # Live (Text-mode) routing: a separate, optional local provider used
+        # only for the keystroke path. Built lazily so boot never waits on it.
+        self._live_provider: BaseTranslationProvider | None = None
+        self._live_probe_at: float = 0.0
+        self._live_reachable: bool = False
         self._jobs_lock = Lock()
         self._jobs: dict[str, TranslationJob] = {}
         self._job_results: dict[str, dict[str, Any]] = {}
@@ -989,6 +1008,128 @@ class TranslationBackend:
             # Never echo the source back as a "translation" — surface the failure.
             logging.error("[Backend] translate_text error: %s", e, exc_info=True)
             raise
+
+    # ───────────────────────── LIVE (KEYSTROKE) PATH ────────────────────── #
+
+    def _live_local_provider(self) -> BaseTranslationProvider | None:
+        """A local provider for the live path, or None if it isn't reachable.
+
+        Reachability is cached for LIVE_PROBE_TTL_SECONDS: this runs on the
+        keystroke path, and probing a dead endpoint on every pause would add a
+        connect timeout to every keystroke — worse than just using hosted.
+        """
+        if not LIVE_LOCAL_ENABLED:
+            return None
+        now = time.time()
+        if now - self._live_probe_at < LIVE_PROBE_TTL_SECONDS:
+            return self._live_provider if self._live_reachable else None
+        self._live_probe_at = now
+        try:
+            import urllib.request
+            base = OLLAMA_BASE_URL.rstrip("/")
+            with urllib.request.urlopen(f"{base}/models", timeout=LIVE_PROBE_TIMEOUT_SECONDS):
+                pass
+            if self._live_provider is None:
+                self._live_provider = ChatCompletionsProvider(
+                    api_key="ollama", base_url=OLLAMA_BASE_URL,
+                    text_model=LIVE_LOCAL_MODEL, max_input_chars=OLLAMA_MAX_INPUT_CHARS,
+                )
+                # Ollama loads a model into VRAM on first use. Measured in the
+                # browser, that landed on the user's FIRST keystroke as a 963ms
+                # response where every later one took ~150ms. Pay it in the
+                # background at page load instead, where nobody is waiting.
+                self._warm_live_provider_async()
+            self._live_reachable = True
+        except Exception as error:
+            if self._live_reachable or self._live_probe_at == now:
+                logging.info("[Backend] live-local unreachable (%s); using hosted", error)
+            self._live_reachable = False
+        return self._live_provider if self._live_reachable else None
+
+    def prewarm_live(self) -> None:
+        """Probe and warm the local live model in the background, at page load.
+
+        Called from main_page. Doing this lazily on the first translate request
+        was useless: the probe, the model load and the user's first keystroke
+        all happened at the same instant, so the first response took ~3s and
+        took two more keystrokes to settle. Both the probe (up to 0.6s) and the
+        VRAM load run off the render path here — page render must never wait
+        for either.
+        """
+        Thread(target=self._live_local_provider, daemon=True).start()
+
+    def _warm_live_provider_async(self) -> None:
+        """Load the local model into VRAM off the request path. Best-effort:
+        a failed warm-up must never surface anywhere — the next real call
+        falls back to hosted on its own."""
+        provider = self._live_provider
+        if provider is None:
+            return
+
+        def warm() -> None:
+            try:
+                provider.create_chat_completion(
+                    messages=self._live_prompt_messages("ok", "Spanish"), max_tokens=8,
+                )
+                logging.info("[Backend] live-local warmed: %s", provider.text_model)
+            except Exception as error:
+                logging.info("[Backend] live-local warm-up skipped (%s)", error)
+
+        Thread(target=warm, daemon=True).start()
+
+    def _live_prompt_messages(self, text: str, target_language: str) -> list[dict[str, str]]:
+        """A deliberately short prompt for the live preview.
+
+        The document path spends 143 tokens of injection-hardening preamble per
+        call against ~4 tokens of actual text, and the live path re-sends that
+        on every typing pause. That hardening exists because a document's text
+        is untrusted content from a file someone was handed. The live box is
+        different: the only person who can put text in it is the same person
+        reading the output, it is never persisted, and nothing downstream
+        consumes it — so the preamble buys nothing here and costs 97% of the
+        tokens. A one-line role instruction still keeps the model on task.
+        """
+        return [
+            {"role": "system", "content": f"Translate the user's text to {target_language}. Reply with the translation only."},
+            {"role": "user", "content": text},
+        ]
+
+    def translate_live(self, text: str, target_language: str) -> tuple[str, str]:
+        """Translate for the keystroke path. Returns (translation, engine_label).
+
+        Prefers a local model when one is reachable — free, and measurably
+        faster than hosted here — and falls back to the normal hosted path on
+        any failure so a flaky local endpoint can never break typing. The
+        engine label is returned rather than hidden: the user should be able to
+        see which model answered.
+        """
+        text = text.replace("\t", " ").strip()
+        if not text:
+            return text, "none"
+        cache_key = self._normalize_cache_key(text, target_language, mode="translate")
+        cached = self.translation_cache.get(cache_key)
+        if cached is not None:
+            self.metrics.record_cache_hit()
+            return cached, "cache"
+
+        provider = self._live_local_provider()
+        if provider is not None:
+            try:
+                masked, protected = _mask_protected_spans(text)
+                completion = provider.create_chat_completion(
+                    messages=self._live_prompt_messages(masked, target_language),
+                    max_tokens=1000,
+                )
+                result = (completion.choices[0].message.content or "").strip()
+                if result:
+                    result = _restore_protected_spans(result, protected)
+                    self.translation_cache[cache_key] = result
+                    return result, f"local:{provider.text_model}"
+                logging.info("[Backend] live-local returned empty; falling back to hosted")
+            except Exception as error:
+                logging.info("[Backend] live-local failed (%s); falling back to hosted", error)
+
+        return self.translate_text(text, target_language), f"hosted:{TEXT_MODEL}"
 
     def translate_text_with_instructions(
         self, original_text: str, target_language: str, instructions: str
