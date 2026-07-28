@@ -17,7 +17,11 @@ from starlette.responses import Response, JSONResponse, StreamingResponse
 
 import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
-from TranslationBackend import TranslationBackend, TranslationRunState
+from TranslationBackend import (
+    TranslationBackend,
+    TranslationRunState,
+    SUPPORTED_DOCUMENT_EXTENSIONS,
+)
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage.auth.jwt_verify import identity_from_auth_header
 from passage.ui.voice_page import VoicePageMixin
@@ -451,12 +455,17 @@ class TranslationUI(VoicePageMixin):
         if self.input_mode == "Document":
             # auto_upload so picking a file IS the upload — without it the file
             # sits queued at 0% and Translate says "no file uploaded".
+            # accept= matches the label: without it the picker offered every
+            # file, and choosing e.g. a CSV export produced a green "Selected"
+            # toast and "Ready to translate" before failing on Translate with
+            # "Unsupported file extension: csv". Say no at selection time.
             ui.upload(
                 label="Click or drop DOCX, PPTX, or PDF",
                 multiple=False,
                 auto_upload=True,
                 on_upload=self.handle_mobile_upload,
-            ).classes("w-full")
+            ).props(f"accept={','.join('.' + e for e in sorted(SUPPORTED_DOCUMENT_EXTENSIONS))}")\
+             .classes("w-full")
             if self.uploaded_file_name:
                 ui.label(f"Selected file: {self.uploaded_file_name}").classes("text-sm p-muted-text")
             return
@@ -479,8 +488,21 @@ class TranslationUI(VoicePageMixin):
 
     async def handle_mobile_upload(self, event):
         # NiceGUI 3.x: the payload lives on event.file (FileUpload) and reads async.
-        self.uploaded_file_name = event.file.name
-        self.uploaded_file_extension = self.uploaded_file_name.split(".")[-1].lower()
+        name = event.file.name
+        extension = name.split(".")[-1].lower() if "." in name else ""
+        # accept= on the input is only a picker hint — drag-and-drop ignores it
+        # entirely. Reject here too, so an unsupported file never gets a green
+        # "Selected" toast and a "Ready to translate" status it can't honour.
+        if extension not in SUPPORTED_DOCUMENT_EXTENSIONS:
+            supported = ", ".join(sorted(e.upper() for e in SUPPORTED_DOCUMENT_EXTENSIONS))
+            ui.notify(
+                f"Passage can't translate .{extension or 'unknown'} files yet — "
+                f"upload a {supported}.",
+                type="negative",
+            )
+            return
+        self.uploaded_file_name = name
+        self.uploaded_file_extension = extension
         self.uploaded_file = BytesIO(await event.file.read())
         ui.notify(f"Selected '{self.uploaded_file_name}'", type="positive")
         self.refresh_upload_ui()

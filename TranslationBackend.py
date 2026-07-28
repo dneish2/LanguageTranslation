@@ -277,6 +277,13 @@ def _split_into_chunks(text: str, max_chars: int) -> list[str]:
     return [c for c in chunks if c]
 
 
+#: The extensions translate_file() can actually dispatch on. Kept next to the
+#: dispatch it mirrors so the upload widget and the backend cannot drift —
+#: CSV/XLSX are Problems.md roadmap item 8 and deliberately not here yet.
+SUPPORTED_DOCUMENT_EXTENSIONS = frozenset({"docx", "pptx", "pdf"})
+SUPPORTED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp"})
+
+
 JOB_STATE_QUEUED = "queued"
 JOB_STATE_RUNNING = "running"
 JOB_STATE_SUCCEEDED = "succeeded"
@@ -1891,7 +1898,7 @@ class TranslationBackend:
                 run_state=state,
                 progress_callback=progress_callback,
             )
-        elif ext in {"png", "jpg", "jpeg", "webp"}:
+        elif ext in SUPPORTED_IMAGE_EXTENSIONS:
             result = self.process_image(
                 input_stream,
                 target_language,
