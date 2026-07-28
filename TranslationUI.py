@@ -28,6 +28,7 @@ from TranslationBackend import (
 )
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage import __version__ as passage_version
+from passage import diagnostics
 from passage import engine_ledger
 from passage import local_voice
 from passage import policy
@@ -1962,13 +1963,79 @@ class TranslationUI(VoicePageMixin):
         unable to translate" is the failure worth catching.
         """
         local = self.backend.available_local_models()
+        report = diagnostics.collect(self.backend)
         return JSONResponse({
             "status": "ok",
             "version": passage_version,
             "hosted_provider": self.backend.provider is not None,
             "local_models": local,
             "local_default": self.backend.choose_local_model(),
+            # PORTABILITY_PLAN.md §5 Phase B. Kept alongside the original keys
+            # rather than replacing them: something out there health-checks this
+            # route, and a diagnostic is not worth breaking a deploy probe for.
+            # Ungated like the rest of /api/health, and carrying no secret and
+            # no home-directory path, so it is safe for an unauthenticated
+            # caller (see passage/diagnostics.redact_path).
+            "diagnostics": report,
         })
+
+    def diagnostics_page(self) -> None:
+        """One page a real device can answer "does this work here?" with.
+
+        The plan (§4) is blunt that real iOS Safari, real Android Chrome, OS
+        permission dialogs and actual mic hardware are NOT reachable from CI or
+        from this development machine. For those the diagnostic IS the test, so
+        this page is built to be read and copied on a phone: a plain text block,
+        a copy button, no interaction required beyond loading it.
+
+        The browser half is gathered in the browser (see
+        diagnostics.BROWSER_PROBE_JS) and merged in, because the server cannot
+        observe a secure context or the sample rate a browser granted.
+        """
+        self._inject_theme()
+        report = diagnostics.collect(self.backend)
+
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                ui.label("Diagnostics").classes(theme.DATA)
+
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-3xl gap-4"):
+                ui.label("What this machine resolved").classes("p-display text-xl")
+                ui.label(
+                    "Every line is a probe of this device, not a guess from its "
+                    "name. Copy the block and paste it back with any report."
+                ).classes("text-sm p-muted-text")
+
+                text_area = ui.markdown(
+                    f"```\n{diagnostics.format_text(report)}\n```"
+                ).classes("w-full text-xs")
+
+                state: dict[str, Any] = {"report": report}
+
+                async def gather_browser() -> None:
+                    try:
+                        browser = await ui.run_javascript(
+                            diagnostics.BROWSER_PROBE_JS, timeout=10.0)
+                    except Exception as error:  # pragma: no cover - browser only
+                        browser = {"collected": False,
+                                   "note": f"browser probe failed: {error}"}
+                    if isinstance(browser, dict):
+                        state["report"]["browser"] = browser
+                        text_area.set_content(
+                            f"```\n{diagnostics.format_text(state['report'])}\n```")
+
+                async def copy_all() -> None:
+                    payload = json.dumps(diagnostics.format_text(state["report"]))
+                    await ui.run_javascript(
+                        f"navigator.clipboard && navigator.clipboard.writeText({payload})")
+                    ui.notify("Copied")
+
+                ui.button("Copy", on_click=copy_all).classes(theme.BTN_SECONDARY_SM)
+                ui.timer(0.1, gather_browser, once=True)
 
 
 def start_ui() -> None:
@@ -2017,6 +2084,7 @@ def start_ui() -> None:
     ui.page("/voice")(lambda: new_page_ui().voice_translation_page())
     ui.page("/compare")(lambda: new_page_ui().compare_page())
     ui.page("/engines")(lambda: new_page_ui().engines_page())
+    ui.page("/diagnostics")(lambda: new_page_ui().diagnostics_page())
     # /mobile is retired — one responsive layout; keep old bookmarks working
     ui.page("/mobile")(lambda: ui.navigate.to("/"))
     app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))
