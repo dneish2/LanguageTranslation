@@ -53,6 +53,18 @@ _AUTO, _ON, _OFF = "auto", "on", "off"
 
 #: "base" is the smallest model that transcribes cleanly in testing; tiny
 #: garbles proper nouns badly enough to poison the translation downstream.
+#:
+#: THE ONE LINE. This is the only place a Whisper size is named anywhere in the
+#: app — the STT path reads it here and the engine label reported to the user
+#: (`meta["stt"] == f"local:{WHISPER_MODEL}"`) is derived from it, so setting
+#: PASSAGE_WHISPER_MODEL=small (or editing this default) changes the model and
+#: the label together, with nothing else to keep in sync.
+#:
+#: CAVEAT, and it is a real one: base-vs-small has NEVER been measured on real
+#: speech. Every number behind this default came from a synthetic TTS fixture,
+#: which is unrealistically clean — exactly the audio that flatters a small
+#: model. See RESEARCH.md §4a for why, and for the half-hour experiment that
+#: would settle it. Do not switch to "small" on a hunch; measure first.
 WHISPER_MODEL = os.getenv("PASSAGE_WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("PASSAGE_WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("PASSAGE_WHISPER_COMPUTE", "int8")
