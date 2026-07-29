@@ -126,10 +126,28 @@ def _take_local_snapshot(backend: Any) -> dict[str, Any]:
                   "elapsed_ms": None, "detail": str(error)[:300]}
     models = [name for name in (report.get("models") or [])
               if "embed" not in name and ollama_suits_translation(name)]
+    # THE FORECAST IS THE ROUTER'S ANSWER, NOT A LIST OF INSTALLED MODELS.
+    # `models` deliberately still lists everything installed, because that is
+    # what diagnostics needs — but deriving the forecast from it printed "your
+    # next translation will run on X on this machine" on a server where local
+    # routing was switched off (PASSAGE_LIVE_LOCAL=0) or where
+    # PASSAGE_LIVE_LOCAL_MODEL named a model that is not pulled. probe_local_llm
+    # now answers the routing question directly, through the same
+    # usable_local_model() the live router consults, so the page cannot promise
+    # a run the router will not make. _choose_from_probe stays as the fallback
+    # for an injected probe that predates these keys.
+    can_serve = report.get("can_serve")
+    if can_serve is None:
+        chosen = _choose_from_probe(models)
+        can_serve = bool(report.get("reachable") and chosen)
+    else:
+        can_serve = bool(can_serve)
+        chosen = report.get("chosen_model") if can_serve else None
     snapshot = {
         "probe": report,
         "models": models,
-        "chosen_model": _choose_from_probe(models),
+        "chosen_model": chosen,
+        "can_serve": can_serve,
         "probed_at": time.time(),
         "ttl_seconds": LIVE_PROBE_TTL_SECONDS,
     }
@@ -158,6 +176,7 @@ def _pending_snapshot() -> dict[str, Any]:
                   "elapsed_ms": None, "detail": "probe in flight"},
         "models": [],
         "chosen_model": None,
+        "can_serve": False,
         "probed_at": time.time(),
         "ttl_seconds": LIVE_PROBE_TTL_SECONDS,
         "pending": True,

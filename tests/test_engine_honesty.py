@@ -488,3 +488,45 @@ def test_a_privacy_sentence_never_says_this_machine_about_a_hosted_run():
         assert "on this machine" not in policy.classify_run(engine).privacy
     for engine in ("local:x", "cache", "none"):
         assert "sent" in policy.classify_run(engine).privacy
+
+
+# ---------------------------------------------------------------------------
+# The /engines FORECAST must be the router's answer, not the installed list.
+# Verified live before it was written down: with PASSAGE_LIVE_LOCAL=0 the page
+# still printed "Your next translation will run on translategemma:4b on this
+# machine" while the router was sending everything to a hosted model, because
+# the snapshot chose from report["models"] (everything INSTALLED) instead of
+# report["chosen_model"] / report["can_serve"] (what will actually serve).
+# ---------------------------------------------------------------------------
+
+def _probing_backend(report):
+    return types.SimpleNamespace(probe_local_llm=lambda: dict(report))
+
+
+def test_the_forecast_names_the_model_that_will_really_serve():
+    snap = ui_module._take_local_snapshot(_probing_backend({
+        "reachable": True, "outcome": "ok",
+        "models": ["translategemma:4b", "qwen2.5:7b"],
+        "routing_enabled": True, "chosen_model": "translategemma:4b",
+        "can_serve": True,
+    }))
+    assert snap["chosen_model"] == "translategemma:4b"
+    assert snap["can_serve"] is True
+
+
+def test_no_local_forecast_when_the_router_will_not_serve_locally():
+    """Reachable daemon, models installed, routing off. "The endpoint is up"
+    and "local will answer your next request" are different facts."""
+    snap = ui_module._take_local_snapshot(_probing_backend({
+        "reachable": True, "outcome": "ok",
+        "models": ["translategemma:4b", "qwen2.5:7b"],
+        "routing_enabled": False, "chosen_model": None, "can_serve": False,
+    }))
+    assert snap["can_serve"] is False
+    assert snap["chosen_model"] is None, "forecast a local run the router will not make"
+    # Diagnostics still needs the installed list; only the FORECAST is gated.
+    assert snap["models"] == ["translategemma:4b", "qwen2.5:7b"]
+    # And the sentence the page prints follows chosen_model, so it cannot
+    # promise this machine.
+    assert "on this machine" not in policy.describe_privacy(
+        None, local_first_model=snap["chosen_model"], hosted_available=True)
