@@ -57,5 +57,21 @@ jobs:
           service: translation-app
           region: us-central1
           image: gcr.io/translation-app-452812/translation-app:${{ github.sha }}
+          # NiceGUI is server-stateful: UI elements live in process memory
+          # keyed to a client id, and the WebSocket IS the request. Two Cloud
+          # Run defaults are hostile to that and both cost nothing to change
+          # (DECISIONS.md §7):
+          #   --timeout=3600      the 300s default kills every live session
+          #                       after five minutes, mid-document.
+          #   --session-affinity  best-effort, but without it a reconnect can
+          #                       land on an instance holding none of this
+          #                       client's state.
+          # --min-instances=1 is the third item in that table and is NOT set
+          # here on purpose: it bills continuously, and scale-to-zero taking
+          # idle sessions with it is the acceptable half of the trade.
+          # Unverified against the real service — reasoned from documented
+          # behaviour. The honest test is to deploy, open a session and watch
+          # when it drops.
+          flags: --timeout=3600 --session-affinity
           env_vars: |
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}

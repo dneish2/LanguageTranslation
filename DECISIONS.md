@@ -150,11 +150,16 @@ them — it passes only `service`, `region`, `image` and `OPENAI_API_KEY`:
 | min-instances 0 | scale-to-zero when idle takes every live session with it |
 
 Act on it, in this order:
-1. **Config, not code.** Deploy with `--timeout=3600 --session-affinity --min-instances=1`, and
-   tune `--concurrency` to the per-client memory cost. `min-instances=1` bills continuously; that
-   is the trade. Cloud Run session affinity is *best-effort*, so this reduces state loss rather
-   than eliminating it. **Unverified** — reasoned from documented behaviour, not observed on the
-   real service. The honest test is to deploy, open a session, and watch when it drops.
+1. **Config, not code. — TWO OF THE THREE DONE.** `deploy.yml` now passes
+   `--timeout=3600 --session-affinity`. Both are free, and taking them separately is the point:
+   the table above lists three defaults together, which made it easy to reject all three as a
+   bundle because the third one bills. `--min-instances=1` is deliberately NOT set — it bills
+   continuously for an app with no users, and scale-to-zero taking idle sessions with it is the
+   acceptable half of that trade. Revisit it the day someone other than David is mid-document.
+   `--concurrency` is still untuned against the per-client memory cost. Cloud Run session affinity
+   is *best-effort*, so this reduces state loss rather than eliminating it. **Unverified** —
+   reasoned from documented behaviour, not observed on the real service. The honest test is to
+   deploy, open a session, and watch when it drops.
 2. **Then persist only what must survive a reconnect.** Not everything should. The current
    cache-scope work already keys on `app.storage.browser['id']`, which is cookie-backed and does
    survive; the translation cache is in-process and deliberately ephemeral.
