@@ -123,11 +123,61 @@ parsing) can be measured once — the distinction is whether sampling is in the 
 
 ---
 
+## 7. Session durability: NiceGUI's statefulness, and where persistence should live
+
+**Resolution: pin the Cloud Run config first; move state to a store only for what must survive.
+Not yet implemented — the config change needs a deploy, the store needs credentials.**
+
+Observed locally: long-lived sessions drop and reconnect. There are two separate causes and they
+should not be conflated.
+
+**Cause one, fixed.** NiceGUI holds a socket.io connection per client with a heartbeat on the
+asyncio event loop. Block the loop and the heartbeat stops, the browser declares the connection
+dead, and the client reconnects. `/api/health` was doing exactly that: four sequential blocking
+`urllib` probes on the loop, measured at **15.31 s wall clock with zero 50 ms heartbeat ticks**
+against an unresponsive Ollama socket. After the fix, 2.53 s and 41 ticks (median of 5, 5/5
+improved). Disconnects that clustered around a slow or stopped Ollama should be gone.
+
+**Cause two, structural and unfixed.** NiceGUI is server-stateful: UI elements live in process
+memory keyed to a client id, and `start_ui`'s `new_page_ui()` builds a fresh `TranslationUI` per
+page load. Three Cloud Run defaults are hostile to that, and the current `deploy.yml` sets none of
+them — it passes only `service`, `region`, `image` and `OPENAI_API_KEY`:
+
+| default | effect |
+|---|---|
+| request timeout 300 s | the WebSocket *is* the request, so it is killed every 5 minutes |
+| session affinity off | a reconnect can land on an instance that has none of this client's state |
+| min-instances 0 | scale-to-zero when idle takes every live session with it |
+
+Act on it, in this order:
+1. **Config, not code.** Deploy with `--timeout=3600 --session-affinity --min-instances=1`, and
+   tune `--concurrency` to the per-client memory cost. `min-instances=1` bills continuously; that
+   is the trade. Cloud Run session affinity is *best-effort*, so this reduces state loss rather
+   than eliminating it. **Unverified** — reasoned from documented behaviour, not observed on the
+   real service. The honest test is to deploy, open a session, and watch when it drops.
+2. **Then persist only what must survive a reconnect.** Not everything should. The current
+   cache-scope work already keys on `app.storage.browser['id']`, which is cookie-backed and does
+   survive; the translation cache is in-process and deliberately ephemeral.
+
+**What goes where, if a store lands:**
+- **Supabase (Postgres)** for per-user rows: usage/credits, saved provider profiles, thread
+  history, and `passage/traces.py` output. `passage/usage.py` was written for this — the note in
+  §5 already says `usage` becomes a read against a `passage_usage` table keyed by uid with nothing
+  above it changing. This is the higher-value half.
+- **GCS** only for blobs, and note the policy constraint: `passage/policy.py` forbids durably
+  storing an original upload. So GCS is for *derived* artifacts — a rendered overlay image, a
+  translated document a user asked to keep — never the source file. Adding a bucket without that
+  rule would quietly break a policy the app currently enforces in code.
+
+**BLOCKED on David** for the Supabase half: URL + anon key (see below). The Cloud Run flags are
+not blocked and can ship whenever a deploy is wanted.
+
 ## NEEDS DAVID — genuinely blocked
 
 - **Supabase URL + anon key.** Auth verification is ported and live-tested against a throwaway
   project; the sign-in UI and any durable per-user storage need the real values. Both are designed
-  to be public (they ship in every browser bundle), unlike the service-role key.
+  to be public (they ship in every browser bundle), unlike the service-role key. This is also the
+  gate on §7's persistence half.
 - **Whether traces get a UI, and what it shows.** `passage/traces.py` records document runs,
   machine output and human edits, and computes edit rate per engine. What to *display* — a
   per-segment timeline, an edit-rate dashboard, an LLM-as-judge view — is a product decision, and
