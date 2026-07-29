@@ -278,8 +278,14 @@ def test_a_comparison_cannot_claim_the_whole_session_stayed_on_this_machine(comp
     Compare's local leg used to be the only thing anyone could see: a local
     run followed by a Compare left the page saying 100% of the session's
     characters stayed on this machine, seconds after the sentence had been
-    delivered to a hosted model on Passage's key. Half the compared characters
+    delivered to a hosted model on Passage's key. All of the compared text
     left, and the summary now says so.
+
+    The share is 0.0, not the 0.5 this test used to assert. The user typed ONE
+    sentence and every character of it went to Passage's hosted key; that a
+    local model also answered the same sentence does not unsend it, and
+    dividing per-row would make the number a function of how many local models
+    happen to be installed (six of them read "83% stayed on this machine").
     """
     from passage import engine_ledger
 
@@ -289,14 +295,22 @@ def test_a_comparison_cannot_claim_the_whole_session_stayed_on_this_machine(comp
     summary = engine_ledger.summarise(store["engine_runs"])
     assert summary["remote"]["runs"] == 1, summary
     assert summary["remote"]["chars"] == len(SENTENCE), summary
-    assert summary["local_share_of_chars"] == 0.5, summary
+    assert summary["local_share_of_chars"] == 0.0, summary
+    assert summary["new_chars"] == len(SENTENCE), summary
     assert summary["metered_runs"] == 1, summary
 
 
-def test_an_engine_that_failed_is_not_recorded_as_a_run(compare_ui, monkeypatch):
-    """Only work that produced an answer is a run. A failed candidate sent
-    text out but got nothing back; booking it as a delivered translation would
-    make the ledger disagree with the page beside it."""
+def test_a_local_engine_that_failed_is_not_recorded_as_a_run(compare_ui, monkeypatch):
+    """A LOCAL leg that failed writes no row, because nothing left the machine.
+
+    Connection refused on localhost: the sentence never reached anybody, so
+    there is no destination to disclose and no work to report. This test used
+    to be called "an engine that failed" and demonstrated the rule with this
+    local case while locking it in for hosted ones too — where the bytes had
+    already been delivered. See the hosted case below: it is the opposite rule
+    for the opposite reason, and conflating them is what reprinted "100% of
+    the characters you translated stayed on this machine".
+    """
     _, store = compare_ui
 
     def only_hosted(self, profile=None):
@@ -320,3 +334,96 @@ def test_an_engine_that_failed_is_not_recorded_as_a_run(compare_ui, monkeypatch)
     _run_comparison()
 
     assert [r["engine"] for r in _rows(store)] == [f"hosted:{TEXT_MODEL}"], _rows(store)
+
+
+def _hosted_fails(monkeypatch, endpoints, *, how: str):
+    """Make the hosted leg fail AFTER the bytes are delivered.
+
+    Exactly what a 429, a timeout or an empty answer looks like from here: the
+    endpoint counts the call — the sentence is in `endpoints.texts[HOSTED]`,
+    it is on someone else's machine — and only then does the reply come back
+    unusable. `how="raise"` errors, `how="empty"` answers with nothing.
+    """
+    real_create = _FakeCompletions.create
+
+    def create(self, **kwargs):
+        completion = real_create(self, **kwargs)
+        if self._base_url is not HOSTED:
+            return completion
+        if how == "raise":
+            raise RuntimeError("429 rate limit")
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=""))])
+
+    monkeypatch.setattr(_FakeCompletions, "create", create)
+
+
+@pytest.mark.parametrize("how", ["raise", "empty"])
+def test_a_hosted_leg_that_failed_is_still_disclosed_as_sent_out(
+    compare_ui, endpoints, monkeypatch, how
+):
+    """F1. A failed hosted leg changes what the user GOT, not where their words
+    WENT — so it is disclosed, and it is not billed.
+
+    Booking rows only `if r.ok` printed, live, for a comparison whose hosted
+    leg 429'd on a 57-character secret: "100% of the 285 characters you
+    translated stayed on this machine · sent out: 0 runs · 0 chars", with the
+    sentence sitting in the hosted provider's logs. The bytes are gone; the
+    only thing the failure removes is the bill.
+    """
+    from passage import engine_ledger
+
+    _, store = compare_ui
+    _hosted_fails(monkeypatch, endpoints, how=how)
+
+    _run_comparison()
+
+    # WHICH PATH RAN: the hosted endpoint really received these bytes, and the
+    # local model really answered. Neither is assumed.
+    assert endpoints.calls[HOSTED] == 1, "the hosted endpoint never saw the sentence"
+    assert endpoints.calls[LOCAL_URL] == 1, "the local model never ran"
+    assert any(SENTENCE in t for t in endpoints.texts[HOSTED]), endpoints.texts[HOSTED]
+
+    by_engine = {r["engine"]: r for r in _rows(store)}
+    assert set(by_engine) == {f"hosted:{TEXT_MODEL}", f"local:{LOCAL_TAG}"}, by_engine
+    hosted = by_engine[f"hosted:{TEXT_MODEL}"]
+    assert hosted["left_machine"] is True, hosted
+    assert engine_ledger.LedgerEntry(**hosted).destination == "sent out", hosted
+    assert hosted["chars"] == len(SENTENCE), hosted
+    # Told, not billed. The user gets no translation and no charge.
+    assert hosted["metered"] is False, hosted
+    assert store.get("usage", {}).get("metered_runs", 0) == 0, store.get("usage")
+
+    summary = engine_ledger.summarise(store["engine_runs"])
+    assert summary["remote"]["runs"] == 1, summary
+    assert summary["remote"]["chars"] == len(SENTENCE), summary
+    assert summary["local_share_of_chars"] == 0.0, summary   # was 1.0 — "100% stayed"
+    assert summary["metered_runs"] == 0, summary
+
+
+def test_the_privacy_share_counts_the_users_sentence_once_per_comparison(
+    compare_ui, endpoints, monkeypatch
+):
+    """F2. The denominator is characters the user typed, not chars x engines.
+
+    With six engines answering one 57-character sentence the page said "83% of
+    the 342 characters you translated stayed on this machine" — a claim that
+    climbs toward 100% the more local models you install, about a sentence that
+    went out in full. One comparison is one piece of text.
+    """
+    from passage import engine_ledger
+
+    _, store = compare_ui
+    monkeypatch.setattr(TranslationBackend, "available_local_models",
+                        lambda self: [LOCAL_TAG, "llama3.2:3b", "phi4:14b"])
+
+    _run_comparison()
+
+    rows = _rows(store)
+    assert len(rows) == 4, rows                      # 1 hosted + 3 local, all answered
+    assert endpoints.calls[LOCAL_URL] == 3, endpoints.calls
+    assert len({r["text_id"] for r in rows}) == 1, "one comparison is one piece of text"
+
+    summary = engine_ledger.summarise(store["engine_runs"])
+    assert summary["new_chars"] == len(SENTENCE), summary     # was 4 x 57 = 228
+    assert summary["local_share_of_chars"] == 0.0, summary    # was 0.75

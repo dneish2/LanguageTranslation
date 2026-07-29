@@ -172,6 +172,29 @@ Act on it, in this order:
 **BLOCKED on David** for the Supabase half: URL + anon key (see below). The Cloud Run flags are
 not blocked and can ship whenever a deploy is wanted.
 
+## 8. Known bug, UNFIXED: a photo with no readable text leaves no ledger row
+
+**Open. Not fixed, and not introduced by the ledger work — it predates this branch.**
+
+Photograph something with nothing readable in it. The image is base64'd and sent to the hosted
+vision model, the model finds no text, and `TranslationBackend` raises
+`ValueError("No text recognized in image.")`. That exception propagates out through
+`_run_recorded` *before* the `record(...)` call at the end of it, so no ledger row is written at
+all — and `/engines` says "Nothing translated yet." after a photograph has demonstrably been sent
+to a hosted model on Passage's key.
+
+Reproduce: run `w_launch.py` with `PROBE_NO_BLOCKS=1`, photograph/upload any image on `/`, then
+open `/engines`.
+
+It is the same class of defect as the Compare one fixed here — **a failed call is still a
+disclosure** — but it lives in a different place: Compare booked the row and filtered it out,
+whereas the image path never reaches its booking at all because the exception escapes first. The
+fix is for `_run_recorded` to record what provenance already saw when `fn` raises, which is a
+change on the path every surface uses and wants its own round with its own live gate rather than
+being smuggled into this one.
+
+---
+
 ## NEEDS DAVID — genuinely blocked
 
 - **Supabase URL + anon key.** Auth verification is ported and live-tested against a throwaway

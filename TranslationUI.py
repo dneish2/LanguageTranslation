@@ -929,16 +929,31 @@ class TranslationUI(VoicePageMixin):
                         results = await asyncio.to_thread(
                             self.backend.compare_translations, text,
                             target.value or "Spanish", candidates)
-                    # One row per engine that actually answered. Compare is a
-                    # fan-out: collapsing it into a single "compare" run would
-                    # name an engine that did not exist and would hide the
-                    # hosted call, which is precisely the text that left the
-                    # machine and the only one Passage pays for. Failed rows
-                    # produced no output and are not runs.
+                    # One row per engine. Compare is a fan-out: collapsing it
+                    # into a single "compare" run would name an engine that did
+                    # not exist and would hide the hosted call, which is
+                    # precisely the text that left the machine.
+                    #
+                    # A FAILED REMOTE LEG IS STILL A DISCLOSURE. The bytes were
+                    # handed to someone else's machine before it answered, so a
+                    # 429, a timeout or an empty reply changes what the user
+                    # GOT, not where their words WENT — it is recorded and
+                    # shown as sent out, and `delivered=False` keeps it off the
+                    # bill. Booking it only `if r.ok` is how a comparison whose
+                    # hosted leg failed printed "100% of the characters you
+                    # translated stayed on this machine". A failed LOCAL leg is
+                    # genuinely different: nothing left, so there is nothing to
+                    # disclose and no row.
+                    #
+                    # `text_id` ties these rows to ONE piece of the user's text
+                    # so the privacy share counts the sentence they typed, not
+                    # the sentence times the models they have installed.
+                    text_id = f"compare:{uuid.uuid4().hex}"
                     for r in results:
-                        if r.ok:
+                        if r.ok or not r.is_local:
                             recorder(surface=policy.Surface.COMPARE, engine=r.engine,
-                                     latency_ms=r.latency_ms or 0, chars=len(text))
+                                     latency_ms=r.latency_ms or 0, chars=len(text),
+                                     delivered=r.ok, text_id=text_id)
                     render(results)
                     run_row.clear()
                     with run_row:
@@ -2298,7 +2313,9 @@ class TranslationUI(VoicePageMixin):
     def _record_engine_run(self, *, surface, engine: str, latency_ms: int, chars: int,
                            runs_store: list | None = None,
                            usage_store: dict | None = None,
-                           profile=None, origin: str | None = None) -> policy.EngineRun | None:
+                           profile=None, origin: str | None = None,
+                           delivered: bool = True,
+                           text_id: str | None = None) -> policy.EngineRun | None:
         """Book one COMPLETED request against what actually served it.
 
         Everything comes from `policy.classify_run`, including whether the text
@@ -2328,10 +2345,20 @@ class TranslationUI(VoicePageMixin):
                     privacy=("Answered from this session's cache on this machine — no "
                              "model ran and nothing was sent anywhere for this request. "
                              f"These words were originally produced by {origin}."))
+            # BEING TOLD AND BEING BILLED ARE TWO DIFFERENT FACTS. `delivered`
+            # is False when the bytes reached the engine and no answer came
+            # back (a 429, a timeout, an empty reply). The text left this
+            # machine, so the row is written and the disclosure stands; the
+            # user just doesn't pay for a translation they never received.
+            if not delivered and run.metered:
+                run = dataclass_replace(
+                    run, metered=False,
+                    privacy=(f"Sent to {run.engine}, which returned no translation — "
+                             "the text left this machine, and this run isn't metered."))
             engine_ledger.record_run(
                 self.engine_runs if runs_store is None else runs_store,
                 surface=str(getattr(surface, "value", surface)), run=run,
-                latency_ms=latency_ms, chars=chars, when=time.time())
+                latency_ms=latency_ms, chars=chars, when=time.time(), text_id=text_id)
             # Only work Passage paid for reaches the counter — a local, cached
             # or BYO run is never recorded, not recorded-then-zeroed.
             usage.record(self.usage_store if usage_store is None else usage_store,
@@ -2355,10 +2382,12 @@ class TranslationUI(VoicePageMixin):
         runs, used, profile = self.engine_runs, self.usage_store, self.active_profile
 
         def record(*, surface, engine: str, latency_ms: int, chars: int,
-                   origin: str | None = None):
+                   origin: str | None = None, delivered: bool = True,
+                   text_id: str | None = None):
             return self._record_engine_run(
                 surface=surface, engine=engine, latency_ms=latency_ms, chars=chars,
-                runs_store=runs, usage_store=used, profile=profile, origin=origin)
+                runs_store=runs, usage_store=used, profile=profile, origin=origin,
+                delivered=delivered, text_id=text_id)
 
         return record
 

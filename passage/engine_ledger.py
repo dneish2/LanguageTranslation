@@ -51,6 +51,14 @@ class LedgerEntry:
     #: 220 chars", and the hosted version of the same session claimed 80%
     #: local about text that had entirely left the machine.
     ran: str | None = None
+    #: Which piece of the USER'S text this row is about. Compare fans one
+    #: sentence out to N engines and writes N rows, and a chars-weighted share
+    #: that charged the denominator once per row made the claim a function of
+    #: how many models happen to be installed: a 57-character sentence sent to
+    #: a hosted key rendered "83% of the 342 characters you translated stayed
+    #: on this machine". Rows sharing a text_id are ONE piece of text. A row
+    #: without one is its own piece, which is every non-fan-out surface.
+    text_id: str | None = None
 
     @property
     def destination(self) -> str:
@@ -62,20 +70,21 @@ class LedgerEntry:
 def record(store: list, *, surface: str, engine: str, is_local: bool,
            latency_ms: int, chars: int, when: float,
            left_machine: Any = _UNSET, metered: bool = False,
-           ran: str | None = None) -> None:
+           ran: str | None = None, text_id: str | None = None) -> None:
     """Append an entry, newest last, bounded."""
     store.append(asdict(LedgerEntry(
         surface=surface, engine=engine, is_local=bool(is_local),
         latency_ms=int(latency_ms), chars=int(chars), when=float(when),
         left_machine=(not bool(is_local)) if left_machine is _UNSET else left_machine,
         metered=bool(metered), ran=None if ran is None else str(ran),
+        text_id=text_id,
     )))
     if len(store) > MAX_ENTRIES:
         del store[:len(store) - MAX_ENTRIES]
 
 
 def record_run(store: list, *, surface: str, run, latency_ms: int, chars: int,
-               when: float) -> None:
+               when: float, text_id: str | None = None) -> None:
     """Record a completed request from its `policy.EngineRun` receipt.
 
     The preferred entry point, because it removes the caller's ability to
@@ -87,7 +96,7 @@ def record_run(store: list, *, surface: str, run, latency_ms: int, chars: int,
            is_local=(run.left_machine is False), latency_ms=latency_ms,
            chars=chars, when=when, left_machine=run.left_machine,
            metered=bool(run.metered),
-           ran=getattr(run.ran, "value", run.ran))
+           ran=getattr(run.ran, "value", run.ran), text_id=text_id)
 
 
 def left_machine_of(row: dict[str, Any]) -> bool | None:
@@ -144,6 +153,24 @@ def served_from_cache(row: dict[str, Any]) -> bool:
     return (row.get("engine") or "").strip().lower() == "cache"
 
 
+def group_by_text(rows: list[dict[str, Any]]) -> dict[Any, list[dict[str, Any]]]:
+    """Rows grouped into the pieces of the user's text they describe.
+
+    Rows sharing a `text_id` are one piece answered by several engines; a row
+    without one is its own piece.
+    """
+    pieces: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        pieces.setdefault(row.get("text_id") or id(row), []).append(row)
+    return pieces
+
+
+def distinct_chars(rows: list[dict[str, Any]]) -> int:
+    """Characters of the user's text these rows cover, counting a fan-out once."""
+    return sum(max(r.get("chars", 0) for r in group)
+               for group in group_by_text(rows).values())
+
+
 def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Local vs cloud, in the terms someone would actually ask about.
 
@@ -160,6 +187,11 @@ def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     characters and all of them left. Everything local-vs-sent-out here is
     therefore computed over rows where something actually ran, and re-reads
     are reported on their own line where they cannot inflate anything.
+
+    NEITHER IS A FAN-OUT. The same re-counting arrived a second time through a
+    door this guard doesn't watch: Compare's duplicate rows are `local` rows,
+    not `cache` rows, so characters are counted per PIECE of the user's text
+    (see `text_id`), not per row, everywhere the share is computed.
     """
     rows = list(entries)
     # Three kinds of row, not two. A row where NOTHING was asked of anything
@@ -185,7 +217,7 @@ def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
         latencies = sorted(r.get("latency_ms", 0) for r in subset)
         return {
             "runs": len(subset),
-            "chars": sum(r.get("chars", 0) for r in subset),
+            "chars": distinct_chars(subset),
             "median_ms": latencies[len(latencies) // 2] if latencies else None,
         }
 
@@ -199,8 +231,18 @@ def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for r in ran_rows:
         engines[r.get("engine", "?")] = engines.get(r.get("engine", "?"), 0) + 1
 
-    new_chars = sum(r.get("chars", 0) for r in ran_rows)
-    local_chars = sum(r.get("chars", 0) for r in local)
+    # THE SHARE IS OVER THE CHARACTERS THE USER TYPED, not over rows. Compare
+    # writes one row per engine for a single sentence, so a per-row sum
+    # multiplied the user's text by however many models were installed —
+    # "83% of the 342 characters you translated stayed on this machine" about
+    # 57 characters that had all gone to a hosted key. And a piece of text
+    # counts as local only when NO leg of it left: the sentence either was
+    # sent somewhere or it wasn't, and five local answers don't unsend it.
+    pieces = group_by_text(ran_rows)
+    new_chars = distinct_chars(ran_rows)
+    local_chars = sum(max(r.get("chars", 0) for r in group)
+                      for group in pieces.values()
+                      if all(left_machine_of(r) is False for r in group))
     return {
         "total_runs": len(rows),
         # Rows where a model (or nothing at all, for empty input) actually
