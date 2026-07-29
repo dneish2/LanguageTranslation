@@ -24,6 +24,7 @@ state is reachable on a machine that has never installed it.
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -408,6 +409,20 @@ LAYOUTS = [
 ]
 
 
+#: huggingface_hub arrives only with faster-whisper, which is an optional extra
+#: (requirements-local-voice.txt). CI installs the base requirements, so the
+#: source of truth this test compares against is simply absent there. Skipping
+#: is the honest outcome: without huggingface_hub there is nothing to disagree
+#: with. It does mean this guard runs only where the speech extra is installed —
+#: which is already true of the divergence it protects against, since CI sets
+#: none of the cache variables either.
+_HAS_HF_HUB = importlib.util.find_spec("huggingface_hub") is not None
+
+
+@pytest.mark.skipif(not _HAS_HF_HUB,
+                    reason="huggingface_hub absent (installed with the "
+                           "optional faster-whisper extra); no source of "
+                           "truth to compare the derivation against")
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_the_probe_looks_where_huggingface_hub_actually_writes(
         monkeypatch, tmp_path, layout):
