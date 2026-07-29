@@ -186,12 +186,34 @@ to a hosted model on Passage's key.
 Reproduce: run `w_launch.py` with `PROBE_NO_BLOCKS=1`, photograph/upload any image on `/`, then
 open `/engines`.
 
-It is the same class of defect as the Compare one fixed here — **a failed call is still a
-disclosure** — but it lives in a different place: Compare booked the row and filtered it out,
-whereas the image path never reaches its booking at all because the exception escapes first. The
-fix is for `_run_recorded` to record what provenance already saw when `fn` raises, which is a
-change on the path every surface uses and wants its own round with its own live gate rather than
-being smuggled into this one.
+It is the same class of defect as the Compare one fixed here — **a call that was DELIVERED and
+then failed is still a disclosure** — and this one qualifies: the vision model received the photo
+and answered, it just found no text. But it lives in a different place: Compare booked the row and
+filtered it out, whereas the image path never reaches its booking at all because the exception
+escapes first. The fix is for `_run_recorded` to record what provenance already saw when `fn`
+raises, which is a change on the path every surface uses and wants its own round with its own live
+gate rather than being smuggled into this one.
+
+---
+
+## 9. Where the delivered-vs-attempted line is drawn, and what it can still get wrong
+
+`/engines` discloses a leg as "sent out" when its bytes reached someone else's machine, and stays
+silent when the connection never opened — otherwise an offline session reads "sent out: 1 runs ·
+57 chars" about text that never left, which is a lie told to precisely the user who chose this
+app. The two cases are indistinguishable from `ok`, so `compare.reached_the_engine` reads the
+exception: a connect-phase failure (refused, DNS, unreachable) means nothing left; everything
+else — 429, 500, a timeout waiting for the answer, an empty reply — means it did.
+
+**The residual, accepted knowingly.** The openai SDK collapses *every* transport failure into
+`APIConnectionError` with the message "Connection error.", including the rare ones that happen
+after the connection is up and some bytes are already on the wire (a write error, a protocol
+error mid-request). Those are read here as never-sent, so a request that partially left could go
+undisclosed. It is not distinguishable without reaching into the SDK's transport, and the
+alternative — treating every "Connection error." as a disclosure — is the offline false positive
+this section exists to prevent, which is both far more common and aimed at the user who cares
+most. Ambiguity elsewhere errs the other way: anything not knowably a connect failure is treated
+as delivered.
 
 ---
 

@@ -478,9 +478,18 @@ def test_zero_runs_is_not_evidence_of_privacy():
     assert usage.describe(empty, total_runs=0) == \
         "Nothing translated yet, so nothing has been metered."
     assert "ran locally" not in usage.describe(empty, total_runs=0)
-    # Once something HAS run unmetered, the claim is sayable.
-    assert "own key" in usage.describe(empty, total_runs=3)
-    # And with no ledger in hand, no claim is made either way.
+    # UNMETERED IS NOT UNSENT, and this used to assert the opposite: once
+    # something had run, the line added "everything so far ran on this machine,
+    # from cache, or on your own key". That is a billing fact asserting a
+    # destination, and the two come apart the moment a run is disclosed but not
+    # charged — a hosted leg that took the sentence and then failed is exactly
+    # that, and this sentence printed four blocks under "sent out: 1 runs · 57
+    # chars" on the same page. A block that only knows the bill says only that.
+    line = usage.describe(empty, total_runs=3)
+    assert line == "Nothing metered this session."
+    for claim in ("this machine", "own key", "ran locally"):
+        assert claim not in line, line
+    # And with no ledger in hand, still no claim either way.
     assert "own key" not in usage.describe(empty)
 
 

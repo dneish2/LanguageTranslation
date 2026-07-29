@@ -427,3 +427,114 @@ def test_the_privacy_share_counts_the_users_sentence_once_per_comparison(
     summary = engine_ledger.summarise(store["engine_runs"])
     assert summary["new_chars"] == len(SENTENCE), summary     # was 4 x 57 = 228
     assert summary["local_share_of_chars"] == 0.0, summary    # was 0.75
+
+
+def _hosted_is_unreachable(monkeypatch):
+    """The hosted endpoint refuses the connection: the socket never opens.
+
+    The fake therefore never counts the call and never records the bytes, so
+    `endpoints.calls[HOSTED] == 0` is independent evidence that nothing left
+    this machine — the assertion the disclosure has to answer to. Contrast
+    `_hosted_fails`, which counts first and fails after.
+    """
+    real_create = _FakeCompletions.create
+
+    def create(self, **kwargs):
+        if self._base_url is HOSTED:
+            # What the openai SDK raises when it cannot reach the host; its
+            # APIConnectionError message is literally "Connection error."
+            raise RuntimeError("Connection error: could not reach api.openai.com")
+        return real_create(self, **kwargs)
+
+    monkeypatch.setattr(_FakeCompletions, "create", create)
+
+
+def _engines_page_text(app_ui) -> str:
+    """Render the real /engines page and return every line it prints.
+
+    The page is the surface the claim is made on, so it is the surface the
+    claim is read back from: a summary dict that is right while the sentence
+    over it is wrong is the defect this file keeps finding.
+    """
+    client = context.client
+    before = set(client.elements)
+    app_ui.engines_page()
+    return "\n".join(
+        element.text for eid, element in list(client.elements.items())
+        if eid not in before and isinstance(element, ui.label) and element.text)
+
+
+def test_a_hosted_leg_that_never_connected_is_not_disclosed_as_sent_out(
+    compare_ui, endpoints, monkeypatch
+):
+    """D-A. Nothing left this machine, so the page must not say anything did.
+
+    `r.ok or not r.is_local` booked a row for every remote leg, delivered or
+    not. Live, with an unreachable provider, that printed "0% of the 57
+    characters you translated stayed on this machine · local: 3 runs · 57
+    chars · sent out: 1 runs · 57 chars" while the provider's own counter sat
+    at zero — a false disclosure, and a false LOSS of the local share, shown
+    to the offline user this app exists for.
+
+    A failed local leg and an unreached remote leg are the same fact and now
+    get the same treatment: no bytes, no destination, no row.
+    """
+    from passage import engine_ledger
+
+    app_ui, store = compare_ui
+    _hosted_is_unreachable(monkeypatch)
+
+    _run_comparison()
+
+    # WHICH PATH RAN, from the endpoints' own counters. Nothing reached the
+    # hosted endpoint; the local model really did answer.
+    assert endpoints.calls[HOSTED] == 0, "the hosted endpoint was reached after all"
+    assert endpoints.texts[HOSTED] == [], endpoints.texts[HOSTED]
+    assert endpoints.calls[LOCAL_URL] == 1, "the local model never ran"
+    assert any(SENTENCE in t for t in endpoints.texts[LOCAL_URL]), endpoints.texts[LOCAL_URL]
+
+    rows = _rows(store)
+    assert [r["engine"] for r in rows] == [f"local:{LOCAL_TAG}"], rows
+    assert not any(engine_ledger.LedgerEntry(**r).destination == "sent out" for r in rows), rows
+
+    summary = engine_ledger.summarise(store["engine_runs"])
+    assert summary["remote"] == {"runs": 0, "chars": 0, "median_ms": None}, summary
+    # Not filed as unknown either: a refusal is knowably nothing-left, and an
+    # unknown row in this fan-out's group would pull the share off 100%.
+    assert summary["unknown"]["runs"] == 0, summary
+    assert summary["local_share_of_chars"] == 1.0, summary
+    assert summary["new_chars"] == len(SENTENCE), summary
+
+    page = _engines_page_text(app_ui)
+    assert f"100% of the {len(SENTENCE)} characters you translated stayed on this machine" \
+        in page, page
+    assert "sent out: 0 runs · 0 chars" in page, page
+    assert "destination not known" not in page, page
+
+
+def test_the_usage_block_does_not_contradict_a_disclosed_run(
+    compare_ui, endpoints, monkeypatch
+):
+    """D-B. One page, two blocks, opposite claims about the same sentence.
+
+    A delivered-then-failed hosted leg is disclosed and unbilled, so the
+    metered counter stays at zero — and the zero-metered copy read "Nothing
+    metered this session — everything so far ran on this machine, from cache,
+    or on your own key" four blocks under "sent out: 1 runs · 57 chars". True
+    about the bill, false about the destination, and it only claimed the
+    second because it assumed unmetered implies local.
+    """
+    app_ui, store = compare_ui
+    _hosted_fails(monkeypatch, endpoints, how="raise")
+
+    _run_comparison()
+
+    # WHICH PATH RAN: these bytes really were delivered before the failure.
+    assert endpoints.calls[HOSTED] == 1, "the hosted endpoint never saw the sentence"
+    assert any(SENTENCE in t for t in endpoints.texts[HOSTED]), endpoints.texts[HOSTED]
+    assert store.get("usage", {}).get("metered_runs", 0) == 0, store.get("usage")
+
+    page = _engines_page_text(app_ui)
+    assert f"sent out: 1 runs · {len(SENTENCE)} chars" in page, page
+    assert "Nothing metered this session." in page, page
+    assert "everything so far ran on this machine" not in page, page

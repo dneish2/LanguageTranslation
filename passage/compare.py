@@ -45,6 +45,10 @@ class CandidateResult:
     cost_usd: float | None = None
     error: str | None = None
     agreement: float | None = field(default=None)
+    #: Whether this leg's bytes got as far as the engine. Only false when the
+    #: connection never opened, which for a remote engine is the difference
+    #: between a disclosure and a false one — see `reached_the_engine`.
+    reached: bool = True
 
     @property
     def ok(self) -> bool:
@@ -96,6 +100,48 @@ def describe_empty_output(message: Any) -> str:
         return ("thinking model — answered in its reasoning channel, which this "
                 "endpoint doesn't expose as output")
     return "returned no text"
+
+
+#: Exception CLASS names raised while the connection is still being opened.
+#: Named rather than imported: the same fact arrives as a builtin from the
+#: socket layer, as httpx/httpcore's ConnectError under the openai SDK, and as
+#: urllib3's NewConnectionError under a self-hosted endpoint.
+_NEVER_CONNECTED_TYPES = (
+    "ConnectionRefusedError", "ConnectError", "ConnectTimeout",
+    "NewConnectionError", "gaierror",
+)
+#: The same fact when a wrapper has already flattened it to a string. The
+#: openai SDK's own APIConnectionError message is literally "Connection error."
+_NEVER_CONNECTED_TEXT = (
+    "connection refused", "connection error", "could not reach",
+    "failed to establish", "network is unreachable", "getaddrinfo",
+)
+
+
+def reached_the_engine(error: BaseException) -> bool:
+    """Did this leg's bytes get as far as the other machine?
+
+    THE DIFFERENCE BETWEEN THESE TWO CASES IS THE WHOLE DISCLOSURE, and `ok`
+    cannot tell them apart because it is false for both. A 429, a 500, a
+    timeout waiting for the answer or an empty reply all happen AFTER the
+    sentence was handed over: it is on someone else's computer and the user
+    has to be told. A connection that never opened handed over nothing, and
+    reporting it as "sent out" prints a false disclosure to an offline or
+    air-gapped user — the person who chose this app for exactly that reason.
+
+    Ambiguity errs towards disclosure: a refusal is the only thing claimed
+    here as knowably-never-sent, and everything else is treated as delivered,
+    because being told your text may have left when it didn't is recoverable
+    and the opposite is not.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in _NEVER_CONNECTED_TYPES:
+            return False
+        current = current.__cause__
+    return not any(mark in str(error).lower() for mark in _NEVER_CONNECTED_TEXT)
 
 
 def _normalise(text: str) -> str:
@@ -169,6 +215,7 @@ def run_comparison(
         except Exception as error:
             result.latency_ms = int((time.time() - started) * 1000)
             result.error = str(error)[:200]
+            result.reached = reached_the_engine(error)
         return result
 
     if not candidates:

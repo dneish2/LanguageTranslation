@@ -934,23 +934,32 @@ class TranslationUI(VoicePageMixin):
                     # not exist and would hide the hosted call, which is
                     # precisely the text that left the machine.
                     #
-                    # A FAILED REMOTE LEG IS STILL A DISCLOSURE. The bytes were
-                    # handed to someone else's machine before it answered, so a
-                    # 429, a timeout or an empty reply changes what the user
-                    # GOT, not where their words WENT — it is recorded and
-                    # shown as sent out, and `delivered=False` keeps it off the
-                    # bill. Booking it only `if r.ok` is how a comparison whose
-                    # hosted leg failed printed "100% of the characters you
-                    # translated stayed on this machine". A failed LOCAL leg is
-                    # genuinely different: nothing left, so there is nothing to
-                    # disclose and no row.
+                    # A DELIVERED LEG IS A DISCLOSURE; AN ATTEMPTED ONE IS NOT.
+                    # `ok` is false for two unlike things and only one of them
+                    # is about where the text went. A 429, a timeout or an
+                    # empty reply happens after the bytes are handed over, so
+                    # it changes what the user GOT, not where their words WENT
+                    # — recorded, shown as sent out, and `delivered=False`
+                    # keeps it off the bill. A connection that never opened
+                    # sent nothing: `r.ok or not r.is_local` booked one anyway
+                    # and told an offline user "sent out: 1 runs · 57 chars"
+                    # while dragging the local share to 0%, about text that
+                    # never left. That is a lie to precisely the user this app
+                    # is for, so an unreached leg writes no row — the same
+                    # rule, for the same reason, as a failed LOCAL leg.
+                    #
+                    # Not filed as `unknown` either, though the ledger has that
+                    # bucket: an unknown row would sit in this fan-out's group
+                    # and pull the share off 100% for a session where nothing
+                    # was sent. Unknown is for when you cannot tell; a refusal
+                    # is knowably nothing-left.
                     #
                     # `text_id` ties these rows to ONE piece of the user's text
                     # so the privacy share counts the sentence they typed, not
                     # the sentence times the models they have installed.
                     text_id = f"compare:{uuid.uuid4().hex}"
                     for r in results:
-                        if r.ok or not r.is_local:
+                        if r.ok or (not r.is_local and r.reached):
                             recorder(surface=policy.Surface.COMPARE, engine=r.engine,
                                      latency_ms=r.latency_ms or 0, chars=len(text),
                                      delivered=r.ok, text_id=text_id)
@@ -2350,11 +2359,12 @@ class TranslationUI(VoicePageMixin):
             # back (a 429, a timeout, an empty reply). The text left this
             # machine, so the row is written and the disclosure stands; the
             # user just doesn't pay for a translation they never received.
+            # Metering is all this changes: `run.privacy` is read by exactly
+            # one surface (/api/text_translate's body) and nothing on that path
+            # can pass delivered=False, so a sentence written here would be
+            # code that renders nowhere and reads like shipped behaviour.
             if not delivered and run.metered:
-                run = dataclass_replace(
-                    run, metered=False,
-                    privacy=(f"Sent to {run.engine}, which returned no translation — "
-                             "the text left this machine, and this run isn't metered."))
+                run = dataclass_replace(run, metered=False)
             engine_ledger.record_run(
                 self.engine_runs if runs_store is None else runs_store,
                 surface=str(getattr(surface, "value", surface)), run=run,

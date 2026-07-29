@@ -81,14 +81,21 @@ def describe(summary_: UsageSummary, *, total_runs: int | None = None) -> str:
     absence of evidence — and the claim is only sayable once there is something
     it is true OF. None means the caller can't see the ledger, so no claim is
     made either way.
+
+    UNMETERED IS NOT UNSENT, and this line used to say it was: "everything so
+    far ran on this machine, from cache, or on your own key" is a statement
+    about BILLING that also asserts a destination, and the two come apart the
+    moment a run is disclosed but not charged — a hosted leg that took the
+    sentence and then failed is exactly that. It printed four blocks under
+    "sent out: 1 runs · 57 chars" and contradicted it. This block only knows
+    what was charged; the ledger above is the only thing that knows where the
+    text went, so this now says the smaller true thing and leaves the
+    destination to the surface that has the evidence.
     """
     if summary_.metered_runs == 0:
         if total_runs == 0:
             return "Nothing translated yet, so nothing has been metered."
-        if total_runs is None:
-            return "Nothing metered this session."
-        return ("Nothing metered this session — everything so far ran on this machine, "
-                "from cache, or on your own key.")
+        return "Nothing metered this session."
     if summary_.over_free_allowance:
         return (f"{summary_.metered_chars:,} characters metered — over the "
                 f"{summary_.free_chars:,} free allowance.")
