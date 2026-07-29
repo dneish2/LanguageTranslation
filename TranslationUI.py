@@ -36,6 +36,7 @@ from TranslationBackend import (
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage import __version__ as passage_version
 from passage import diagnostics
+from passage import compare
 from passage import engine_ledger
 from passage import local_voice
 from passage import policy
@@ -2423,7 +2424,24 @@ class TranslationUI(VoicePageMixin):
         """
         with self.backend.capture_provenance() as provenance:
             started = time.perf_counter()
-            result = fn(*args)
+            try:
+                result = fn(*args)
+            except Exception as error:
+                # A CALL THAT WAS DELIVERED AND THEN FAILED IS STILL A
+                # DISCLOSURE, and this is the one place that used to lose it.
+                # `fn` raising escaped the whole function, so the `record(...)`
+                # below never ran: photograph something with no readable text,
+                # the vision model receives the image and answers "nothing
+                # here", `TranslationBackend` raises, and /engines says
+                # "Nothing translated yet." about a photo that had
+                # demonstrably been base64'd to a hosted model on Passage's
+                # key. Booking it here — off the provenance that was written
+                # when the outbound call was made, not off state read later —
+                # is the fix for the shape, not just for that one path.
+                self._record_attempted_run(
+                    record, error, provenance, surface=surface, engine=engine,
+                    latency_ms=int((time.perf_counter() - started) * 1000))
+                raise
             latency_ms = int((time.perf_counter() - started) * 1000)
         reported = None
         if unwrap is not None:
@@ -2466,6 +2484,69 @@ class TranslationUI(VoicePageMixin):
         except Exception:
             LOGGER.debug("engine run not recorded", exc_info=True)
         return result
+
+    def _record_attempted_run(self, record, error: BaseException, provenance, *,
+                              surface, engine: str | None, latency_ms: int) -> None:
+        """Book the disclosure owed by a call that failed AFTER its bytes left.
+
+        Four cases are deliberately silent, and each one is silent for the same
+        reason the Compare page is (see `run_comparison`'s caller): a row here
+        is a statement that the user's text is on somebody else's computer, and
+        writing one when it isn't tells an offline user their words were sent
+        out — a lie told to precisely the person who chose this app.
+
+        1. **Nothing was ever called.** THE PROOF OF DEPARTURE IS PROVENANCE,
+           NEVER THE CALLER'S `engine` ARGUMENT. That argument is derived from
+           the profile that WOULD have served the request — an expectation
+           formed before the call, which is exactly the render-time-derived
+           claim this whole class of defect is made of. Trusting it booked
+           "sent to hosted:gpt-5.4-mini" for a non-image file that was rejected
+           by validation before a single byte left. `provenance.engine` is
+           written by `_note_engine` at the point of the outbound call, so its
+           presence is evidence and its absence is too.
+        2. **It came from cache.** Nothing ran and nothing was sent for this
+           request; a later failure downstream doesn't change that.
+        3. **It ran locally.** Knowably on this machine, so there is nothing to
+           disclose. A failed local leg writes no row on the Compare page for
+           the same reason.
+        4. **The connection never opened.** `compare.reached_the_engine` reads
+           the exception chain for a connect-phase failure. DECISIONS.md §9
+           records both this rule and the residual case it still gets wrong.
+
+        Everything else is treated as delivered, because ambiguity has to err
+        towards disclosure: being told your text may have left when it didn't
+        is recoverable and the opposite is not. An unrecognised engine label is
+        included on purpose — the ledger files it under `unknown`, which is
+        reported on its own line and inflates neither the local share nor the
+        sent-out one.
+
+        `chars=0` because the amount of text is genuinely not knowable: on the
+        image path the source text is inside the photo and the model never got
+        as far as reporting it. `delivered=False` keeps the row off the bill —
+        the text left the machine, so the disclosure stands, but the user does
+        not pay for a translation they never received. That preserves the
+        "an erroring request is never metered" rule this path already had,
+        rather than trading it for the disclosure.
+        """
+        if not getattr(provenance, "engine", None) or getattr(provenance, "from_cache", False):
+            return
+        # Provenance decides WHETHER to disclose; the caller's label decides
+        # WHAT TO CALL IT. Same precedence, and the same reasons, as the
+        # success path: `provenance.engine` is a provider identity — an opaque
+        # "endpoint:<sha256 prefix>" for a BYO endpoint, and the identity of
+        # the LAST sub-call in a multi-call operation — where `engine` is the
+        # user-facing name the document path has always used. Two surfaces
+        # naming the same endpoint differently is how a user loses the ability
+        # to check where their data went.
+        produced_by = engine or provenance.engine
+        try:
+            run = policy.classify_run(produced_by, self.active_profile)
+            if run.left_machine is False or not compare.reached_the_engine(error):
+                return
+            record(surface=surface, engine=produced_by, latency_ms=latency_ms,
+                   chars=0, delivered=False)
+        except Exception:  # bookkeeping must never replace the real error
+            LOGGER.debug("attempted engine run not recorded", exc_info=True)
 
     def _set_active_profile(self, profile) -> None:
         try:

@@ -88,6 +88,13 @@ class Endpoints:
         self.names: dict[object, str] = {}
         self.calls: dict[object, int] = {}
         self._lock = threading.Lock()
+        #: The OCR read succeeds but finds no text — a photograph of a blank
+        #: wall. The photo still reached the model, which is the whole point of
+        #: the tests that set this.
+        self.ocr_finds_nothing = False
+        #: Raised INSTEAD of connecting, and deliberately not counted: a
+        #: refused connection means nothing landed anywhere.
+        self.refuse_with: BaseException | None = None
 
     def register(self, base_url, name: str) -> None:
         self.names[base_url] = name
@@ -109,13 +116,15 @@ class _FakeCompletions:
         key = self._base_url
         if key not in self._endpoints.names:
             raise AssertionError(f"call to an endpoint no test registered: {key!r}")
+        if self._endpoints.refuse_with is not None:
+            raise self._endpoints.refuse_with
         with self._endpoints._lock:
             self._endpoints.calls[key] = self._endpoints.calls.get(key, 0) + 1
         name = self._endpoints.names[key]
 
         body = json.dumps(kwargs.get("messages") or [])
         if "image_url" in body:  # the OCR read of the photo
-            content = json.dumps({"recognized_blocks": [
+            content = json.dumps({"recognized_blocks": [] if self._endpoints.ocr_finds_nothing else [
                 {"text": "ENTRANTES", "confidence": 0.95, "bbox": [0.1, 0.1, 0.9, 0.3]},
             ]})
         elif '"translations"' in body:  # the batched block translation
@@ -605,3 +614,117 @@ def test_the_image_api_honours_the_sessions_own_endpoint(
     rows = session.rows("image")
     assert len(rows) == 1 and rows[0]["engine"] == "byo:private-a"
     assert rows[0]["metered"] is False
+
+
+# ───────── a delivered call that then failed is still a disclosure ──────── #
+#
+# DECISIONS.md §8, and the last instance of the defect shape that took six
+# review rounds to converge on: the app deriving a privacy claim from state
+# read later instead of recording what happened when it happened. Every
+# earlier instance was a claim computed too late. This one was a claim never
+# computed at all — `_run_recorded`'s `record(...)` sits at the END of the
+# function, so an exception from the wrapped call escaped past it and the run
+# was never booked.
+#
+# The repro: photograph something with no readable text. The image is base64'd
+# to the hosted vision model, the model answers "nothing here",
+# `TranslationBackend` raises `ValueError("No text recognized in image.")`, and
+# /engines says "Nothing translated yet." about a photograph that had
+# demonstrably been sent to a hosted model on Passage's key.
+#
+# These run the real route against the fake endpoints above, so the outbound
+# call genuinely happens and production's own `_note_engine` writes the
+# provenance the fix reads. That matters: an earlier version of this fix
+# passed a test that fed it the caller's engine LABEL, and shipped a false
+# disclosure for a file that validation rejected before anything left.
+
+
+def test_a_photo_the_model_read_but_found_no_text_in_is_still_disclosed(
+    backend, endpoints, storage
+):
+    """The §8 repro, end to end through the route that had the bug."""
+    endpoints.ocr_finds_nothing = True
+    session = _make_session(backend, storage, scope="session:A")
+
+    response = _translate_image(session, _photo())
+
+    # The user still gets the real error, unchanged. Bookkeeping must not
+    # replace, swallow or reshape the failure it is recording.
+    assert response.status_code == 400
+    assert "error" in json.loads(response.body.decode())
+    # The photograph really was sent: this is what makes it a disclosure.
+    assert endpoints.count(HOSTED) == 1
+
+    rows = session.rows("image")
+    assert rows, "a delivered-then-failed vision call left no ledger row"
+    assert len(rows) == 1
+    assert rows[0]["engine"] == f"hosted:{VISION_MODEL}"   # which path ran
+    assert rows[0]["left_machine"] is True                 # the disclosure
+    # NOT billed. `delivered=False` preserves the existing rule that an
+    # erroring image request is never metered, rather than trading that rule
+    # away in exchange for the disclosure.
+    assert rows[0]["metered"] is False
+    assert session.usage.get("metered_chars", 0) == 0
+    # Unknowable, and reported as such rather than guessed: the source text was
+    # inside the photo and the model never got as far as reporting it.
+    assert rows[0]["chars"] == 0
+
+    from passage import engine_ledger
+    summary = engine_ledger.summarise(session.runs)
+    assert summary["total_runs"] == 1, "/engines still says nothing was translated"
+    assert summary["remote"]["runs"] == 1
+    assert summary["metered_runs"] == 0
+
+
+def test_a_byo_photo_that_fails_is_disclosed_against_the_users_own_endpoint(
+    backend, endpoints, storage
+):
+    """The disclosure has to name the endpoint that actually received the
+    photo. A BYO session's failure booked against Passage's hosted key would
+    be a worse lie than not booking it at all."""
+    endpoints.ocr_finds_nothing = True
+    session = _make_session(backend, storage, scope="session:A", profile=_byo_profile())
+
+    _translate_image(session, _photo())
+
+    assert endpoints.count(HOSTED) == 0, "a BYO session's photograph went to Passage's key"
+    rows = session.rows("image")
+    assert len(rows) == 1 and rows[0]["engine"] == "byo:private-a"
+    assert rows[0]["left_machine"] is True and rows[0]["metered"] is False
+
+
+def test_a_connection_that_never_opened_writes_no_row(
+    backend, endpoints, storage
+):
+    """The false disclosure this must not produce.
+
+    An offline user reading "sent out: 1 run" about text that never left is a
+    lie told to precisely the person who chose this app. Note that provenance
+    IS written here — `_note_engine` runs before the outbound call, so its
+    presence cannot be the only gate — which is exactly why
+    `compare.reached_the_engine` is consulted as a second one. Same rule and
+    same reason as the Compare page's unreached legs; see DECISIONS.md §9.
+    """
+    endpoints.refuse_with = ConnectionRefusedError("connection refused")
+    session = _make_session(backend, storage, scope="session:A")
+
+    _translate_image(session, _photo())
+
+    assert endpoints.total() == 0, "nothing should have landed"
+    assert session.rows("image") == [], "an offline session was told its photo was sent out"
+
+
+def test_the_sdk_flattened_connection_error_also_writes_no_row(
+    backend, endpoints, storage
+):
+    """The openai SDK collapses transport failures into `APIConnectionError`
+    with the literal message "Connection error." — the residual DECISIONS.md §9
+    accepts knowingly. It is read as never-sent, deliberately, because the
+    offline false positive that choice prevents is both far more common and
+    aimed at the user who cares most."""
+    endpoints.refuse_with = RuntimeError("Connection error.")
+    session = _make_session(backend, storage, scope="session:A")
+
+    _translate_image(session, _photo())
+
+    assert session.rows("image") == []

@@ -172,27 +172,64 @@ Act on it, in this order:
 **BLOCKED on David** for the Supabase half: URL + anon key (see below). The Cloud Run flags are
 not blocked and can ship whenever a deploy is wanted.
 
-## 8. Known bug, UNFIXED: a photo with no readable text leaves no ledger row
+## 8. A photo with no readable text left no ledger row
 
-**Open. Not fixed, and not introduced by the ledger work — it predates this branch.**
+**Resolution: record the disclosure when the call happens, not when the result renders.
+— IMPLEMENTED.**
 
 Photograph something with nothing readable in it. The image is base64'd and sent to the hosted
 vision model, the model finds no text, and `TranslationBackend` raises
-`ValueError("No text recognized in image.")`. That exception propagates out through
-`_run_recorded` *before* the `record(...)` call at the end of it, so no ledger row is written at
-all — and `/engines` says "Nothing translated yet." after a photograph has demonstrably been sent
+`ValueError("No text recognized in image.")`. That exception propagated out through
+`_run_recorded` *before* the `record(...)` call at the end of it, so no ledger row was written at
+all — and `/engines` said "Nothing translated yet." after a photograph had demonstrably been sent
 to a hosted model on Passage's key.
 
-Reproduce: run `w_launch.py` with `PROBE_NO_BLOCKS=1`, photograph/upload any image on `/`, then
-open `/engines`.
+Reproduced by: running `w_launch.py` with `PROBE_NO_BLOCKS=1`, photographing/uploading any image
+on `/`, then opening `/engines`. Now covered without a browser by
+`test_a_photo_the_model_read_but_found_no_text_in_is_still_disclosed`, which drives the real route
+with the fake vision endpoint returning zero recognised blocks.
 
 It is the same class of defect as the Compare one fixed here — **a call that was DELIVERED and
 then failed is still a disclosure** — and this one qualifies: the vision model received the photo
 and answered, it just found no text. But it lives in a different place: Compare booked the row and
 filtered it out, whereas the image path never reaches its booking at all because the exception
-escapes first. The fix is for `_run_recorded` to record what provenance already saw when `fn`
-raises, which is a change on the path every surface uses and wants its own round with its own live
-gate rather than being smuggled into this one.
+escapes first.
+
+**As implemented.** `_run_recorded` now catches, books, and re-raises: `_record_attempted_run`
+writes the row from the provenance that was already captured, and the original exception continues
+on untouched. Because this sits on the path every surface uses, it closes the defect at the shape
+rather than at the one place the shape was noticed — which is what makes it the last item in this
+section rather than the fourth entry in a list of three.
+
+Four cases stay silent, each for the reason the Compare page is silent about them: a row here is a
+statement that the user's text is on somebody else's computer, and writing one when it isn't tells
+an offline user their words were sent out.
+
+1. Nothing was ever called.
+2. It came from cache — nothing ran and nothing was sent for this request.
+3. It ran locally, knowably, so there is nothing to disclose.
+4. The connection never opened (`compare.reached_the_engine`, §9's rule and §9's residual).
+
+Everything else is disclosed, including an engine label policy cannot classify: that lands in the
+ledger's `unknown` bucket, which is reported on its own line and inflates neither the local share
+nor the sent-out one. The row carries `chars=0`, because the source text was inside the photo and
+the model never got as far as reporting it — unknowable, and said so rather than guessed — and
+`delivered=False`, which keeps the existing "an erroring request is never metered" rule intact
+instead of trading it away for the disclosure. The text left; the user just doesn't pay for a
+translation they never received.
+
+**One thing worth recording, because it is the same mistake one level up.** The first cut named the
+engine from `_run_recorded`'s `engine` argument, which is derived from the profile that *would*
+have served the request. That is an expectation formed before the call — precisely the
+render-time-derived claim this whole class of defect is made of — and it booked "sent to
+hosted:gpt-5.4-mini" for a non-image file that validation rejected before a single byte left. It
+was caught by an existing test (`test_an_image_request_that_errors_is_not_metered`) whose docstring
+had already stated the rule: *rejected before anything leaves, and nothing is booked.* Provenance
+is now the sole proof of departure — it is written by `_note_engine` at the point of the outbound
+call, so its presence is evidence and its absence is too — and the caller's label is used only to
+*name* what provenance says was already reached. A test that feeds in a label proves nothing;
+`tests/test_voice_and_doc_ledger.py` drives the real route against fake endpoints that count their
+own calls, so the outbound call genuinely happens and production writes its own provenance.
 
 ---
 
