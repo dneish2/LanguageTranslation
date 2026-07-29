@@ -325,10 +325,16 @@ def test_the_harness_would_catch_the_original_defect(tmp_path):
     """Strip the transcript-path fix out of the real JS and the stale local
     claim must come back. Without this, every assertion above could be passing
     for reasons unrelated to the mechanism."""
-    broken = VOICE_PAGE_JS \
-        .replace("updateEngines(textEngineLine(textEngine));", "") \
-        .replace("        beginEngineLine();\n        try {", "        try {")
+    # Mutate the transcript function only, and by call rather than by
+    # surrounding text: the clearing block around it has grown (the stale
+    # audio player is cleared there too), and a whitespace-exact patch would
+    # silently stop mutating anything.
+    head, tail = VOICE_PAGE_JS.split("async function translateTranscriptFallback", 1)
+    tail = tail.replace("beginEngineLine();", "", 1) \
+               .replace("updateEngines(textEngineLine(textEngine));", "", 1)
+    broken = head + "async function translateTranscriptFallback" + tail
     assert broken != VOICE_PAGE_JS
+    assert "beginEngineLine();" not in broken.split("async function translateTranscriptFallback")[1]
 
     out = _run([_audio_ok(), _text_ok()], tmp_path, page_js=broken)
     stale = out["timeline"][1]["engines"]

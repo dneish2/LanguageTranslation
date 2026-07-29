@@ -29,10 +29,17 @@ def format_engine_line(meta: dict) -> str:
     """
     stt = meta.get("stt") or "hosted"
     tts = meta.get("tts") or "hosted"
-    where = ("this machine" if stt.startswith("local") and tts.startswith("local")
-             else "sent out" if not stt.startswith("local") and not tts.startswith("local")
+    # THREE steps run, not two. The middle one carries the actual words, so a
+    # sentence built from stt+tts alone claimed "this machine" over a
+    # transcript that had just been sent to a hosted model. An absent label
+    # counts as hosted: the honest default is the one that cannot over-claim.
+    translation = meta.get("translation") or "hosted"
+    steps = (stt, translation, tts)
+    local_steps = [s for s in steps if s.startswith("local")]
+    where = ("this machine" if len(local_steps) == len(steps)
+             else "sent out" if not local_steps
              else "partly on this machine")
-    line = f"heard by {stt} · spoken by {tts} — {where}"
+    line = f"heard by {stt} · translated by {translation} · spoken by {tts} — {where}"
     fell_back = [k for k in ("stt_fallback", "tts_fallback") if meta.get(k)]
     if fell_back:
         line += " (local was tried and failed)"
@@ -181,6 +188,31 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
         const where = engine.indexOf('local') === 0 ? 'this machine' : 'sent out';
         return `translated by ${engine} — ${where} · text only, no audio was heard or spoken`;
     }
+    // The player holds a blob URL from the PREVIOUS recording. Leaving it in
+    // place under a transcript-only translation (which synthesises nothing) or
+    // under a failed recording offers the user audio of a different sentence
+    // and reads as output of the request they just made.
+    function clearAudioPlayer() {
+        const player = document.getElementById('out_audio');
+        if (!player) return;
+        if (typeof player.pause === 'function') { try { player.pause(); } catch (_e) {} }
+        const previous = player.src;
+        player.src = 'data:audio/wav;base64,';
+        if (typeof player.load === 'function') { try { player.load(); } catch (_e) {} }
+        if (previous && previous.indexOf('blob:') === 0 &&
+            typeof URL !== 'undefined' && URL.revokeObjectURL) {
+            try { URL.revokeObjectURL(previous); } catch (_e) {}
+        }
+    }
+    // A failed request translated nothing, so the previous request's panes
+    // must not stay on screen as if they were its result.
+    function clearResultPanes() {
+        const orig = document.getElementById('original_text');
+        const trans = document.getElementById('translated_text');
+        if (orig) orig.textContent = '';
+        if (trans) trans.textContent = '';
+        clearAudioPlayer();
+    }
     function updateButtons(recording) {
         window.voiceUx.setRecordingButtons(DESKTOP_SCOPE, recording);
         isRecording = recording;
@@ -306,6 +338,9 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
         // Clear before the request, not after: whatever is on screen describes
         // the PREVIOUS request and is already wrong.
         beginEngineLine();
+        // Same argument as the engine line: the panes and the player describe
+        // the PREVIOUS request and are already wrong.
+        clearResultPanes();
         updateButtons(false);
         const sampleRate = audioCtx.sampleRate;
         const captured = pcmChunks;
@@ -340,10 +375,17 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
                 let player = document.getElementById('out_audio');
                 player.src = url; player.play();
                 window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
+            } else {
+                // Text came back but nothing was spoken: no player content.
+                clearAudioPlayer();
+                window.voiceUx.setStatus(DESKTOP_SCOPE, window.voiceUx.states.COMPLETE);
             }
         } catch(e) {
             window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
             window.voiceUx.setDebug(DESKTOP_SCOPE, e.message);
+            // Nothing was translated, so nothing of the previous request may
+            // stay on screen under this failure.
+            clearResultPanes();
             // A failed recording must not leave the last successful
             // recording's "this machine" claim standing over an empty result.
             updateEngines(ENGINE_AUDIO_FAILED);
@@ -363,6 +405,10 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
         // Drop any audio engine line from a previous recording BEFORE this
         // text-only request starts.
         beginEngineLine();
+        // This path synthesises NOTHING. A player still holding the last
+        // recording's audio under a text-only result is the same false claim
+        // the engine line was fixed for.
+        clearAudioPlayer();
         try {
             const resp = await fetch('/api/text_translate_stream', {
                 method: 'POST',
@@ -372,7 +418,7 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
             const contentType = resp.headers.get('Content-Type') || '';
             // The text endpoint names its engine when it can. If it does not,
             // we say so — we do not borrow the audio path's label.
-            const textEngine = resp.headers.get('X-Text-Engine') || '';
+            let textEngine = resp.headers.get('X-Text-Engine') || '';
             if (contentType.includes('text/event-stream')) {
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();
@@ -389,6 +435,9 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
                         const dataLine = evt.split('\n').find(line => line.startsWith('data: '));
                         const eventType = eventLine ? eventLine.replace('event: ', '').trim() : '';
                         const payload = dataLine ? JSON.parse(dataLine.replace('data: ', '')) : {};
+                        // The events carry the engine too, so a proxy that
+                        // strips response headers cannot silence the label.
+                        if (payload.engine) textEngine = textEngine || payload.engine;
                         if (eventType === 'start') {
                             document.getElementById('original_text').textContent = payload.original_text || cleaned;
                         } else if (eventType === 'partial') {
@@ -407,6 +456,7 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
             } else {
                 const data = await resp.json();
                 if (!resp.ok) throw new Error(data?.error || 'Transcript translation failed.');
+                textEngine = textEngine || data.engine || '';
                 document.getElementById('original_text').textContent = data.original_text || cleaned;
                 document.getElementById('translated_text').textContent = data.translated_text || '';
             }
@@ -415,6 +465,7 @@ _VOICE_PAGE_JS_TEMPLATE = r"""
         } catch (e) {
             window.voiceUx.setStatus(DESKTOP_SCOPE, "Error: " + e.message);
             window.voiceUx.setDebug(DESKTOP_SCOPE, e.message || 'unknown error');
+            clearResultPanes();
             updateEngines(ENGINE_TEXT_FAILED);
         }
     }

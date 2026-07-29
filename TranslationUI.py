@@ -2398,8 +2398,22 @@ class TranslationUI(VoicePageMixin):
         threshold = int(os.getenv("LIVE_TEXT_STREAMING_CHAR_THRESHOLD", "250"))
         should_stream = live_streaming_enabled or len(cleaned_text) >= threshold
 
+        # This endpoint used to pass NO profile, so a visitor who had
+        # configured their own endpoint had their transcript translated on
+        # PASSAGE'S key — the credential boundary the picker exists to draw,
+        # crossed silently. Resolved here, on the request context (session
+        # storage is unreadable from a worker thread), applied inside it.
+        profile = self.active_profile
+        engine = self._text_engine_label(profile)
+        started = time.perf_counter()
+
         if not should_stream:
-            translated = await asyncio.to_thread(self.backend.translate_text, cleaned_text, language)
+            translated = await asyncio.to_thread(
+                self._translate_text_on_profile, cleaned_text, language, profile)
+            self._record_engine_run(
+                surface=policy.Surface.LIVE_TEXT, engine=engine,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                chars=len(cleaned_text))
             self._record_chat_thread(cleaned_text, translated, language)
             return JSONResponse(
                 {
@@ -2407,30 +2421,61 @@ class TranslationUI(VoicePageMixin):
                     "original_text": cleaned_text,
                     "translated_text": translated,
                     "target_language": language,
+                    "engine": engine,
                 },
-                headers={"X-Correlation-Id": correlation_id},
+                # The /voice page has a reader for this header; until now no
+                # server code produced it, so the transcript engine line was
+                # permanently stuck on "the server did not name the engine".
+                headers={"X-Correlation-Id": correlation_id, "X-Text-Engine": engine},
             )
 
         async def event_generator():
-            yield f"event: start\ndata: {json.dumps({'target_language': language, 'original_text': cleaned_text})}\n\n"
+            yield f"event: start\ndata: {json.dumps({'target_language': language, 'original_text': cleaned_text, 'engine': engine})}\n\n"
             try:
                 final_text, partials = await asyncio.to_thread(
-                    self.backend.stream_translate_text,
+                    self._stream_translate_text_on_profile,
                     cleaned_text,
                     language,
+                    profile,
                 )
                 for partial in partials[:-1]:
                     yield f"event: partial\ndata: {json.dumps({'translated_text': partial})}\n\n"
+                self._record_engine_run(
+                    surface=policy.Surface.LIVE_TEXT, engine=engine,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    chars=len(cleaned_text))
                 self._record_chat_thread(cleaned_text, final_text, language)
-                yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True})}\n\n"
+                yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True, 'engine': engine})}\n\n"
             except Exception as e:
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Correlation-Id": correlation_id},
+            headers={"Cache-Control": "no-cache", "X-Correlation-Id": correlation_id,
+                     "X-Text-Engine": engine},
         )
+
+    @staticmethod
+    def _text_engine_label(profile) -> str:
+        """Name the engine a text call will ACTUALLY run on.
+
+        Derived from the profile that is about to be applied rather than
+        assumed hosted, so the label, the header and the work cannot disagree.
+        """
+        if profile is not None and getattr(profile, "kind", None) != provider_profiles.KIND_APP:
+            return profile.describe()
+        return f"hosted:{TEXT_MODEL}"
+
+    def _translate_text_on_profile(self, text: str, language: str, profile) -> str:
+        """Runs in a worker thread: contextvars do not propagate into a thread,
+        so the endpoint override is established HERE, not at the route."""
+        with self.backend.using_profile(profile):
+            return self.backend.translate_text(text, language)
+
+    def _stream_translate_text_on_profile(self, text: str, language: str, profile):
+        with self.backend.using_profile(profile):
+            return self.backend.stream_translate_text(text, language)
 
     async def api_image_translate(
         self,

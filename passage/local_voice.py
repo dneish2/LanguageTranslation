@@ -106,8 +106,26 @@ VOICE_PREFIXES = {
 }
 
 
+#: ISO code (and Piper locale tag) -> language NAME, derived from the table
+#: above rather than typed twice. The app spells the target language BOTH ways:
+#: the /voice JS default is `lang || 'es'` and the server defaults an empty
+#: language box to 'es', while the language picker offers "Spanish". Only the
+#: NAME used to resolve, so the DEFAULT spelling reported no local voice with
+#: es_ES-davefx-medium sitting installed on disk, and every default-language
+#: request sent its translated text out for hosted synthesis.
+_CODE_TO_NAME = {}
+for _name, _prefix in VOICE_PREFIXES.items():
+    _CODE_TO_NAME[_prefix.split("_")[0].lower()] = _name   # "es"
+    _CODE_TO_NAME[_prefix.lower()] = _name                 # "es_es"
+
+
 def _lang_key(language: str | None) -> str:
-    return (language or "").strip().lower().split("(")[0].strip()
+    """Normalise a language NAME or CODE to the table's key.
+
+    Accepts "Spanish", "spanish (latin america)", "es", "es-ES", "es_ES".
+    """
+    key = (language or "").strip().lower().split("(")[0].strip()
+    return _CODE_TO_NAME.get(key.replace("-", "_"), key)
 
 
 def iso_code(language: str | None) -> str | None:

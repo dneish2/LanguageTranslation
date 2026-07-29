@@ -222,7 +222,7 @@ def _voice_backend(monkeypatch):
 def test_no_voice_models_uses_hosted_stt_and_tts_and_meta_says_hosted(monkeypatch, tmp_path):
     monkeypatch.delenv("PASSAGE_LOCAL_VOICE", raising=False)
     _voice_stack(monkeypatch, tmp_path, whisper=False, piper=False, voice=False)
-    _tb, backend = _voice_backend(monkeypatch)
+    tb, backend = _voice_backend(monkeypatch)
 
     source, _translated, audio, meta = backend.translate_audio(b"audio", "Spanish")
 
@@ -230,7 +230,11 @@ def test_no_voice_models_uses_hosted_stt_and_tts_and_meta_says_hosted(monkeypatc
     assert meta["stt"] == "hosted" and meta["tts"] == "hosted"
     assert meta["media_type"] == "audio/mpeg" and audio == b"hosted-mp3"
     # And the user is TOLD, in the line the page renders.
-    assert format_engine_line(meta) == "heard by hosted · spoken by hosted — sent out"
+    assert format_engine_line(meta) == (
+        # THREE steps, not two: the middle one carries the words, and a
+        # line built from stt+tts alone claimed "this machine" over a
+        # transcript that had just been sent to a hosted model.
+        f"heard by hosted · translated by hosted:{tb.TEXT_MODEL} · spoken by hosted — sent out")
 
 
 def test_positive_control_installed_voice_models_produce_local_labels(monkeypatch, tmp_path):

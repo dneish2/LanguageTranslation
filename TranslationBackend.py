@@ -471,6 +471,18 @@ def _mask_protected_spans(text: str) -> tuple[str, list[str]]:
     return _PROTECTED_SPAN_RE.sub(take, text), spans
 
 
+#: Lenient: matches the placeholder as the model MANGLED it, not as we wrote
+#: it. Masking is a deterministic mechanism, so a restore that silently half
+#: worked must be detected rather than shipped — "[[PSG:0]]" reaching a user's
+#: screen is machinery leaking into the product.
+_PLACEHOLDER_DEBRIS_RE = re.compile(r"\[{1,2}\s*P\s*S\s*G\s*[:：]?\s*\d*\s*\]{0,2}", re.IGNORECASE)
+
+
+def detect_placeholder_debris(text: str) -> list[str]:
+    """Every placeholder-shaped fragment left in `text`. Empty when clean."""
+    return _PLACEHOLDER_DEBRIS_RE.findall(text or "")
+
+
 def _restore_protected_spans(text: str, spans: list[str]) -> str:
     """Put the original URLs/emails back. Any placeholder the model dropped or
     mangled beyond recognition simply doesn't come back — that is no worse than
@@ -488,6 +500,18 @@ def _restore_protected_spans(text: str, spans: list[str]) -> str:
             "[Backend] %d/%d protected spans survived translation",
             count, len(spans),
         )
+    # A mangled or out-of-range placeholder does not match the strict pattern,
+    # so it used to travel all the way to the user's screen as "[[PSG:0]]".
+    # Detect it here and take it out: the URL is already lost either way, and
+    # visible internals are the worse of the two failures.
+    debris = detect_placeholder_debris(restored)
+    if debris:
+        logging.error(
+            "[Backend] placeholder restore failed; removing %d leaked fragment(s): %s",
+            len(debris), debris[:5],
+        )
+        restored = _PLACEHOLDER_DEBRIS_RE.sub("", restored)
+        restored = re.sub(r"[ \t]{2,}", " ", restored)
     return restored
 
 
@@ -1951,7 +1975,12 @@ class TranslationBackend:
                 source_text = self._transcribe_hosted(audio_bytes)
             logging.info("[Backend] Transcription (%s): %s", meta["stt"], source_text[:60] + "…")
 
+            # The MIDDLE step is the one that carries the actual words. It runs
+            # hosted here, and the meta must say so: a page that computed "this
+            # machine" from the STT and TTS labels alone told the user their
+            # recording stayed local while its transcript was being sent out.
             translated_text = self.translate_text(source_text, target_language)
+            meta["translation"] = f"hosted:{TEXT_MODEL}"
 
             if local_voice.tts_available(target_language):
                 try:
