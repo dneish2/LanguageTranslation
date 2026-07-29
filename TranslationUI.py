@@ -2786,14 +2786,42 @@ class TranslationUI(VoicePageMixin):
         with self.backend.using_profile(profile):
             return self.backend.stream_translate_text(text, language)
 
+    def _translate_image_as_json(self, payload: bytes, filename: str, language: str) -> dict:
+        """`translate_image_text_blocks`, in a shape JSONResponse can send.
+
+        `overlay_png` (raw PNG bytes) becomes `overlay_png_base64`, and the
+        whole payload is round-tripped through `json.dumps` here so that a
+        non-serialisable value is an exception rather than a 500 the caller
+        has already been billed for. The in-process UI path does NOT go
+        through this: it consumes the bytes directly (see
+        show_mobile_image_result), which is why every UI-driven probe of this
+        bug passed while every API call returned 500.
+        """
+        result = self.backend.translate_image_text_blocks(payload, filename, language)
+        payload_out = dict(result or {})
+        overlay = payload_out.pop("overlay_png", None)
+        payload_out["overlay_png_base64"] = (
+            base64.b64encode(overlay).decode("ascii") if overlay else None)
+        json.dumps(payload_out)
+        return payload_out
+
     def _run_image_on_profile(self, recorder, profile, payload: bytes, filename: str,
                               language: str):
         """Runs in a worker thread: the endpoint override is established HERE,
         and the ledger label is derived from the same profile that establishes
-        it, so 'where it went' and 'what we booked' cannot disagree."""
+        it, so 'where it went' and 'what we booked' cannot disagree.
+
+        The result is made JSON-safe INSIDE the recorded call, not after it.
+        `translate_image_text_blocks` returns `overlay_png` as raw PNG bytes,
+        which `JSONResponse` cannot serialise — so every image this route
+        successfully translated came back to the caller as a 500 while the
+        ledger row had already been written and metered: the user paid for an
+        error. Converting here means a payload that cannot be serialised
+        raises before `_run_recorded` books anything, so an erroring request
+        is never metered."""
         with self.backend.using_profile(profile):
             return self._run_recorded(
-                recorder, self.backend.translate_image_text_blocks,
+                recorder, self._translate_image_as_json,
                 (payload, filename, language),
                 surface=policy.Surface.IMAGE,
                 engine=self._vision_engine_label(profile),

@@ -526,3 +526,82 @@ def test_a_document_runs_on_the_sessions_own_endpoint_and_is_booked_there(
     assert rows[0]["metered"] is False
 
 
+# ─────────────── D-IMG: the image API returns what it charged ──────────── #
+
+
+def _photo() -> bytes:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (320, 160), "white")
+    ImageDraw.Draw(image).text((20, 60), "ENTRANTES", fill="black")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _translate_image(session: Session, payload: bytes, filename="menu.png"):
+    return asyncio.run(session.ui.api_image_translate(
+        _request(session.ui), file=_Upload(payload, filename), language="Spanish"))
+
+
+def test_the_image_api_returns_a_usable_payload_not_a_500(
+    backend, endpoints, storage
+):
+    """D-IMG. ``overlay_png`` was raw PNG bytes and JSONResponse cannot
+    serialise bytes, so a successful vision call reached the caller as
+    ``500 {"error": "... Object of type bytes is not JSON serializable"}``
+    while the ledger row had already been written and metered."""
+    session = _make_session(backend, storage, scope="session:A")
+
+    response = _translate_image(session, _photo())
+
+    assert response.status_code == 200, response.body.decode()
+    body = json.loads(response.body.decode())
+    assert "error" not in body, body
+    blocks = body["translated_blocks"]
+    assert blocks and "<<PASSAGE-HOSTED>>" in blocks[0]["translated_text"], (
+        f"a different engine produced these blocks: {blocks}")
+    overlay = body["overlay_png_base64"]
+    assert overlay, "the composed overlay was dropped instead of being encoded"
+    import base64
+    assert base64.b64decode(overlay)[:4] == b"\x89PNG", "not a decodable PNG"
+    assert endpoints.count(HOSTED) >= 2, "expected at least an OCR read and a translation"
+
+    rows = session.rows("image")
+    assert len(rows) == 1 and rows[0]["engine"] == f"hosted:{VISION_MODEL}"
+    assert rows[0]["metered"] is True
+
+
+def test_an_image_request_that_errors_is_not_metered(
+    backend, endpoints, storage
+):
+    """D-IMG's other half: the user must not pay for a request that comes back
+    as an error. A file that is not a decodable image is rejected before
+    anything leaves, and nothing is booked."""
+    session = _make_session(backend, storage, scope="session:A")
+
+    response = _translate_image(session, b"plain text pretending to be png\n" * 50)
+
+    assert response.status_code == 400
+    assert "error" in json.loads(response.body.decode())
+    assert endpoints.total() == 0, "a non-image was sent to a model anyway"
+    assert session.rows("image") == [], "an erroring request was written to the ledger"
+    assert session.usage.get("metered_runs", 0) == 0, "the user was billed for an error"
+
+
+def test_the_image_api_honours_the_sessions_own_endpoint(
+    backend, endpoints, storage
+):
+    """The response the caller now actually receives must also be the one the
+    ledger describes, on a BYO session."""
+    session = _make_session(backend, storage, scope="session:A", profile=_byo_profile())
+
+    response = _translate_image(session, _photo())
+
+    assert response.status_code == 200, response.body.decode()
+    body = json.loads(response.body.decode())
+    assert "<<PRIVATE-A>>" in body["translated_blocks"][0]["translated_text"]
+    assert endpoints.count(HOSTED) == 0, "a BYO session's photograph went to Passage's key"
+    rows = session.rows("image")
+    assert len(rows) == 1 and rows[0]["engine"] == "byo:private-a"
+    assert rows[0]["metered"] is False
