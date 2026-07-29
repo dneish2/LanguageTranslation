@@ -1189,6 +1189,8 @@ class TranslationUI(VoicePageMixin):
                 type="negative",
             )
             return
+        if self._reject_oversize_upload(event.file):
+            return
         self.uploaded_file_name = name
         self.uploaded_file_extension = extension
         self.uploaded_file = BytesIO(await event.file.read())
@@ -1226,8 +1228,23 @@ class TranslationUI(VoicePageMixin):
             self._set_translate_button_busy(True)
             progress_ui, label_ui = self._render_progress_ui("Reading image text...")
 
+            # Bound on THIS thread, where session storage exists (see
+            # _engine_recorder): the work below runs off the event loop.
+            recorder = self._engine_recorder()
+            # Same reason, second fact: the session's ENGINE choice also only
+            # exists on this thread (active_profile reads app.storage.user),
+            # and the ContextVar the backend consults does not cross into a
+            # bare Thread. Without capturing it here the image path ran on
+            # Passage's own hosted key even for a user who had pointed the app
+            # at their own endpoint — their photo went to the wrong place.
+            profile = self.active_profile
+
             def image_task():
-                self._run_mobile_image_translation(language, progress_ui, label_ui)
+                # Established INSIDE the worker, for the same reason
+                # queue_translation_job does it: ContextVars are per-thread.
+                with self.backend.using_profile(profile):
+                    self._run_mobile_image_translation(language, progress_ui, label_ui,
+                                                       recorder)
 
             Thread(target=image_task).start()
             return
@@ -1293,7 +1310,36 @@ class TranslationUI(VoicePageMixin):
             logging.error("[UI] Mobile image translation error: %s", ex, exc_info=True)
             self.show_error(ex, retry=self.start_mobile_translation)
 
+    @staticmethod
+    def upload_exceeds_limit(file_upload) -> bool:
+        """True when an upload is over MAX_UPLOAD_BYTES, asked BEFORE reading it.
+
+        The limit used to be enforced at exactly one place — the image API
+        route — and only after the whole body was already in memory. The two
+        browser upload handlers checked the extension and then did
+        ``await event.file.read()`` on anything, so a 900 MB file named .png
+        was a memory event, not a rejection. NiceGUI's FileUpload knows its
+        size without reading (bytes already in a buffer, or a stat on the
+        spooled temp file), so the answer costs nothing.
+        """
+        size = getattr(file_upload, "size", None)
+        if not callable(size):
+            return False  # unknown size: fall through to the downstream limit
+        return size() > MAX_UPLOAD_BYTES
+
+    def _reject_oversize_upload(self, file_upload) -> bool:
+        if not self.upload_exceeds_limit(file_upload):
+            return False
+        limit_mb = MAX_UPLOAD_BYTES / (1024 * 1024)
+        ui.notify(
+            f"That file is too large. The limit is {limit_mb:.0f} MB.",
+            type="negative",
+        )
+        return True
+
     async def handle_mobile_image_upload(self, event):
+        if self._reject_oversize_upload(event.file):
+            return
         self.image_upload_name = event.file.name
         self.image_upload_bytes = await event.file.read()
         ui.notify(f"Selected image '{self.image_upload_name}'", type="positive")

@@ -133,14 +133,35 @@ class ImageCompositor:
     def compose(self, image_bytes: bytes, regions: list[dict[str, Any]], *, show_original: bool = False) -> bytes:
         img = Image.open(BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
+
+        # TWO PASSES, and the split is load-bearing. Covering and lettering a
+        # region in the same iteration means region 2's cover is painted AFTER
+        # region 1's text, so wherever the boxes touch — and on a real menu they
+        # touch constantly, because a cover is padded and lines are close — the
+        # later block ERASES the earlier block's translation. Measured on a
+        # blank canvas with two overlapping bboxes: 3136 of region 1's 8045 ink
+        # pixels (39%) vanished, all inside region 2's cover band. Reversing the
+        # region order just moved the damage to the other block, which is the
+        # signature of an ordering bug rather than a geometry one.
+        #
+        # This is NOT the "cover narrower than the original text" problem
+        # (DECISIONS.md section 4) — that one is about the model's bbox numbers
+        # and is deliberately parked. Nothing here touches bbox geometry.
+        placements: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
         for region in regions:
             bbox = region.get("bbox")
             if not bbox:
                 continue
-            x0, y0, x1, y1 = map(int, bbox)
-            if not show_original:
+            box = tuple(map(int, bbox))  # type: ignore[assignment]
+            placements.append((box, region))  # type: ignore[arg-type]
+
+        # Pass 1: every cover.
+        if not show_original:
+            for (x0, y0, x1, y1), _region in placements:
                 draw.rectangle((x0, y0, x1, y1), fill=self.style.cover_color)
 
+        # Pass 2: every text, on top of all of the covers.
+        for (x0, y0, x1, y1), region in placements:
             text = region.get("original", "") if show_original else region.get("translated") or ""
             if not text:
                 continue

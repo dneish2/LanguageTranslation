@@ -1988,6 +1988,32 @@ class TranslationBackend:
         if not image_bytes:
             raise ValueError("Image payload is empty.")
 
+        # DECODE BEFORE TRANSMITTING. The extension check above is a claim the
+        # uploader makes; it is not evidence. A text file renamed fake.png used
+        # to be base64'd and shipped to the hosted vision model, which only then
+        # failed downstream with "cannot identify image file" — i.e. a user's
+        # arbitrary file left the machine because of its filename. Pillow is
+        # already here; ask it first. The declared extension must also match
+        # what the bytes actually are, so a PDF named .png does not get
+        # relabelled image/png on its way out.
+        try:
+            with Image.open(BytesIO(image_bytes)) as probe:
+                probe.verify()
+            with Image.open(BytesIO(image_bytes)) as probe:
+                actual_format = (probe.format or "").upper()
+        except Exception:
+            raise ValueError(
+                "That file isn't a readable image. Use a PNG, JPG, JPEG, or WEBP photo."
+            ) from None
+        expected_formats = {
+            "image/png": {"PNG"}, "image/jpeg": {"JPEG", "MPO"}, "image/webp": {"WEBP"},
+        }[mime_type]
+        if actual_format not in expected_formats:
+            raise ValueError(
+                f"This file is a {actual_format or 'unknown'} image but is named "
+                f"'{extension}'. Rename it to match its real format and try again."
+            )
+
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         # bbox is requested in NORMALISED coordinates (0-1) so the answer does
         # not depend on the model knowing the pixel dimensions, and so the same
