@@ -353,6 +353,37 @@ def _refine_timeout_outcome(outcome: str, endpoint: str, budget: float) -> str:
         parsed.hostname, port, budget) == PROBE_REFUSED else PROBE_TIMEOUT
 
 
+def usable_local_model(installed: list[str] | tuple[str, ...] | None) -> str | None:
+    """Which local model can actually serve the NEXT live request, or None.
+
+    One function so the probe (which forecasts) and the live path (which
+    routes) cannot disagree. Two ways it says None that the old forecast
+    ignored, and which put "your next translation will run on X on this
+    machine" above "0% of your text stayed on this machine":
+
+      * live-local routing is switched off (PASSAGE_LIVE_LOCAL=0), so no local
+        model will be asked no matter what is installed;
+      * PASSAGE_LIVE_LOCAL_MODEL names a model that is NOT installed, so the
+        request will fail over to hosted on its first call.
+
+    An explicit PASSAGE_LIVE_LOCAL_MODEL still wins over the preference order
+    whenever it IS installed. `installed=None` means "not known" (the endpoint
+    could not be listed), which is itself a reason not to forecast local.
+    """
+    if not LIVE_LOCAL_ENABLED:
+        return None
+    if installed is None:
+        return None
+    names = set(installed)
+    if LIVE_LOCAL_MODEL:
+        return LIVE_LOCAL_MODEL if LIVE_LOCAL_MODEL in names else None
+    suitable = [n for n in names if "embed" not in n and ollama_suits_translation(n)]
+    for candidate in LIVE_LOCAL_PREFERENCE:
+        if candidate in suitable:
+            return candidate
+    return sorted(suitable)[0] if suitable else None
+
+
 def probe_local_llm(
     base_url: str | None = None,
     timeout: float | None = None,
@@ -388,6 +419,7 @@ def probe_local_llm(
         outcome = _refine_timeout_outcome(
             classify_probe_error(error), endpoint, PROBE_REFUSAL_CHECK_SECONDS)
         detail = str(error)[:300]
+    chosen = usable_local_model(models if reachable else None)
     return {
         "reachable": reachable,
         "outcome": outcome,
@@ -396,6 +428,12 @@ def probe_local_llm(
         "timeout_seconds": limit,
         "elapsed_ms": int((time.time() - started) * 1000),
         "detail": detail,
+        # Reachability is NOT the same question as "will the next translation
+        # actually run here". These three answer that one, and any forecast
+        # shown to a user must be derived from them:
+        "routing_enabled": LIVE_LOCAL_ENABLED,
+        "chosen_model": chosen,
+        "can_serve": bool(reachable and chosen),
     }
 
 
@@ -564,6 +602,84 @@ _active_provider: ContextVar[Any] = ContextVar("passage_active_provider", defaul
 #: cache lives on the one shared backend instance, so anything that decides who
 #: may read a cache entry has to be per-request, never an attribute.
 _active_cache_scope: ContextVar[str | None] = ContextVar("passage_cache_scope", default=None)
+
+@dataclass
+class CallProvenance:
+    """What actually served ONE specific translate call.
+
+    This exists because "was that a cache hit?" used to be inferred by sampling
+    a process-wide counter (backend.metrics.cache_hits) before and after a
+    call. That counter is bumped by every session, so a long-running vision
+    call in one session could be labelled "cache" because an unrelated session
+    got a keystroke cache hit while it was in flight — a false "no model ran
+    and nothing was sent anywhere" printed over a photograph that had just been
+    base64'd to a hosted vision model.
+
+    Provenance is therefore a per-call fact carried in a ContextVar-scoped
+    object: no other session can reach it, and it is written by the code that
+    actually served the request rather than deduced afterwards.
+
+    ``engine`` names whoever ORIGINALLY produced the bytes (a cache hit still
+    reports e.g. ``hosted:gpt-5.4-nano``); ``from_cache`` says whether anything
+    ran or was sent FOR THIS REQUEST. Metering and the privacy sentence follow
+    ``from_cache``; the displayed engine label follows ``engine``.
+    """
+
+    #: Counted, not a single flag: a document translation is many sub-calls,
+    #: and "nothing was sent for this request" is only true when EVERY one of
+    #: them was served from cache. A boolean set by the last sub-call would
+    #: report a hosted document as cached whenever its final chunk repeated.
+    cache_hits: int = 0
+    engine_runs: int = 0
+    engine: str | None = None
+
+    @property
+    def from_cache(self) -> bool:
+        """True only when this call ran nothing and sent nothing."""
+        return self.cache_hits > 0 and self.engine_runs == 0
+
+    def record_cache_hit(self, engine: str | None) -> None:
+        self.cache_hits += 1
+        if engine and self.engine is None:
+            self.engine = engine
+
+    def record_engine(self, engine: str | None) -> None:
+        self.engine_runs += 1
+        if engine:
+            self.engine = engine
+
+    def record_nothing(self, engine: str | None = "none") -> None:
+        """Empty input: no model ran, but nothing was cached either."""
+        if engine:
+            self.engine = engine
+
+
+#: Provenance sink for the call running in THIS context, or None when nobody
+#: asked (see TranslationBackend.capture_provenance).
+_call_provenance: ContextVar["CallProvenance | None"] = ContextVar(
+    "passage_call_provenance", default=None)
+
+
+def _note_cache_hit(engine: str | None) -> None:
+    sink = _call_provenance.get()
+    if sink is not None:
+        sink.record_cache_hit(engine)
+
+
+def _note_engine(engine: str | None) -> None:
+    sink = _call_provenance.get()
+    if sink is not None:
+        sink.record_engine(engine)
+
+
+@dataclass(frozen=True)
+class TranslationResult:
+    """A translation together with its per-call provenance."""
+
+    text: str
+    engine: str
+    from_cache: bool
+
 
 #: The cache is no longer an unbounded dict: translated user content is held in
 #: memory for the life of the process, so it needs a ceiling. Oldest-first
@@ -1041,16 +1157,45 @@ class TranslationBackend:
             return self._identity_for_provider(self.provider)
         return f"hosted:{TEXT_MODEL}"
 
+    @staticmethod
+    @contextmanager
+    def capture_provenance():
+        """Scope a per-call provenance record around ONE translate call.
+
+            with backend.capture_provenance() as prov:
+                text, engine = backend.translate_live(...)
+            prov.from_cache   # nothing ran and nothing was sent for THIS call
+            prov.engine       # who originally produced the bytes
+
+        The record is ContextVar-scoped, so concurrent work in another session
+        (or another asyncio task) can never write into it. `asyncio.to_thread`
+        copies the context, so wrapping an awaited to_thread call works.
+        """
+        record = CallProvenance()
+        token = _call_provenance.set(record)
+        try:
+            yield record
+        finally:
+            _call_provenance.reset(token)
+
     def _cache_get(self, cache_key) -> "CacheEntry | None":
         entry = self.translation_cache.get(cache_key)
         if entry is None:
             return None
         # Tolerate an entry planted as a bare string by older code or a test.
         if isinstance(entry, str):
-            return CacheEntry(text=entry, engine=cache_key[1])
+            entry = CacheEntry(text=entry, engine=cache_key[1])
+        # The one choke point every cache hit passes through: record the hit as
+        # a fact of THIS call rather than leaving callers to infer it from a
+        # shared counter.
+        _note_cache_hit(entry.engine)
         return entry
 
     def _cache_put(self, cache_key, text: str, engine: str) -> None:
+        # A store means a model really answered for this call: the counterpart
+        # of _cache_get's hit note, and the reason a mixed document (some
+        # chunks cached, some fresh) never reports "nothing was sent".
+        _note_engine(engine)
         self.translation_cache[cache_key] = CacheEntry(text=text, engine=engine)
 
     @property
@@ -1613,9 +1758,20 @@ class TranslationBackend:
         explicit PASSAGE_LIVE_LOCAL_MODEL always wins, because someone who
         names a model means it.
         """
-        if LIVE_LOCAL_MODEL:
-            return LIVE_LOCAL_MODEL
         installed = {m["name"] for m in self.available_local_models_detailed()}
+        if LIVE_LOCAL_MODEL:
+            # Only if it is really installed. Honouring a name the daemon has
+            # already logged as not found is how /engines came to forecast a
+            # local run that could not happen: the forecast said the named
+            # model, the request failed over to hosted, and the same page then
+            # reported 0% of the text stayed on this machine.
+            if not installed or LIVE_LOCAL_MODEL in installed:
+                return LIVE_LOCAL_MODEL
+            logging.info(
+                "[Backend] PASSAGE_LIVE_LOCAL_MODEL=%s is not installed; "
+                "not routing live text locally", LIVE_LOCAL_MODEL,
+            )
+            return None
         for candidate in LIVE_LOCAL_PREFERENCE:
             if candidate in installed:
                 return candidate
@@ -1769,6 +1925,9 @@ class TranslationBackend:
         """
         text = text.replace("\t", " ").strip()
         if not text:
+            sink = _call_provenance.get()
+            if sink is not None:
+                sink.record_nothing("none")
             return text, "none"
         # No profile id in the mode any more: identity is a first-class key
         # dimension now, and a profile id is not an engine -- two sessions with
@@ -1779,7 +1938,10 @@ class TranslationBackend:
         if cached is not None:
             self.metrics.record_cache_hit()
             # The stored label, never "cache": the caller shows this to the user
-            # as the engine that produced the text on screen.
+            # as the engine that produced the text on screen. Whether THIS call
+            # ran or sent anything is a separate fact, carried by
+            # capture_provenance() (see translate_live_detailed) — deriving it
+            # from the label is what billed cache hits as fresh hosted calls.
             return cached.text, cached.engine
 
         if profile is not None and profile.kind != pp.KIND_APP:
@@ -1811,7 +1973,44 @@ class TranslationBackend:
             except Exception as error:
                 logging.info("[Backend] live-local failed (%s); falling back to hosted", error)
 
-        return self.translate_text(text, target_language), f"hosted:{TEXT_MODEL}"
+        fallback = self.translate_text(text, target_language)
+        # translate_text may itself have been served from cache; only claim a
+        # run when it really ran. Either way the label names the hosted model
+        # that produced these bytes.
+        sink = _call_provenance.get()
+        if sink is not None and sink.engine_runs:
+            sink.engine = f"hosted:{TEXT_MODEL}"
+        return fallback, f"hosted:{TEXT_MODEL}"
+
+    def translate_live_detailed(
+        self, text: str, target_language: str, profile=None
+    ) -> TranslationResult:
+        """`translate_live` plus per-call provenance, as one atomic fact.
+
+        Prefer this over `translate_live` at any call site that meters a run or
+        prints a privacy sentence: `from_cache` is measured inside this call,
+        so concurrent activity in another session cannot change it.
+        """
+        with self.capture_provenance() as prov:
+            translation, engine = self.translate_live(text, target_language, profile=profile)
+        return TranslationResult(
+            text=translation, engine=engine, from_cache=prov.from_cache)
+
+    def translate_text_detailed(
+        self,
+        text: str,
+        target_language: str,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ) -> TranslationResult:
+        """`translate_text` plus per-call provenance. See translate_live_detailed."""
+        with self.capture_provenance() as prov:
+            translation = self.translate_text(
+                text, target_language, correlation_id=correlation_id,
+                file_metrics=file_metrics)
+        engine = prov.engine or ("none" if not translation else self._engine_identity())
+        return TranslationResult(
+            text=translation, engine=engine, from_cache=prov.from_cache)
 
     def translate_text_with_instructions(
         self, original_text: str, target_language: str, instructions: str
@@ -2398,8 +2597,20 @@ class TranslationBackend:
         for kind, runs in units:
             source = "".join(r.text for r in runs)
             if not source.strip():
+                # Whitespace-only piece: keep it verbatim. Dropping it welded
+                # the neighbouring pieces together in the DOCUMENT.
+                out_parts.append(source)
                 continue
-            translated = translate(source.strip())
+            # Translate the trimmed text (a trailing space confuses the model)
+            # but write the boundary whitespace BACK, because these pieces sit
+            # either side of a link inside one paragraph. Without this,
+            # "See " + link("the documentation") was written into the runs as
+            # "Ver" + "la documentación" and rendered "Verla documentación" —
+            # the join below only ever fixed the returned string, never the
+            # document the user downloads.
+            leading = source[:len(source) - len(source.lstrip())]
+            trailing = source[len(source.rstrip()):]
+            translated = leading + translate(source.strip()) + trailing
             if self._write_runs_preserving_first(runs, translated):
                 self.add_fidelity_note(
                     state,
@@ -2415,7 +2626,15 @@ class TranslationBackend:
             "in pieces around the links to keep them clickable. Wording across a link "
             "boundary may read less naturally than a whole-sentence translation.",
         )
-        return " ".join(p.strip() for p in out_parts if p.strip())
+        # The pieces now carry their own boundary whitespace, so the returned
+        # plain text is exactly what the document says. Fall back to a single
+        # space only where two adjacent pieces would otherwise collide.
+        rendered = ""
+        for part in out_parts:
+            if rendered and not rendered[-1].isspace() and not part[:1].isspace():
+                rendered += " "
+            rendered += part
+        return rendered.strip()
 
     def _overwrite_docx_paragraph(self, para, text: str, *, location: str = "", state=None) -> None:
         """Replace a paragraph's text with a human edit, keeping what can be kept.
