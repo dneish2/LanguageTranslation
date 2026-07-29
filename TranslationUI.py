@@ -582,6 +582,37 @@ class TranslationUI(VoicePageMixin):
                 .classes("p-mode-tab ml-auto")\
                 .tooltip("Choose where translation runs")
 
+    @staticmethod
+    def describe_local_default(snap: dict[str, Any]) -> str:
+        """The "local default:" detail line, from the routing facts.
+
+        `chosen_model` is None whenever the router will NOT serve locally, and
+        that is three different situations: routing switched off, the named
+        model not installed / nothing installed that suits translation, and an
+        endpoint that did not answer. Rendering `chosen_model or 'none
+        installed'` asserted the one of those that is usually false — live
+        with PASSAGE_LIVE_LOCAL=0 the page printed "local default: none
+        installed" and then, in the same render, listed seven installed
+        models. "Not used" and "not there" are different claims.
+        """
+        if snap.get("pending"):
+            return "local default: still checking this machine"
+        if snap.get("chosen_model"):
+            return f"local default: {snap['chosen_model']}"
+        probe = snap.get("probe") or {}
+        if probe.get("routing_enabled") is False:
+            return "local default: not used (local routing is switched off)"
+        if probe.get("reachable") is False:
+            return "local default: not used (local engine did not answer)"
+        installed = list(probe.get("models") or []) or list(snap.get("models") or [])
+        if not installed:
+            return "local default: none installed"
+        import TranslationBackend as backend_module
+        named = getattr(backend_module, "LIVE_LOCAL_MODEL", "") or ""
+        if named:
+            return f"local default: not used ({named} is not installed)"
+        return "local default: not used (no installed model suits translation)"
+
     def engines_page(self):
         """Where your text has actually been going.
 
@@ -634,7 +665,7 @@ class TranslationUI(VoicePageMixin):
                         bits = [f"engine: {profile.describe() if profile else 'auto (local first)'}"]
                         bits.append("metered" if policy.is_metered(
                             profile, local_first_model=local_default) else "not metered")
-                        bits.append(f"local default: {local_default or 'none installed'}")
+                        bits.append(self.describe_local_default(snap))
                         detail_label.set_text(" · ".join(bits))
                         freshness_label.set_text(describe_snapshot_age(snap))
 
@@ -648,16 +679,31 @@ class TranslationUI(VoicePageMixin):
                         ui.label("Nothing translated yet.").classes("text-sm p-muted-text")
                     else:
                         local, remote = summary["local"], summary["remote"]
-                        share = int(summary["local_share_of_chars"] * 100)
-                        ui.label(f"{share}% of your text stayed on this machine")\
-                            .classes("text-base")
-                        # A bar, because a ratio is the whole point and a
-                        # number makes you do the comparison yourself.
-                        with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
-                                .style("background: var(--p-rule, #d6cbb4)"):
-                            if share:
-                                ui.element("div").classes("h-full")\
-                                    .style(f"width:{share}%; background: var(--p-ok, #3F6B4A)")
+                        # The share describes the text the user actually had.
+                        # Cache hits are excluded from it (see
+                        # engine_ledger.summarise): counting a re-read as new
+                        # local characters printed "80% of your text stayed on
+                        # this machine" over a session whose every character
+                        # had been sent to a hosted model. `None` means there
+                        # was no new text to describe, and it is said rather
+                        # than rounded to a percentage nobody earned.
+                        fraction = summary["local_share_of_chars"]
+                        share = 0 if fraction is None else int(fraction * 100)
+                        if fraction is None:
+                            ui.label("No new text was translated this session — "
+                                     "every answer came from this session's cache.")\
+                                .classes("text-base")
+                        else:
+                            ui.label(f"{share}% of the {summary['new_chars']} characters "
+                                     "you translated stayed on this machine")\
+                                .classes("text-base")
+                            # A bar, because a ratio is the whole point and a
+                            # number makes you do the comparison yourself.
+                            with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
+                                    .style("background: var(--p-rule, #d6cbb4)"):
+                                if share:
+                                    ui.element("div").classes("h-full")\
+                                        .style(f"width:{share}%; background: var(--p-ok, #3F6B4A)")
                         ui.label(
                             f"local: {local['runs']} runs · {local['chars']} chars"
                             + (f" · {local['median_ms']} ms median" if local["median_ms"] is not None else "")
@@ -673,6 +719,15 @@ class TranslationUI(VoicePageMixin):
                             ui.label(
                                 f"destination not known: {summary['unknown']['runs']} runs · "
                                 f"{summary['unknown']['chars']} chars"
+                            ).classes(theme.DATA)
+                        # Re-reads, on their own line. They are not runs of the
+                        # engine named below and they are not new text above.
+                        if summary["cache"]["runs"]:
+                            hits = summary["cache"]["runs"]
+                            ui.label(
+                                f"answered from this session's cache: {hits} "
+                                f"time{'s' if hits != 1 else ''} — no model ran and "
+                                "nothing was sent"
                             ).classes(theme.DATA)
                         for name, count in summary["engines"].items():
                             ui.label(f"{name} — {count} run{'s' if count != 1 else ''}")\

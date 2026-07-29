@@ -88,8 +88,23 @@ def _snapshot_claiming(monkeypatch, model):
     return snap
 
 
-def _text_translate(ui_app, text="hola", language="es"):
-    resp = asyncio.run(ui_app.api_text_translate(_app_request(ui_app), text=text, language=language))
+def _text_translate(ui_app, text="hola", language="es", scope=None):
+    """Drive the real route.
+
+    `scope` pins the backend's cache partition, which under a live server comes
+    from the browser id. Outside a request context there is no such id and each
+    call would land in its own partition — i.e. no test could ever see a cache
+    hit, which is exactly the behaviour the R1/R2 tests below are about.
+    `TranslationBackend.cache_scope` is the production mechanism for this (the
+    document path uses it to carry a session onto a worker thread).
+    """
+    if scope is None:
+        resp = asyncio.run(ui_app.api_text_translate(
+            _app_request(ui_app), text=text, language=language))
+    else:
+        with ui_app.backend.cache_scope(scope):
+            resp = asyncio.run(ui_app.api_text_translate(
+                _app_request(ui_app), text=text, language=language))
     return json.loads(resp.body.decode())
 
 
@@ -227,9 +242,17 @@ def test_the_engines_page_no_longer_contradicts_itself_on_a_cache_hit(monkeypatc
 
     summary = engine_ledger.summarise(runs)
     assert summary["total_runs"] == 1
-    assert summary["engines"] == {"cache": 1}
+    # No model ran, so no model appears in the run-count histogram — the hit
+    # is reported as a hit. `engines == {"cache": 1}` was the old shape, back
+    # when a cache row still carried the label "cache" in its engine column.
+    assert summary["engines"] == {}
+    assert summary["cache"]["runs"] == 1
     assert summary["remote"]["runs"] == 0          # nothing was sent out
-    assert summary["local_share_of_chars"] == 1.0  # was 0.64
+    # And no privacy percentage is claimed: there was no new text to describe.
+    # This used to be 1.0, which counted 38 re-read characters as 38
+    # characters that stayed put.
+    assert summary["local_share_of_chars"] is None
+    assert summary["new_chars"] == 0
     assert summary["metered_runs"] == 0
 
     line = usage.describe(usage.summary(used), total_runs=summary["total_runs"])
@@ -530,3 +553,239 @@ def test_no_local_forecast_when_the_router_will_not_serve_locally():
     # promise this machine.
     assert "on this machine" not in policy.describe_privacy(
         None, local_first_model=snap["chosen_model"], hosted_available=True)
+
+
+# ---------------------------------------------------------------------------
+# R1 / R2 - a cache hit is the SAME text, already counted.
+#
+# Reproduced live on this branch before being written down. Five identical
+# translations of one 44-character sentence, driven through the real route in a
+# real browser session with one outbound call, rendered:
+#
+#     80% of your text stayed on this machine
+#     local: 4 runs - 176 chars
+#     sent out: 1 runs - 44 chars
+#     hosted:gpt-5.4-nano - 5 runs
+#
+# The user had 44 characters and every one of them was sent out. Both defects
+# arrived with the (correct) fix that stopped billing cache hits: demoting the
+# row's engine to the producing model moved re-reads onto the local side of a
+# chars-weighted statistic and into a run-count histogram, neither of which was
+# adjusted for counting the same sentence five times.
+#
+# These tests drive the production route and the production cache. The only
+# fake is the provider itself, which counts its invocations - so "how many
+# times a model ran" is measured, never assumed.
+# ---------------------------------------------------------------------------
+
+SENTENCE = "The quick brown fox jumps over the lazy dog."  # 44 characters
+#: One browser, one session - the situation the live repro was driven in.
+ONE_BROWSER = "browser:one-visitor"
+
+
+class CountingProvider:
+    """A local provider that records every call it is actually asked to make."""
+
+    text_model = "counted-model:1b"
+
+    def __init__(self):
+        self.calls = 0
+
+    def create_chat_completion(self, messages=None, max_tokens=None, **kw):
+        self.calls += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="El rapido zorro marron."))])
+
+
+def _hosted_only(monkeypatch, ui_app):
+    """No local model, and a counting hosted call.
+
+    The fake is pushed all the way down to the one method that talks to the
+    model, so every cache in front of it — translate_live's and
+    translate_text's — is the production one. `calls` is therefore the real
+    number of times a model was asked to translate anything.
+    """
+    monkeypatch.setattr(ui_app.backend, "_live_local_provider", lambda: None)
+    monkeypatch.setattr(ui_app.backend, "_require_provider",
+                        lambda: types.SimpleNamespace(max_input_chars=None))
+    calls = []
+
+    def fake_chunk(chunk, target_language, *a, **kw):
+        calls.append(chunk)
+        return "El rapido zorro marron."
+
+    monkeypatch.setattr(ui_app.backend, "_translate_chunk", fake_chunk)
+    return calls
+
+
+def test_repeated_identical_translations_cannot_inflate_the_privacy_share(monkeypatch):
+    """THE REGRESSION. One sentence, typed once, translated five times, served
+    once by a hosted model. The page may not claim any part of it stayed."""
+    ui_app = TranslationUI()
+    runs, used = _session(monkeypatch, ui_app)
+    calls = _hosted_only(monkeypatch, ui_app)
+
+    payloads = [_text_translate(ui_app, SENTENCE, scope=ONE_BROWSER)
+                for _ in range(5)]
+
+    # WHICH PATH RAN: one hosted call, four re-reads of it - measured at the
+    # provider, not inferred from the ledger under test.
+    assert len(calls) == 1
+    assert [p["engine"] for p in payloads] == [f"hosted:{TEXT_MODEL}"] * 5
+    assert [p["ran_on"] for p in payloads] == ["hosted"] + ["cache"] * 4
+    assert len(runs) == 5
+
+    summary = engine_ledger.summarise(runs)
+    # The user's real text is 44 characters and all 44 left the machine.
+    assert summary["new_chars"] == len(SENTENCE)
+    assert summary["local_share_of_chars"] == 0.0      # was 0.8
+    assert summary["local"]["chars"] == 0              # was 176
+    assert summary["local"]["runs"] == 0               # was 4
+    assert summary["remote"]["chars"] == len(SENTENCE)
+    assert summary["cache"]["runs"] == 4
+    # And the counter still only bills the one call that was really made.
+    assert usage.summary(used).metered_chars == len(SENTENCE)
+
+
+def test_the_privacy_share_never_exceeds_the_text_that_really_stayed_local(monkeypatch):
+    """The invariant, stated over a mixed session: one sentence answered
+    locally and re-read three times, one different sentence sent out. The
+    honest share is 44/(44+38); anything above that is an over-claim."""
+    ui_app = TranslationUI()
+    runs, _used = _session(monkeypatch, ui_app)
+    local_provider = CountingProvider()
+    monkeypatch.setattr(ui_app.backend, "_live_local_provider", lambda: local_provider)
+
+    for _ in range(4):
+        # 1 local run + 3 cache hits
+        _text_translate(ui_app, SENTENCE, scope=ONE_BROWSER)
+    sent_out = "x" * 38
+    _hosted_only(monkeypatch, ui_app)
+    _text_translate(ui_app, sent_out, scope=ONE_BROWSER)
+
+    assert local_provider.calls == 1               # which path ran
+    summary = engine_ledger.summarise(runs)
+    truth = len(SENTENCE) / (len(SENTENCE) + len(sent_out))
+    assert summary["local_share_of_chars"] <= truth + 0.001
+    assert summary["local_share_of_chars"] == round(truth, 3)   # was 0.82
+    assert summary["cache"]["runs"] == 3
+
+
+def test_the_engine_histogram_counts_model_runs_not_ledger_rows(monkeypatch):
+    """R2. "hosted:gpt-5.4-nano - 5 runs" printed under a claim that most of
+    the session stayed local, when the model ran exactly once."""
+    ui_app = TranslationUI()
+    runs, _used = _session(monkeypatch, ui_app)
+    calls = _hosted_only(monkeypatch, ui_app)
+
+    for _ in range(5):
+        _text_translate(ui_app, SENTENCE, scope=ONE_BROWSER)
+
+    summary = engine_ledger.summarise(runs)
+    assert len(calls) == 1
+    assert summary["engines"] == {f"hosted:{TEXT_MODEL}": 1}   # was 5
+    assert sum(summary["engines"].values()) == len(calls)
+    # The re-reads are still reported - as re-reads.
+    assert summary["cache"]["runs"] == 4
+    assert summary["total_runs"] == 5
+
+
+def test_a_cache_row_still_names_the_model_that_produced_the_words(monkeypatch):
+    """The demotion this fix must NOT undo: the row's own receipt names the
+    producer, which is how a user finds out those words came from a hosted
+    model. Only the aggregates stop treating it as a run."""
+    ui_app = TranslationUI()
+    runs, _used = _session(monkeypatch, ui_app)
+    _hosted_only(monkeypatch, ui_app)
+
+    _text_translate(ui_app, SENTENCE, scope=ONE_BROWSER)
+    payload = _text_translate(ui_app, SENTENCE, scope=ONE_BROWSER)
+
+    hit = engine_ledger.LedgerEntry(**runs[1])
+    assert hit.engine == f"hosted:{TEXT_MODEL}"
+    assert hit.ran == "cache"
+    assert hit.destination == "this machine" and hit.metered is False
+    assert f"produced by hosted:{TEXT_MODEL}" in payload["privacy"]
+    assert engine_ledger.served_from_cache(runs[1]) is True
+    assert engine_ledger.served_from_cache(runs[0]) is False
+
+
+def test_a_ledger_row_written_before_the_ran_column_is_still_read_correctly():
+    """A live session's storage outlives a deploy. Rows written by the older
+    code labelled a cache hit "cache" in the engine column."""
+    old_style = {"surface": "text", "engine": "cache", "is_local": True,
+                 "latency_ms": 0, "chars": 38, "when": 0.0,
+                 "left_machine": False, "metered": False}
+    assert engine_ledger.served_from_cache(old_style) is True
+    summary = engine_ledger.summarise([old_style])
+    assert summary["engines"] == {} and summary["cache"]["runs"] == 1
+    assert summary["local_share_of_chars"] is None
+
+
+# ---------------------------------------------------------------------------
+# R3 - "local default: none installed" on a machine with seven models.
+#
+# `chosen_model` is None whenever the router will not serve locally, which is
+# three different situations. The live page printed the one that was false:
+# with PASSAGE_LIVE_LOCAL=0 it said "local default: none installed" and then
+# listed translategemma:27b, gemma3:12b, translategemma:12b, translategemma:4b,
+# qwen2.5:7b, gemma4:latest and gemma3:1b under "Models on this machine".
+# ---------------------------------------------------------------------------
+
+INSTALLED = ["translategemma:4b", "qwen2.5:7b", "gemma3:12b"]
+
+
+def _local_default_line(report):
+    """The line the page prints, built from a production snapshot."""
+    return TranslationUI.describe_local_default(
+        ui_module._take_local_snapshot(_probing_backend(report)))
+
+
+def test_the_local_default_line_names_the_model_that_will_serve():
+    line = _local_default_line({
+        "reachable": True, "outcome": "ok", "models": INSTALLED,
+        "routing_enabled": True, "chosen_model": "translategemma:4b",
+        "can_serve": True})
+    assert line == "local default: translategemma:4b"
+
+
+def test_routing_switched_off_is_not_reported_as_nothing_installed():
+    """The exact live defect."""
+    line = _local_default_line({
+        "reachable": True, "outcome": "ok", "models": INSTALLED,
+        "routing_enabled": False, "chosen_model": None, "can_serve": False})
+    assert "none installed" not in line          # was "local default: none installed"
+    assert "switched off" in line
+    # The three Nones must not collapse back into one another.
+    assert line != _local_default_line({
+        "reachable": False, "outcome": "refused", "models": [],
+        "routing_enabled": True, "chosen_model": None, "can_serve": False})
+
+
+def test_an_unreachable_endpoint_is_not_reported_as_nothing_installed():
+    line = _local_default_line({
+        "reachable": False, "outcome": "timeout", "models": [],
+        "routing_enabled": True, "chosen_model": None, "can_serve": False})
+    assert "did not answer" in line and "none installed" not in line
+
+
+def test_a_named_model_that_is_not_pulled_says_so(monkeypatch):
+    import TranslationBackend as backend_module
+    monkeypatch.setattr(backend_module, "LIVE_LOCAL_MODEL", "ghost-model:999b")
+    line = _local_default_line({
+        "reachable": True, "outcome": "ok", "models": INSTALLED,
+        "routing_enabled": True, "chosen_model": None, "can_serve": False})
+    assert "ghost-model:999b is not installed" in line
+    assert "none installed" not in line
+
+
+def test_nothing_installed_is_still_reported_as_nothing_installed():
+    """The claim stays available for the one case where it is true."""
+    line = _local_default_line({
+        "reachable": True, "outcome": "ok", "models": [],
+        "routing_enabled": True, "chosen_model": None, "can_serve": False})
+    assert line == "local default: none installed"
+
+
+def test_the_line_says_it_is_still_checking_before_the_first_probe_lands():
+    assert "checking" in TranslationUI.describe_local_default(ui_module._pending_snapshot())
