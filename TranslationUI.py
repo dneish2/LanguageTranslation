@@ -1699,10 +1699,43 @@ class TranslationUI(VoicePageMixin):
                 # whole document had gone to a hosted model on Passage's key.
                 # `processed` runs are excluded because no model ran there —
                 # that path only regenerates the output file.
+                #
+                # Cache provenance, on the surface where it was still missing.
+                # This was the ONE ledger call site that booked the
+                # profile-derived label unconditionally: translating the same
+                # file twice in a session made zero outbound calls the second
+                # time and still wrote a row saying "sent to
+                # hosted:<model>, metered", i.e. printed "sent out" over text
+                # that never left the machine and billed for it twice.
+                #
+                # It cannot use capture_provenance() the way every other call
+                # site does: that record is ContextVar-scoped and the document
+                # job runs on a plain Thread, which ContextVars do not cross
+                # (start_translation_job re-establishes cache scope and profile
+                # inside the worker for exactly this reason). The job's own
+                # MetricsCollector is the per-job equivalent — created for this
+                # job in _run_translation_job and threaded through the whole
+                # file translation — NOT the process-wide backend.metrics
+                # counter whose sampling caused the original mislabelling.
+                #
+                # "Nothing was sent" requires EVERY chunk to have been a hit,
+                # so a miss anywhere keeps the run booked against the engine
+                # (the same rule as CallProvenance.from_cache). `origin` keeps
+                # the second fact: who produced these words the first time.
+                doc_metrics = result.get("metrics") or {}
+                chars = sum(len(s.get("original") or "") for s in seg_map.values())
+                served_from_cache = (int(doc_metrics.get("cache_hits") or 0) > 0
+                                     and int(doc_metrics.get("cache_misses") or 0) == 0)
+                if not chars:
+                    label, origin = "none", None
+                elif served_from_cache:
+                    label, origin = "cache", engine
+                else:
+                    label, origin = engine, None
                 doc_recorder(
-                    surface=policy.Surface.DOCUMENT, engine=engine,
+                    surface=policy.Surface.DOCUMENT, engine=label, origin=origin,
                     latency_ms=int((time.time() - started) * 1000),
-                    chars=sum(len(s.get("original") or "") for s in seg_map.values()))
+                    chars=chars)
 
             if not processed and self.uploaded_file_name:
                 self._record_thread({

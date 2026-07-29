@@ -393,3 +393,136 @@ def test_a_fully_local_repeat_is_booked_as_cache_and_not_billed(
     assert rows[1]["metered"] is False
     assert rows[1]["engine"] == profile.describe(), (
         "a cache row must still name who originally produced the words")
+
+
+# ───────────────── D-DOC: the document job's ledger row ───────────────── #
+
+
+def _docx(text: str) -> bytes:
+    document = Document()
+    document.add_paragraph(text)
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+class _Progress:
+    def set_value(self, value):
+        return None
+
+
+class _Label:
+    def __init__(self):
+        self.text = ""
+
+
+class _Timer:
+    """What ``ui.timer`` hands back. The test drives the real ``poll_job``
+    through it rather than waiting on NiceGUI's clock."""
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.active = True
+
+
+def _run_document_job(monkeypatch, session: Session, payload: bytes, *, language="Spanish"):
+    """Drive the production document path: real job thread, real poll_job."""
+    ui_app = session.ui
+    ui_app.uploaded_file = BytesIO(payload)
+    ui_app.uploaded_file_name = "report.docx"
+    ui_app.uploaded_file_extension = "docx"
+    ui_app.current_target_language = language
+    ui_app.drawer = None                      # show_document_list() no-ops
+    ui_app.show_result = lambda: None          # presentation only
+    ui_app._set_translate_button_busy = lambda busy: None
+
+    timers: list[_Timer] = []
+    monkeypatch.setattr(ui_module.ui, "timer",
+                        lambda interval, callback, **kw: timers.append(_Timer(callback))
+                        or timers[-1])
+
+    ui_app._start_job_and_poll(
+        progress_ui=_Progress(), label_ui=_Label(), correlation_id="test-doc",
+        processed=False, font_size=None, autofit=False, target_language=language,
+        complete_event="ui.translation_complete",
+        failed_event="ui.translation_failed",
+        cancelled_event="ui.translation_cancelled",
+    )
+
+    poll = timers[-1].callback
+    for _ in range(600):
+        poll()
+        if ui_app.active_job_id is None:
+            break
+        threading.Event().wait(0.05)
+    assert ui_app.active_job_id is None, "the document job never completed"
+
+
+def test_the_same_document_twice_costs_nothing_the_second_time(
+    monkeypatch, backend, endpoints, storage, tmp_path
+):
+    """D-DOC. Same session, same file. The second run makes no outbound call,
+    so it must not be booked as sent and must not move the meter."""
+    monkeypatch.setattr(traces, "TRACE_DIR", tmp_path)
+    session = _make_session(backend, storage, scope="session:A")
+    payload = _docx("The acquisition target is Meridian Holdings.")
+
+    _run_document_job(monkeypatch, session, payload)
+    calls_after_first = endpoints.count(HOSTED)
+    usage_after_first = dict(session.usage)
+    _run_document_job(monkeypatch, session, payload)
+
+    assert calls_after_first >= 1, "the first document never reached an endpoint"
+    assert endpoints.count(HOSTED) == calls_after_first, (
+        "the repeat made NEW outbound calls; there is no cache hit to observe here")
+
+    rows = session.rows("document")
+    assert len(rows) == 2, session.runs
+    first, second = rows
+    assert first["ran"] == "hosted" and first["metered"] is True
+    assert second["ran"] == "cache", (
+        "the document job printed 'sent out' over text that never left the machine")
+    assert second["left_machine"] is False
+    assert second["metered"] is False
+    assert second["engine"] == f"hosted:{TEXT_MODEL}", (
+        "a cache row must still name who originally produced the words")
+
+    assert session.usage["metered_runs"] == usage_after_first["metered_runs"] == 1
+    assert session.usage["metered_chars"] == usage_after_first["metered_chars"]
+
+
+def test_a_document_that_really_ran_is_still_booked_and_billed(
+    monkeypatch, backend, endpoints, storage, tmp_path
+):
+    """The negative control for the test above: a different document in the
+    same session is a real run and must be metered."""
+    monkeypatch.setattr(traces, "TRACE_DIR", tmp_path)
+    session = _make_session(backend, storage, scope="session:A")
+
+    _run_document_job(monkeypatch, session, _docx("The first quarterly report."))
+    _run_document_job(monkeypatch, session, _docx("An entirely different sentence."))
+
+    rows = session.rows("document")
+    assert len(rows) == 2, session.runs
+    assert [row["ran"] for row in rows] == ["hosted", "hosted"]
+    assert all(row["metered"] for row in rows)
+    assert session.usage["metered_runs"] == 2
+    assert endpoints.count(HOSTED) >= 2
+
+
+def test_a_document_runs_on_the_sessions_own_endpoint_and_is_booked_there(
+    monkeypatch, backend, endpoints, storage, tmp_path
+):
+    """The doc row must name the endpoint that served it, cache logic or not."""
+    monkeypatch.setattr(traces, "TRACE_DIR", tmp_path)
+    session = _make_session(backend, storage, scope="session:A", profile=_byo_profile())
+
+    _run_document_job(monkeypatch, session, _docx("Board minutes, confidential."))
+
+    assert endpoints.count(ENDPOINT_A) >= 1, "the document never reached the user's endpoint"
+    assert endpoints.count(HOSTED) == 0, "a BYO session's document went to Passage's key"
+    rows = session.rows("document")
+    assert len(rows) == 1 and rows[0]["engine"] == "byo:private-a"
+    assert rows[0]["metered"] is False
+
+
