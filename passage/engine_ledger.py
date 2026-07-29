@@ -21,6 +21,9 @@ from typing import Any, Iterable
 MAX_ENTRIES = 200
 
 
+_UNSET = object()
+
+
 @dataclass
 class LedgerEntry:
     surface: str
@@ -29,21 +32,59 @@ class LedgerEntry:
     latency_ms: int
     chars: int
     when: float
+    #: Tri-state, and the reason this dataclass grew a field. `is_local` was
+    #: computed as `engine.startswith("local")`, so a cache hit — where no
+    #: model ran and nothing was sent — was filed under "sent out", and an
+    #: engine label nobody recognises was filed there too by luck rather than
+    #: evidence. None means "not known", which is a thing the page has to be
+    #: able to say.
+    left_machine: bool | None = None
+    #: Whether Passage paid for this run, decided by policy.classify_run from
+    #: the engine that actually served it.
+    metered: bool = False
 
     @property
     def destination(self) -> str:
-        return "this machine" if self.is_local else "sent out"
+        if self.left_machine is None:
+            return "not known"
+        return "sent out" if self.left_machine else "this machine"
 
 
 def record(store: list, *, surface: str, engine: str, is_local: bool,
-           latency_ms: int, chars: int, when: float) -> None:
+           latency_ms: int, chars: int, when: float,
+           left_machine: Any = _UNSET, metered: bool = False) -> None:
     """Append an entry, newest last, bounded."""
     store.append(asdict(LedgerEntry(
         surface=surface, engine=engine, is_local=bool(is_local),
         latency_ms=int(latency_ms), chars=int(chars), when=float(when),
+        left_machine=(not bool(is_local)) if left_machine is _UNSET else left_machine,
+        metered=bool(metered),
     )))
     if len(store) > MAX_ENTRIES:
         del store[:len(store) - MAX_ENTRIES]
+
+
+def record_run(store: list, *, surface: str, run, latency_ms: int, chars: int,
+               when: float) -> None:
+    """Record a completed request from its `policy.EngineRun` receipt.
+
+    The preferred entry point, because it removes the caller's ability to
+    disagree with policy about where the text went. The old call site derived
+    `is_local = engine.startswith("local")` on its own, which filed cache hits
+    under "sent out" while the same request's JSON said it was free.
+    """
+    record(store, surface=surface, engine=run.engine,
+           is_local=(run.left_machine is False), latency_ms=latency_ms,
+           chars=chars, when=when, left_machine=run.left_machine,
+           metered=bool(run.metered))
+
+
+def left_machine_of(row: dict[str, Any]) -> bool | None:
+    """Tri-state destination for a stored row, tolerating rows written before
+    `left_machine` existed (a live session's storage outlives a deploy)."""
+    if "left_machine" in row:
+        return row["left_machine"]
+    return not row.get("is_local")
 
 
 def voice_state(target_language: str | None = None) -> dict[str, Any]:
@@ -86,8 +127,9 @@ def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     sent a whole report to a hosted model.
     """
     rows = list(entries)
-    local = [r for r in rows if r.get("is_local")]
-    remote = [r for r in rows if not r.get("is_local")]
+    local = [r for r in rows if left_machine_of(r) is False]
+    remote = [r for r in rows if left_machine_of(r) is True]
+    unknown = [r for r in rows if left_machine_of(r) is None]
 
     def stats(subset: list[dict[str, Any]]) -> dict[str, Any]:
         latencies = sorted(r.get("latency_ms", 0) for r in subset)
@@ -106,7 +148,14 @@ def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "total_runs": len(rows),
         "local": stats(local),
         "remote": stats(remote),
+        # Runs whose engine label nobody could classify. Reported separately
+        # rather than folded into either side: counting them as local would
+        # inflate a privacy claim, counting them as remote would invent a
+        # disclosure that may not have happened.
+        "unknown": stats(unknown),
         "local_share_of_chars": round(len(local) and
                                       sum(r.get("chars", 0) for r in local) / total_chars or 0.0, 3),
+        "metered_runs": sum(1 for r in rows if r.get("metered")),
+        "metered_chars": sum(r.get("chars", 0) for r in rows if r.get("metered")),
         "engines": dict(sorted(engines.items(), key=lambda kv: -kv[1])),
     }

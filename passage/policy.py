@@ -190,13 +190,122 @@ def describe_voice_privacy(target_language: str | None = None) -> str:
             "translated text sent out to be spoken.")
 
 
-def describe_privacy(profile, *, local_first_model: str | None = None) -> str:
-    """One line a user can act on, for the UI."""
+def describe_privacy(profile, *, local_first_model: str | None = None,
+                     hosted_available: bool | None = None) -> str:
+    """What the NEXT translation is expected to do, from a capability probe.
+
+    This is a forecast, not a receipt. It is derived from what was reachable
+    when the page rendered, so it must never be used to describe a request
+    that has already run — for that, ask `classify_run()` what actually served
+    it. The wording says "will" on purpose: a sentence rendered from a probe
+    and phrased as a guarantee is how "runs on this machine" ended up printed
+    over a response a hosted model served.
+
+    `hosted_available` closes the last optimistic guess: with no profile, no
+    local model AND no hosted provider configured, the old version still
+    promised "Runs on Passage's hosted models — metered", which is a claim
+    about an endpoint that does not exist. None means "not known" and keeps
+    the old assumption, because most callers legitimately cannot see it.
+    """
     if not data_leaves_machine(profile, local_first_model=local_first_model):
         if profile is None:
-            return (f"Runs on {local_first_model} on this machine — text isn't sent "
-                    "anywhere unless that model is unavailable.")
+            return (f"Your next translation will run on {local_first_model} on this "
+                    "machine — text isn't sent anywhere unless that model is "
+                    "unavailable.")
         return "Runs on your machine — text isn't sent anywhere."
     if not is_metered(profile):
         return "Runs on your own endpoint — not metered by Passage."
+    if profile is None and hosted_available is False:
+        return ("No local model is reachable and no hosted provider is configured — "
+                "Passage can't translate anything right now.")
     return "Runs on Passage's hosted models — metered."
+
+
+class Ran(str, Enum):
+    """Where a request that has ALREADY happened actually ran."""
+
+    LOCAL = "local"        # a model on this machine
+    CACHE = "cache"        # answered from this session's cache; nothing ran
+    NOTHING = "nothing"    # empty input; there was nothing to translate
+    BYO = "byo"            # the user's own credentials against someone else's API
+    HOSTED = "hosted"      # Passage's own hosted key — the only thing Passage pays for
+    UNKNOWN = "unknown"    # an engine label this module does not recognise
+
+
+@dataclass(frozen=True)
+class EngineRun:
+    """A receipt for one request: what served it, whether the text left this
+    machine, and whether Passage paid.
+
+    `left_machine` is deliberately tri-state. An unrecognised engine label is
+    not evidence that the text stayed put, and rendering "stayed on this
+    machine" for it would be the same bug in a new place.
+    """
+
+    engine: str
+    ran: Ran
+    left_machine: bool | None
+    metered: bool
+    privacy: str
+
+
+def classify_run(engine: str | None, profile=None) -> EngineRun:
+    """What actually happened, from the engine label the request came back with.
+
+    Every privacy sentence and every metered flag about a completed request
+    must come through here. The bug this replaces: the response body derived
+    both from a reachability snapshot taken at page-render time, so one JSON
+    payload could say it ran on a hosted model while promising the text had
+    never left the machine, and a cache hit — where nothing ran at all — was
+    booked as "sent out" and billed.
+
+    Metering follows the engine, not the configuration: a hosted fallback
+    after a local model fails IS metered, and a cache hit never is.
+    """
+    label = (engine or "").strip()
+    kind = label.split(":", 1)[0].lower() if label else ""
+    detail = label.split(":", 1)[1] if ":" in label else ""
+
+    if not label or label.lower() == "none":
+        return EngineRun(label or "none", Ran.NOTHING, False, False,
+                         "Nothing was translated, so nothing was sent anywhere.")
+    if label.lower() == "cache":
+        return EngineRun(label, Ran.CACHE, False, False,
+                         "Answered from this session's cache on this machine — no model "
+                         "ran and nothing was sent anywhere.")
+    if kind == "local":
+        where = detail or "a model"
+        return EngineRun(label, Ran.LOCAL, False, False,
+                         f"Ran on {where} on this machine — this text wasn't sent anywhere.")
+    if kind in ("hosted", "app"):
+        where = detail or "a hosted model"
+        return EngineRun(label, Ran.HOSTED, True, True,
+                         f"Ran on Passage's hosted model {where} — this text was sent "
+                         "there, and this run is metered.")
+    if kind == "byo":
+        where = detail or "your endpoint"
+        return EngineRun(label, Ran.BYO, True, False,
+                         f"Ran on your own endpoint ({where}) — this text was sent there, "
+                         "and Passage doesn't meter it.")
+
+    # An unrecognised label may still be describable if it is this visitor's
+    # own profile talking. Otherwise: say we don't know rather than guess well
+    # of ourselves.
+    if profile is not None:
+        try:
+            if profile.describe() == label:
+                if getattr(profile, "uses_local_inference", False):
+                    return EngineRun(label, Ran.LOCAL, False, False,
+                                     f"Ran on {label} on this machine — this text wasn't "
+                                     "sent anywhere.")
+                metered = bool(getattr(profile, "is_metered", False))
+                return EngineRun(
+                    label, Ran.HOSTED if metered else Ran.BYO, True, metered,
+                    f"Ran on {label} — this text was sent there"
+                    + (", and this run is metered." if metered
+                       else ", and Passage doesn't meter it."))
+        except Exception:  # a malformed profile must not decide privacy
+            pass
+    return EngineRun(label, Ran.UNKNOWN, None, False,
+                     f"Passage can't tell where this ran (engine \"{label}\"), so it "
+                     "can't say this text stayed on this machine.")

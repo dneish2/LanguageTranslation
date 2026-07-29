@@ -72,10 +72,23 @@ def summary(store: dict[str, Any]) -> UsageSummary:
     )
 
 
-def describe(summary_: UsageSummary) -> str:
-    """A line for the UI that says what was actually charged for."""
+def describe(summary_: UsageSummary, *, total_runs: int | None = None) -> str:
+    """A line for the UI that says what was actually charged for.
+
+    `total_runs` is the session's ledger count and it matters: with no metered
+    runs this used to claim "everything ran locally or on your own key" before
+    anything had run at all. Zero runs is not evidence of privacy — it is the
+    absence of evidence — and the claim is only sayable once there is something
+    it is true OF. None means the caller can't see the ledger, so no claim is
+    made either way.
+    """
     if summary_.metered_runs == 0:
-        return "Nothing metered this session — everything ran locally or on your own key."
+        if total_runs == 0:
+            return "Nothing translated yet, so nothing has been metered."
+        if total_runs is None:
+            return "Nothing metered this session."
+        return ("Nothing metered this session — everything so far ran on this machine, "
+                "from cache, or on your own key.")
     if summary_.over_free_allowance:
         return (f"{summary_.metered_chars:,} characters metered — over the "
                 f"{summary_.free_chars:,} free allowance.")
