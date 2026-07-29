@@ -690,9 +690,19 @@ class TranslationUI(VoicePageMixin):
                         fraction = summary["local_share_of_chars"]
                         share = 0 if fraction is None else int(fraction * 100)
                         if fraction is None:
-                            ui.label("No new text was translated this session — "
-                                     "every answer came from this session's cache.")\
-                                .classes("text-base")
+                            # Two different facts, and only one of them is
+                            # about caching. A ledger of nothing but empty
+                            # inputs (a picture-only DOCX) also has no new
+                            # characters, and claiming its answers "came from
+                            # this session's cache" describes a cache that
+                            # never happened — printed above a cache line
+                            # reading 0.
+                            ui.label(
+                                "No new text was translated this session — "
+                                "every answer came from this session's cache."
+                                if summary["cache"]["runs"]
+                                else "No text was translated this session."
+                            ).classes("text-base")
                         else:
                             ui.label(f"{share}% of the {summary['new_chars']} characters "
                                      "you translated stayed on this machine")\
@@ -905,6 +915,11 @@ class TranslationUI(VoicePageMixin):
                         ui.spinner(size="sm")
                         ui.label("Running every engine…").classes(theme.DATA)
                     candidates = self.backend.comparison_candidates(self.active_profile)
+                    # Bound here, on the request context, for the same reason
+                    # the cache scope is: the recording happens after a worker
+                    # thread call and app.storage.user is not reachable from
+                    # there.
+                    recorder = self._engine_recorder()
                     # Event handler: no request context, so a scope resolved
                     # inside the worker collapses to the shared partition and
                     # this page's translations become readable by every other
@@ -914,6 +929,16 @@ class TranslationUI(VoicePageMixin):
                         results = await asyncio.to_thread(
                             self.backend.compare_translations, text,
                             target.value or "Spanish", candidates)
+                    # One row per engine that actually answered. Compare is a
+                    # fan-out: collapsing it into a single "compare" run would
+                    # name an engine that did not exist and would hide the
+                    # hosted call, which is precisely the text that left the
+                    # machine and the only one Passage pays for. Failed rows
+                    # produced no output and are not runs.
+                    for r in results:
+                        if r.ok:
+                            recorder(surface=policy.Surface.COMPARE, engine=r.engine,
+                                     latency_ms=r.latency_ms or 0, chars=len(text))
                     render(results)
                     run_row.clear()
                     with run_row:

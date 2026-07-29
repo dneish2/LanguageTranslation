@@ -33,6 +33,7 @@ class Surface(str, Enum):
     DOCUMENT = "document"        # an uploaded file
     IMAGE = "image"              # camera / photo OCR
     VOICE = "voice"              # recorded speech
+    COMPARE = "compare"          # one sentence run across several engines
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,15 @@ _RETENTION = {
         reason="Somebody is pointing a camera at a menu. The result is useful "
                "for the next minute; a photograph of wherever someone happens "
                "to be standing is the last thing to keep."),
+    Surface.COMPARE: Retention(
+        session_history=False, durable_text=False, durable_segments=False,
+        durable_traces=False, durable_original_file=False,
+        reason="Comparing engines is a one-off diagnostic, not a translation "
+               "someone came back for: the same sentence goes to every engine "
+               "at once, so keeping it would file one input under several "
+               "answers with no way to say which was meant. It still reaches "
+               "the ledger — the text is really sent to every one of those "
+               "engines, and a hosted one is really billed."),
     Surface.VOICE: Retention(
         session_history=True, durable_text=False, durable_segments=False,
         durable_traces=False, durable_original_file=False,
