@@ -1,6 +1,7 @@
 import logging
 import os
 import base64
+import hashlib
 import re
 import string
 import sys
@@ -534,6 +535,98 @@ SUPPORTED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp"})
 #: ContextVar, not an attribute: the backend is shared by every client.
 _active_provider: ContextVar[Any] = ContextVar("passage_active_provider", default=None)
 
+#: Cache-isolation scope for the CURRENT request (see current_cache_scope).
+#: Also a ContextVar for the same reason as _active_provider: the translation
+#: cache lives on the one shared backend instance, so anything that decides who
+#: may read a cache entry has to be per-request, never an attribute.
+_active_cache_scope: ContextVar[str | None] = ContextVar("passage_cache_scope", default=None)
+
+#: The cache is no longer an unbounded dict: translated user content is held in
+#: memory for the life of the process, so it needs a ceiling. Oldest-first
+#: eviction, count-bounded (entries are chunk-sized strings, so a count bound is
+#: a good enough proxy for a byte bound and is cheap to reason about).
+CACHE_MAX_ENTRIES = max(1, int(os.getenv("PASSAGE_CACHE_MAX_ENTRIES", "512")))
+
+
+@dataclass(frozen=True)
+class CacheEntry:
+    """A cached translation together with the engine that actually produced it.
+
+    The label is stored, not recomputed at read time, so a cache hit can never
+    describe the bytes as coming from an engine that did not produce them.
+    """
+
+    text: str
+    engine: str
+
+
+class BoundedTranslationCache(dict):
+    """Insertion-ordered dict with a hard entry ceiling.
+
+    Subclasses dict so existing equality/inspection (``cache == {}``) keeps
+    working; the only added behaviour is eviction of the oldest entry once the
+    ceiling is passed, and refreshing recency on read.
+    """
+
+    def __init__(self, max_entries: int = CACHE_MAX_ENTRIES) -> None:
+        super().__init__()
+        self.max_entries = max(1, int(max_entries))
+
+    def __setitem__(self, key, value) -> None:
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        while len(self) > self.max_entries:
+            super().__delitem__(next(iter(self)))
+
+    def get(self, key, default=None):
+        if key not in self:
+            return default
+        value = super().__getitem__(key)
+        # Touch: dicts preserve insertion order, so re-inserting makes this the
+        # newest entry and keeps eviction LRU rather than strictly FIFO.
+        super().__delitem__(key)
+        super().__setitem__(key, value)
+        return value
+
+
+def _ambient_cache_scope() -> str | None:
+    """Best-effort per-browser identity, when we are inside a NiceGUI request.
+
+    Read defensively: outside a client/request context NiceGUI raises, and the
+    document path runs on a worker thread with no context at all. Callers that
+    care about isolation on a worker thread capture the scope up-front and
+    re-establish it with ``TranslationBackend.cache_scope``.
+    """
+    try:  # pragma: no cover - exercised only under a live NiceGUI server
+        from nicegui import app as _nicegui_app
+
+        browser_id = _nicegui_app.storage.browser.get("id")
+        if browser_id:
+            return f"browser:{browser_id}"
+    except Exception:
+        # No storage_secret, or no request context (event handlers run outside
+        # one). Fall through rather than give up: falling back to the shared
+        # partition here would quietly undo the isolation.
+        pass
+    try:  # pragma: no cover - exercised only under a live NiceGUI server
+        from nicegui import context as _nicegui_context
+
+        client_id = getattr(_nicegui_context.client, "id", None)
+        if client_id:
+            return f"client:{client_id}"
+    except Exception:
+        pass
+    return None
+
+
+def current_cache_scope() -> str:
+    """The cache partition the caller is allowed to read and write."""
+    explicit = _active_cache_scope.get()
+    if explicit:
+        return explicit
+    return _ambient_cache_scope() or "shared"
+
 JOB_STATE_QUEUED = "queued"
 JOB_STATE_RUNNING = "running"
 JOB_STATE_SUCCEEDED = "succeeded"
@@ -794,7 +887,7 @@ class TranslationBackend:
         self._manual_cancel_requested = False
         self._active_run_state = TranslationRunState()
         self._run_states: dict[str, TranslationRunState] = {}
-        self.translation_cache: dict[tuple[str, str, str], str] = {}
+        self.translation_cache: BoundedTranslationCache = BoundedTranslationCache()
         self.metrics = MetricsCollector()
         self.max_openai_attempts = 4
         self.retry_base_delay = 0.5
@@ -854,6 +947,87 @@ class TranslationBackend:
             yield
         finally:
             _active_provider.reset(token)
+
+    @contextmanager
+    def cache_scope(self, scope: str | None):
+        """Run the enclosed work in an explicit cache partition.
+
+        Used to carry a request's scope onto a worker thread (ContextVars do
+        not propagate into threads) and by callers that know the session
+        identity better than the ambient NiceGUI lookup does.
+        """
+        token = _active_cache_scope.set(scope or None)
+        try:
+            yield
+        finally:
+            _active_cache_scope.reset(token)
+
+    # ─────────────────────────── CACHE ISOLATION ───────────────────────── #
+    #
+    # The backend is a single process-wide object shared by every connected
+    # client, so its translation cache is shared too. Keyed only on
+    # (text, target, mode) it happily served one user's BYO/private-endpoint
+    # output to a DIFFERENT user, and told that user their own engine produced
+    # it. Two properties are enforced here, in code:
+    #
+    #   1. ENGINE IDENTITY. Every key carries the identity of the engine that
+    #      would answer this request (the hosted default, a local model, or the
+    #      exact base_url+key+model of a BYO endpoint, hashed). A result made by
+    #      one engine can never be served to a request another engine would have
+    #      answered, in either direction.
+    #   2. OWNER SCOPE. Every key also carries the caller's cache scope, so
+    #      translated user content is not shared between sessions at all. That
+    #      is a privacy property, not only a labelling one: the reproduction
+    #      leaked a sentence of one user's document to another user.
+    #
+    # And the stored value carries the producing engine's LABEL, so a cache hit
+    # reports what actually made the bytes rather than an engine the request
+    # merely could have used.
+
+    def _identity_for_provider(self, provider: Any) -> str:
+        """A stable, non-secret-leaking identity for a resolved provider."""
+        base_url = getattr(provider, "base_url", None)
+        model = getattr(provider, "text_model", None) or TEXT_MODEL
+        if not base_url:
+            return f"hosted:{model}"
+        api_key = getattr(getattr(provider, "client", None), "api_key", "") or ""
+        digest = hashlib.sha256(f"{base_url}\x00{api_key}\x00{model}".encode()).hexdigest()[:16]
+        return f"endpoint:{digest}"
+
+    def _engine_identity(self, profile=None) -> str:
+        """Which engine would answer a request made right now?
+
+        An explicit profile wins (the live path passes one); failing that the
+        per-request provider override, which is how the document path carries a
+        BYO endpoint down through layers that never took a profile argument;
+        failing that, the process default.
+        """
+        if profile is not None and getattr(profile, "kind", None) != pp.KIND_APP:
+            raw = "\x00".join([
+                str(getattr(profile, "kind", "")),
+                str(getattr(profile, "base_url", "") or ""),
+                str(getattr(profile, "api_key", "") or ""),
+                str(getattr(profile, "model", "") or ""),
+            ])
+            return f"endpoint:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
+        override = _active_provider.get()
+        if override is not None:
+            return self._identity_for_provider(override)
+        if self.provider is not None:
+            return self._identity_for_provider(self.provider)
+        return f"hosted:{TEXT_MODEL}"
+
+    def _cache_get(self, cache_key) -> "CacheEntry | None":
+        entry = self.translation_cache.get(cache_key)
+        if entry is None:
+            return None
+        # Tolerate an entry planted as a bare string by older code or a test.
+        if isinstance(entry, str):
+            return CacheEntry(text=entry, engine=cache_key[1])
+        return entry
+
+    def _cache_put(self, cache_key, text: str, engine: str) -> None:
+        self.translation_cache[cache_key] = CacheEntry(text=text, engine=engine)
 
     @property
     def segment_map(self) -> dict[str, dict]:
@@ -955,10 +1129,15 @@ class TranslationBackend:
             self._jobs[job_id] = job
             self._run_states[job_id] = TranslationRunState()
 
+        # Captured HERE, in the request's context: the worker thread has no
+        # NiceGUI context to read an ambient scope from, so a scope resolved
+        # inside the thread would silently collapse to the shared partition.
+        submit_scope = current_cache_scope()
+
         def worker():
             # ContextVars do NOT propagate into a new thread, so the override
             # is established inside the worker rather than assumed.
-            with self.using_profile(profile):
+            with self.cache_scope(submit_scope), self.using_profile(profile):
                 self._run_translation_job(
                     job_id=job_id,
                     input_stream=input_stream,
@@ -1112,11 +1291,26 @@ class TranslationBackend:
     def generate_segment_id(self) -> str:
         return str(uuid.uuid4())
 
-    def _normalize_cache_key(self, text: str, target_language: str, mode: str) -> tuple[str, str, str]:
+    def _normalize_cache_key(
+        self, text: str, target_language: str, mode: str, profile=None,
+    ) -> tuple[str, str, str, str, str]:
+        """(scope, engine identity, text, target, mode).
+
+        The first two dimensions are the isolation ones -- see the CACHE
+        ISOLATION note above. They are part of the key rather than checked after
+        a lookup, so there is no code path that can read an entry without
+        matching them.
+        """
         normalized_text = " ".join(text.replace("\t", " ").split())
         normalized_target = " ".join(target_language.lower().split())
         normalized_mode = " ".join(mode.lower().split())
-        return normalized_text, normalized_target, normalized_mode
+        return (
+            current_cache_scope(),
+            self._engine_identity(profile),
+            normalized_text,
+            normalized_target,
+            normalized_mode,
+        )
 
     def _is_transient_openai_error(self, error: Exception) -> bool:
         transient_types = tuple(
@@ -1233,7 +1427,7 @@ class TranslationBackend:
             return text
         metrics = file_metrics or self.metrics
         cache_key = self._normalize_cache_key(text, target_language, mode="translate")
-        cached = self.translation_cache.get(cache_key)
+        cached = self._cache_get(cache_key)
         if cached is not None:
             metrics.record_cache_hit()
             logging.info("[Backend] translate_text cache hit for target=%s", target_language)
@@ -1241,9 +1435,10 @@ class TranslationBackend:
                 "translation.cache_hit",
                 correlation_id=correlation_id,
                 source_length=len(text),
-                translated_length=len(cached),
+                translated_length=len(cached.text),
+                engine=cached.engine,
             )
-            return cached
+            return cached.text
         metrics.record_cache_miss()
 
         try:
@@ -1258,7 +1453,7 @@ class TranslationBackend:
             else:
                 result = self._translate_chunk(text, target_language)
                 logging.info("[Backend] Translated len=%d → len=%d", len(text), len(result))
-            self.translation_cache[cache_key] = result
+            self._cache_put(cache_key, result, cache_key[1])
             return result
         except Exception as e:
             # Never echo the source back as a "translation" — surface the failure.
@@ -1551,12 +1746,17 @@ class TranslationBackend:
         text = text.replace("\t", " ").strip()
         if not text:
             return text, "none"
-        cache_key = self._normalize_cache_key(
-            text, target_language, mode=f"live:{profile.id if profile else 'auto'}")
-        cached = self.translation_cache.get(cache_key)
+        # No profile id in the mode any more: identity is a first-class key
+        # dimension now, and a profile id is not an engine -- two sessions with
+        # different ids but the same endpoint used to be treated as different
+        # engines, while every profile-less session shared one 'auto' bucket.
+        cache_key = self._normalize_cache_key(text, target_language, mode="live", profile=profile)
+        cached = self._cache_get(cache_key)
         if cached is not None:
             self.metrics.record_cache_hit()
-            return cached, "cache"
+            # The stored label, never "cache": the caller shows this to the user
+            # as the engine that produced the text on screen.
+            return cached.text, cached.engine
 
         if profile is not None and profile.kind != pp.KIND_APP:
             masked, protected = _mask_protected_spans(text)
@@ -1567,7 +1767,7 @@ class TranslationBackend:
             if not result:
                 raise ValueError("The model returned an empty translation.")
             result = _restore_protected_spans(result, protected)
-            self.translation_cache[cache_key] = result
+            self._cache_put(cache_key, result, profile.describe())
             return result, profile.describe()
 
         provider = self._live_local_provider()
@@ -1581,7 +1781,7 @@ class TranslationBackend:
                 result = (completion.choices[0].message.content or "").strip()
                 if result:
                     result = _restore_protected_spans(result, protected)
-                    self.translation_cache[cache_key] = result
+                    self._cache_put(cache_key, result, f"local:{provider.text_model}")
                     return result, f"local:{provider.text_model}"
                 logging.info("[Backend] live-local returned empty; falling back to hosted")
             except Exception as error:
@@ -1600,10 +1800,10 @@ class TranslationBackend:
         normalized_instructions = " ".join(instructions.replace("\t", " ").strip().split())
         mode = f"instructions:{normalized_instructions}" if normalized_instructions else "instructions"
         cache_key = self._normalize_cache_key(original_text, target_language, mode=mode)
-        cached = self.translation_cache.get(cache_key)
+        cached = self._cache_get(cache_key)
         if cached is not None:
             logging.info("[Backend] instruction translation cache hit for target=%s", target_language)
-            return cached
+            return cached.text
 
         # Same URL/email protection as _translate_chunk: refining a translated
         # dossier would otherwise re-corrupt the citation trail.
@@ -1627,7 +1827,7 @@ class TranslationBackend:
             if not result:
                 raise ValueError("The model returned an empty refinement.")
             result = _restore_protected_spans(result, protected)
-            self.translation_cache[cache_key] = result
+            self._cache_put(cache_key, result, cache_key[1])
             logging.info("[Backend] Refined translation len=%d", len(result))
             return result
         except Exception as e:
