@@ -789,3 +789,60 @@ def test_nothing_installed_is_still_reported_as_nothing_installed():
 
 def test_the_line_says_it_is_still_checking_before_the_first_probe_lands():
     assert "checking" in TranslationUI.describe_local_default(ui_module._pending_snapshot())
+
+
+# ── D3 — "nothing was translated" is not "everything came from cache" ──
+
+
+def _row(**kw):
+    row = {"surface": "document", "engine": "none", "is_local": True,
+           "latency_ms": 0, "chars": 0, "when": 0.0, "left_machine": False,
+           "metered": False, "ran": "nothing"}
+    row.update(kw)
+    return row
+
+
+def test_a_session_that_translated_nothing_does_not_claim_a_cache():
+    """THE REGRESSION. A DOCX of one picture and blank paragraphs: no outbound
+    call, empty cache, one row {"chars":0,"ran":"nothing"}. /engines printed
+    "every answer came from this session's cache" above "local: 1 runs" — a
+    cache that never happened and a run that never ran."""
+    summary = engine_ledger.summarise([_row()])
+
+    assert summary["cache"]["runs"] == 0, (
+        "the page picks its sentence off this number; a non-zero here is the "
+        "cache claim")
+    assert summary["local"]["runs"] == 0, "an empty document invented a local run"
+    assert summary["local"]["chars"] == 0
+    assert summary["remote"]["runs"] == 0 and summary["unknown"]["runs"] == 0
+    assert summary["new_chars"] == 0
+    assert summary["local_share_of_chars"] is None
+    assert summary["engines"] == {}
+    # The row is still there; the page's "nothing translated yet" test is about
+    # the whole ledger, and something did happen — it just wasn't a run.
+    assert summary["total_runs"] == 1
+    assert summary["runs_of_new_text"] == 0
+
+
+def test_an_all_cache_session_still_reports_its_cache():
+    """The other side of the same branch: here the sentence about caching is
+    the true one, and it must survive the fix."""
+    hit = _row(engine=f"hosted:{TEXT_MODEL}", chars=44, ran="cache")
+    summary = engine_ledger.summarise([hit, dict(hit)])
+
+    assert summary["cache"]["runs"] == 2
+    assert summary["local_share_of_chars"] is None
+    assert summary["local"]["runs"] == 0 and summary["remote"]["runs"] == 0
+
+
+def test_an_empty_row_cannot_dilute_a_real_privacy_share():
+    """A zero-character row is evidence of no destination, so it may not be
+    counted on either side of the share — in either direction."""
+    sent = _row(engine=f"hosted:{TEXT_MODEL}", is_local=False, left_machine=True,
+                chars=44, metered=True, ran="hosted", surface="live_text")
+    summary = engine_ledger.summarise([sent, _row()])
+
+    assert summary["local_share_of_chars"] == 0.0
+    assert summary["remote"]["runs"] == 1 and summary["remote"]["chars"] == 44
+    assert summary["local"]["runs"] == 0
+    assert summary["engines"] == {f"hosted:{TEXT_MODEL}": 1}

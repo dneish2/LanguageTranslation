@@ -162,8 +162,21 @@ def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     are reported on their own line where they cannot inflate anything.
     """
     rows = list(entries)
-    cache = [r for r in rows if served_from_cache(r)]
-    ran_rows = [r for r in rows if not served_from_cache(r)]
+    # Three kinds of row, not two. A row where NOTHING was asked of anything
+    # (empty input: a picture-only DOCX, a blank box) is neither a run nor a
+    # re-read, so it is evidence of no destination and of no cache. Filing it
+    # with the runs printed "local: 1 runs · 0 chars" for a document that was
+    # never translated at all.
+    cache: list[dict[str, Any]] = []
+    nothing: list[dict[str, Any]] = []
+    ran_rows: list[dict[str, Any]] = []
+    for r in rows:
+        if served_from_cache(r):
+            cache.append(r)
+        elif (r.get("ran") or "").lower() == "nothing":
+            nothing.append(r)
+        else:
+            ran_rows.append(r)
     local = [r for r in ran_rows if left_machine_of(r) is False]
     remote = [r for r in ran_rows if left_machine_of(r) is True]
     unknown = [r for r in ran_rows if left_machine_of(r) is None]
@@ -184,8 +197,6 @@ def summarise(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
     # session stayed local.
     engines: dict[str, int] = {}
     for r in ran_rows:
-        if (r.get("ran") or "").lower() == "nothing":
-            continue  # empty input; no model was asked for anything
         engines[r.get("engine", "?")] = engines.get(r.get("engine", "?"), 0) + 1
 
     new_chars = sum(r.get("chars", 0) for r in ran_rows)

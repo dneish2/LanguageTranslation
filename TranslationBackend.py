@@ -774,6 +774,17 @@ JOB_STATE_FAILED = "failed"
 JOB_STATE_CANCELED = "canceled"
 
 
+def _provider_identity(provider: Any) -> str:
+    """A stable, non-secret-leaking identity for a resolved provider."""
+    base_url = getattr(provider, "base_url", None)
+    model = getattr(provider, "text_model", None) or TEXT_MODEL
+    if not base_url:
+        return f"hosted:{model}"
+    api_key = getattr(getattr(provider, "client", None), "api_key", "") or ""
+    digest = hashlib.sha256(f"{base_url}\x00{api_key}\x00{model}".encode()).hexdigest()[:16]
+    return f"endpoint:{digest}"
+
+
 class BaseTranslationProvider(ABC):
     @abstractmethod
     def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
@@ -823,6 +834,11 @@ class ChatCompletionsProvider(BaseTranslationProvider):
             )
 
     def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
+        # The one place every text model call goes out, and therefore the one
+        # place provenance needs to hear about it. Noted before the request,
+        # because the bytes leave the machine whether or not it succeeds, and
+        # whether or not anyone caches the answer.
+        _note_engine(_provider_identity(self))
         limit_kwargs = (
             _completion_limit_kwargs(self.text_model, max_tokens)
             if self.is_openai_hosted
@@ -1124,16 +1140,6 @@ class TranslationBackend:
     # reports what actually made the bytes rather than an engine the request
     # merely could have used.
 
-    def _identity_for_provider(self, provider: Any) -> str:
-        """A stable, non-secret-leaking identity for a resolved provider."""
-        base_url = getattr(provider, "base_url", None)
-        model = getattr(provider, "text_model", None) or TEXT_MODEL
-        if not base_url:
-            return f"hosted:{model}"
-        api_key = getattr(getattr(provider, "client", None), "api_key", "") or ""
-        digest = hashlib.sha256(f"{base_url}\x00{api_key}\x00{model}".encode()).hexdigest()[:16]
-        return f"endpoint:{digest}"
-
     def _engine_identity(self, profile=None) -> str:
         """Which engine would answer a request made right now?
 
@@ -1152,9 +1158,9 @@ class TranslationBackend:
             return f"endpoint:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
         override = _active_provider.get()
         if override is not None:
-            return self._identity_for_provider(override)
+            return _provider_identity(override)
         if self.provider is not None:
-            return self._identity_for_provider(self.provider)
+            return _provider_identity(self.provider)
         return f"hosted:{TEXT_MODEL}"
 
     @staticmethod
@@ -1192,10 +1198,14 @@ class TranslationBackend:
         return entry
 
     def _cache_put(self, cache_key, text: str, engine: str) -> None:
-        # A store means a model really answered for this call: the counterpart
-        # of _cache_get's hit note, and the reason a mixed document (some
-        # chunks cached, some fresh) never reports "nothing was sent".
-        _note_engine(engine)
+        # Deliberately does NOT note an engine run. Provenance counts model
+        # invocations at the point of the outbound call (see _note_engine's
+        # call sites), because "was anything sent?" is a question about calls,
+        # not about cache writes. Counting stores instead made every model
+        # call that does not cache its result invisible: the image surface's
+        # vision OCR and its batched block translation both bypass the cache,
+        # so a photograph base64'd to a hosted model was booked as a cache hit
+        # and shown as "no model ran and nothing was sent".
         self.translation_cache[cache_key] = CacheEntry(text=text, engine=engine)
 
     @property
@@ -2264,7 +2274,12 @@ class TranslationBackend:
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
             ]},
         ]
-        completion = self._require_provider().client.chat.completions.create(
+        vision_provider = self._require_provider()
+        # The photograph is in `messages` as base64 and is about to be sent.
+        # Nothing about this call touches the translation cache, so it is only
+        # visible to provenance because it says so here.
+        _note_engine(_provider_identity(vision_provider))
+        completion = vision_provider.client.chat.completions.create(
             model=VISION_MODEL,
             messages=messages,
             response_format={"type": "json_object"},

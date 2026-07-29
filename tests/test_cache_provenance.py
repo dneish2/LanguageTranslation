@@ -407,3 +407,86 @@ def test_hyperlink_paragraph_keeps_the_space_before_the_link(backend, monkeypatc
     assert "Verla" not in text, f"the space before the link was lost in the document: {text!r}"
     assert "Ver la documentación" in text, text
     assert "documentación para más detalles." in text, text
+
+
+# ── D2 (round two): a model call that never touches the cache is still a run ──
+
+
+def _png_bytes() -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (400, 200), (250, 250, 240)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_OCR_JSON = (
+    '{"recognized_blocks":[{"text":"ENTRANTES","confidence":0.95,'
+    '"bbox":[0.1,0.1,0.5,0.2]},{"text":"Pan con tomate","confidence":0.93,'
+    '"bbox":[0.1,0.3,0.6,0.4]}]}'
+)
+
+
+def test_the_same_photo_twice_is_never_reported_as_a_cache_hit(backend, endpoints):
+    """THE REGRESSION. Photograph the same menu twice.
+
+    Round two still base64s the image to the hosted vision model and still
+    makes the batched block-translation call; only the per-block fallback
+    translations are re-reads. The receipt said "no model ran and nothing was
+    sent" because provenance counted CACHE WRITES instead of model calls, and
+    neither of those two calls caches anything.
+
+    The endpoint reply is deliberately the OCR JSON for both calls, which is
+    the product's own documented degradation: the batch returns something that
+    is not the expected shape, so every block falls back to a single-block
+    translate — the exact shape of the live reproduction.
+    """
+    endpoints.register(None, _OCR_JSON)
+    image = _png_bytes()
+    rounds = []
+    with backend.cache_scope("session-A"):
+        for _ in range(2):
+            before = endpoints.count(None)
+            with backend.capture_provenance() as prov:
+                backend.translate_image_text_blocks(image, "menu.png", "Spanish")
+            rounds.append((endpoints.count(None) - before, prov.engine_runs,
+                           prov.cache_hits, prov.from_cache))
+
+    first_calls, first_runs, _first_hits, first_cached = rounds[0]
+    second_calls, second_runs, second_hits, second_cached = rounds[1]
+
+    # WHICH PATH RAN: the hosted endpoint, in both rounds, twice each — the
+    # vision read and the batched block translation.
+    assert first_calls >= 2, "round one never reached the hosted vision endpoint"
+    assert second_calls >= 2, (
+        "round two made no outbound call at all; this test can no longer "
+        "detect the defect")
+    assert second_hits > 0, "no per-block re-read happened; the setup is wrong"
+
+    assert first_cached is False
+    assert second_cached is False, (
+        "a photograph that was base64'd to a hosted vision model was booked as "
+        "a cache hit — 'no model ran and nothing was sent'")
+
+    # Two-sided, so the fix cannot swing into over-reporting either: provenance
+    # counts model INVOCATIONS, exactly one per outbound call. If a future
+    # change re-notes an engine run from _cache_put, the fallback translations
+    # would push this above the call count.
+    assert first_runs == first_calls
+    assert second_runs == second_calls
+
+
+def test_counting_cache_writes_instead_of_calls_would_fail_this_suite(backend, endpoints):
+    """Mutation check for the fix above, stated as a property of the ONE place
+    that stores a cache entry: writing to the cache is not, by itself, evidence
+    that anything ran or was sent."""
+    with backend.capture_provenance() as prov:
+        backend._cache_put(("session-A", "hosted:x", "hi", "Spanish", "live"),
+                           "hola", "hosted:x")
+    assert prov.engine_runs == 0, (
+        "a cache write was counted as a model run; provenance is measuring "
+        "stores again, so calls that never cache (vision OCR, batched block "
+        "translation) become invisible")
+    assert prov.from_cache is False, "nothing was read from cache here"
