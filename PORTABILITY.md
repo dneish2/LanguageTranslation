@@ -70,8 +70,11 @@ Windows. What it establishes:
   speech job was skipped — it is schedule/dispatch only, so it **has not yet run at all**.
 - **The failure was a genuine hidden host assumption.** `redact_path` reduced a path to its
   basename using host-specific separator semantics, so a Windows-style path was not redacted on
-  POSIX. Both non-Windows runners caught it on the matrix's *first* run. Another agent is fixing
-  it; there is no green re-run yet, and this document will not claim one.
+  POSIX. Both non-Windows runners caught it on the matrix's *first* run.
+- **Now green on all three.** The path-redaction fix landed and the matrix has since run green on
+  `ubuntu-latest`, `windows-latest` and `macos-14` (most recently run 30481387085). That is a
+  claim about the *test suite* executing on arm64 macOS, and nothing more — see "Still unverified"
+  below, which is unchanged by it.
 
 ### Still unverified
 
