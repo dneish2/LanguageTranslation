@@ -277,6 +277,11 @@ class TranslationUI(VoicePageMixin):
         # ── SEGMENT EDITING ─────────────────────────────────────────────
         self.original_segments_map: dict[str, str] = {}
         self.translated_segments_map: dict[str, str] = {}
+        # seg_id -> the live textarea element rendered by show_result(). Save All
+        # Edits reads THESE; without the registry it could only re-serialise
+        # segments the per-segment Update button had already applied, i.e. it
+        # silently discarded every in-page edit while reporting success.
+        self.segment_editors: dict[str, Any] = {}
         # This client's own document state — never read self.backend.segment_map
         # /.output_stream/etc. (those ambient properties proxy the backend's
         # SHARED self._active_run_state pointer, reassigned by get_job_result()
@@ -1502,6 +1507,9 @@ class TranslationUI(VoicePageMixin):
                     .classes("p-display text-2xl")
 
                 # ── SEGMENT EDITOR ──────────────────────────────
+                # Rebuilt on every render, so the registry is rebuilt too:
+                # stale elements from a previous render must never be read.
+                self.segment_editors.clear()
                 if self.advanced_mode and self.original_segments_map:
                     ui.separator().classes("my-4")
                     ui.label("Segment review").classes("p-display text-xl mb-2")
@@ -1551,6 +1559,7 @@ class TranslationUI(VoicePageMixin):
                                       .props("autogrow rows=3")\
                                       .classes(f"w-full text-sm {theme.PANEL_TARGET}")
                                     textarea.segment_id = seg_id
+                                    self.segment_editors[seg_id] = textarea
 
                                 with ui.row().classes("w-full items-center gap-2"):
                                     refine = ui.input(placeholder="Refinement instructions (optional)")\
@@ -1563,6 +1572,11 @@ class TranslationUI(VoicePageMixin):
                                               on_click=lambda _, s=seg_id, ta=textarea:
                                                 self.retranslate_segment_callback(s, ta)
                                              ).props("size=sm no-caps").classes(theme.BTN_SECONDARY_SM)
+
+                # ── FIDELITY NOTICES ────────────────────────────
+                # Formatting that could not be carried across translation is
+                # stated, not silently dropped.
+                self._render_fidelity_notes()
 
                 if self.uploaded_file_extension in {"png", "jpg", "jpeg", "webp"}:
                     ui.separator().classes("my-3")
@@ -1735,10 +1749,104 @@ class TranslationUI(VoicePageMixin):
             logging.error(f"[UI] Error bulk approving: {ex}", exc_info=True)
             ui.notify(f"Bulk approval failed: {ex}", type="negative")
 
+    def _render_fidelity_notes(self) -> None:
+        """Show what the rewrite could NOT preserve (DOCX runs / hyperlinks)."""
+        notes = list(getattr(self.document_run_state, "fidelity_notes", []) or [])
+        if not notes:
+            return
+        grouped: dict[str, list[str]] = {}
+        for note in notes:
+            grouped.setdefault(note["message"], []).append(note["location"])
+        ui.separator().classes("my-3")
+        with ui.expansion(
+            f"Formatting notes ({len(notes)})", icon="report_problem"
+        ).classes(f"w-full {theme.WELL}"):
+            ui.label(
+                "Translated wording does not line up with the original text spans, "
+                "so some inline formatting could not be carried across:"
+            ).classes("text-sm mb-2")
+            for message, locations in grouped.items():
+                shown = ", ".join(locations[:5])
+                if len(locations) > 5:
+                    shown += f" (+{len(locations) - 5} more)"
+                ui.label(f"- {message}").classes("text-sm")
+                ui.label(shown).classes(f"{theme.DATA} text-xs mb-2")
+
     def save_all_edits(self):
+        """Apply every segment editor's CURRENT contents to the document.
+
+        This used to call regenerate_output_stream() and nothing else, which
+        re-serialised the document from segments that only the per-segment
+        Update button ever wrote. Typing in a box and pressing Save All Edits
+        therefore produced a green success toast, an unchanged download, and no
+        trace row - the edit was lost from both the document and the dataset.
+        Now the editors are the source of truth, edits are recorded as traces
+        exactly like the per-segment path, and a save with nothing to save says
+        so instead of claiming success.
+        """
         try:
+            if not self.segment_editors:
+                ui.notify(
+                    "No segment editors are open, so there is nothing to save. "
+                    "Turn on segment review to edit translations.",
+                    type="warning",
+                )
+                return
+
+            changed, failed = [], []
+            for seg_id, textarea in list(self.segment_editors.items()):
+                if seg_id not in self.document_run_state.segment_map:
+                    continue  # deleted since this render
+                current = textarea.value or ""
+                # The machine's output, captured before we overwrite it: the gap
+                # between it and the human's text is the only ground truth here.
+                machine_output = self.translated_segments_map.get(seg_id, "")
+                if current.strip() == (machine_output or "").strip():
+                    continue
+                try:
+                    updated = self.backend.update_segment(
+                        seg_id,
+                        current,
+                        self.current_target_language,
+                        regenerate=False,
+                        run_state=self.document_run_state,
+                    )
+                except Exception as seg_ex:  # one bad segment must not eat the rest
+                    logging.error(
+                        f"[UI] save_all_edits failed on {seg_id}: {seg_ex}", exc_info=True
+                    )
+                    failed.append(seg_id)
+                    continue
+                textarea.value = updated
+                self.translated_segments_map[seg_id] = updated
+                traces.record_edit(
+                    trace_id=self.document_trace_id,
+                    segment_id=seg_id,
+                    before=machine_output,
+                    after=updated,
+                )
+                changed.append(seg_id)
+
+            # Rebuild the download stream once, after the edits are in the doc.
             self.backend.regenerate_output_stream(run_state=self.document_run_state)
-            ui.notify("All edits saved to document!", type="positive")
+
+            if failed and not changed:
+                ui.notify(
+                    f"Nothing was saved: {len(failed)} segment(s) failed to apply.",
+                    type="negative",
+                )
+            elif failed:
+                ui.notify(
+                    f"Saved {len(changed)} edit(s); {len(failed)} failed and were not applied.",
+                    type="warning",
+                )
+            elif changed:
+                ui.notify(f"Saved {len(changed)} edit(s) to the document.", type="positive")
+            else:
+                ui.notify(
+                    "No changes to save - the document already matches the editors.",
+                    type="info",
+                )
         except Exception as ex:
             logging.error(f"[UI] Error saving edits: {ex}", exc_info=True)
             ui.notify(f"Save failed: {ex}", type="negative")

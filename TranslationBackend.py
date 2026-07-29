@@ -758,6 +758,10 @@ class TranslationRunState:
     output_stream: BytesIO | None = None
     pdf_overlay_ocg: Any | None = None
     current_image_bytes: bytes | None = None
+    #: Human-readable notes about fidelity that could NOT be preserved while
+    #: rewriting the document (inline formatting collapsed, links re-flowed,
+    #: ...). The UI surfaces these instead of silently dropping formatting.
+    fidelity_notes: list[dict] = field(default_factory=list)
 
 
 def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
@@ -931,6 +935,7 @@ class TranslationBackend:
         autofit: bool = False,
         correlation_id: str | None = None,
         profile=None,
+        file_name: str | None = None,
     ) -> str:
         job_id = self.generate_segment_id()
         job = TranslationJob(
@@ -943,6 +948,7 @@ class TranslationBackend:
                 "target_language": target_language,
                 "processed": processed,
                 "correlation_id": correlation_id,
+                "file_name": file_name,
             },
         )
         with self._jobs_lock:
@@ -962,6 +968,7 @@ class TranslationBackend:
                     font_size=font_size,
                     autofit=autofit,
                     correlation_id=correlation_id,
+                    file_name=file_name,
                 )
 
         Thread(target=worker, daemon=True).start()
@@ -1043,6 +1050,7 @@ class TranslationBackend:
         font_size: int | None,
         autofit: bool,
         correlation_id: str | None,
+        file_name: str | None = None,
     ) -> None:
         self._set_job_state(job_id, state=JOB_STATE_RUNNING, status_message="Starting translation...")
         file_metrics = MetricsCollector()
@@ -1059,6 +1067,7 @@ class TranslationBackend:
                 file_metrics=file_metrics,
                 job_id=job_id,
                 run_state=run_state,
+                file_name=file_name,
                 progress_callback=lambda progress, message: self._set_job_state(
                     job_id,
                     progress=progress,
@@ -2003,6 +2012,184 @@ class TranslationBackend:
         self.regenerate_output_stream(run_state=state)
 
     # ------------------
+    # DOCX INLINE FIDELITY
+    # ------------------
+    #: Cap so a pathological document cannot grow the note list without bound.
+    MAX_FIDELITY_NOTES = 50
+
+    @staticmethod
+    def add_fidelity_note(state, location: str, message: str) -> None:
+        """Record something the rewrite could NOT preserve. The point is that
+        the user is told, so this is data the UI reads, not just a log line."""
+        if state is None:
+            return
+        if len(state.fidelity_notes) >= TranslationBackend.MAX_FIDELITY_NOTES:
+            return
+        state.fidelity_notes.append({"location": location, "message": message})
+        logging.info(f"[Backend] fidelity: {location}: {message}")
+
+    @staticmethod
+    def _run_format_signature(run) -> tuple:
+        font = run.font
+        return (
+            run.bold,
+            run.italic,
+            run.underline,
+            font.name,
+            font.size,
+            getattr(getattr(font, "color", None), "rgb", None),
+        )
+
+    @staticmethod
+    def _docx_paragraph_pieces(para) -> list:
+        """Ordered ("run"|"hyperlink", element, [Run, ...]) pieces of a paragraph.
+
+        Hyperlinks are their own piece so the w:hyperlink element - and with it
+        the relationship id that IS the link - survives the rewrite.
+        """
+        from docx.oxml.ns import qn
+        from docx.text.run import Run
+
+        pieces = []
+        for child in para._p:
+            if child.tag == qn("w:r"):
+                pieces.append(("run", child, [Run(child, para)]))
+            elif child.tag == qn("w:hyperlink"):
+                runs = [Run(r, para) for r in child.findall(qn("w:r"))]
+                if runs:
+                    pieces.append(("hyperlink", child, runs))
+        return pieces
+
+    @classmethod
+    def _write_runs_preserving_first(cls, runs, new_text: str) -> bool:
+        """Put ``new_text`` in the first run and blank the rest.
+
+        Returns True when inline formatting variation was lost (the runs did not
+        all share one format). The single-run case - the common one - is fully
+        preserved: the run element, and therefore its rPr, is reused.
+        """
+        signatures = {cls._run_format_signature(r) for r in runs if r.text}
+        runs[0].text = new_text
+        for extra in runs[1:]:
+            extra.text = ""
+        return len(signatures) > 1
+
+    def rewrite_docx_paragraph(
+        self,
+        para,
+        target_language,
+        *,
+        location: str,
+        do_translate: bool = True,
+        correlation_id: str | None = None,
+        file_metrics=None,
+        state=None,
+    ) -> str:
+        """Translate a paragraph in place WITHOUT flattening it to plain text.
+
+        ``para.text = ...`` (what this used to do) deletes every run and every
+        hyperlink in the paragraph. Instead:
+          * no hyperlinks -> one translation call for the whole paragraph,
+            written into the first run so its formatting survives;
+          * hyperlinks present -> each link and each contiguous stretch of plain
+            runs is translated as its own unit, so the w:hyperlink elements (and
+            their r:id) are never touched.
+        Whatever still could not be preserved becomes a fidelity note.
+        """
+        pieces = self._docx_paragraph_pieces(para)
+        has_link = any(kind == "hyperlink" for kind, _el, _runs in pieces)
+
+        def translate(text: str) -> str:
+            if not do_translate:
+                return text
+            return self._translate_text_with_context(
+                text,
+                target_language,
+                correlation_id=correlation_id,
+                file_metrics=file_metrics,
+            )
+
+        if not pieces:
+            # No runs at all (rare); nothing to preserve, fall back to a plain set.
+            new_text = translate(para.text.strip())
+            para.text = new_text
+            return new_text
+
+        if not has_link:
+            original = para.text.strip()
+            new_text = translate(original)
+            runs = [r for _kind, _el, rs in pieces for r in rs]
+            if self._write_runs_preserving_first(runs, new_text):
+                self.add_fidelity_note(
+                    state,
+                    location,
+                    "Mixed inline formatting in this paragraph was collapsed into the "
+                    "first run's style: translated wording does not align to the "
+                    "original bold/italic spans.",
+                )
+            return new_text
+
+        # ---- hyperlink path: translate piecewise so the links survive ----
+        units = []  # (kind, runs), with adjacent plain runs grouped together
+        for kind, _el, runs in pieces:
+            if kind == "hyperlink":
+                units.append(("hyperlink", list(runs)))
+            elif units and units[-1][0] == "text":
+                units[-1][1].extend(runs)
+            else:
+                units.append(("text", list(runs)))
+
+        out_parts = []
+        for kind, runs in units:
+            source = "".join(r.text for r in runs)
+            if not source.strip():
+                continue
+            translated = translate(source.strip())
+            if self._write_runs_preserving_first(runs, translated):
+                self.add_fidelity_note(
+                    state,
+                    location,
+                    "Mixed inline formatting was collapsed into the first run's style.",
+                )
+            out_parts.append(translated)
+        link_count = sum(1 for kind, _runs in units if kind == "hyperlink")
+        self.add_fidelity_note(
+            state,
+            location,
+            f"This paragraph contains {link_count} hyperlink(s), so it was translated "
+            "in pieces around the links to keep them clickable. Wording across a link "
+            "boundary may read less naturally than a whole-sentence translation.",
+        )
+        return " ".join(p.strip() for p in out_parts if p.strip())
+
+    def _overwrite_docx_paragraph(self, para, text: str, *, location: str = "", state=None) -> None:
+        """Replace a paragraph's text with a human edit, keeping what can be kept.
+
+        A hand-edited paragraph cannot be mapped back onto the original spans, so
+        the first run's formatting is kept for the whole paragraph, and any
+        hyperlink text it contained is dropped - reported, not hidden.
+        """
+        pieces = self._docx_paragraph_pieces(para)
+        if not pieces:
+            para.text = text
+            return
+        runs = [r for _kind, _el, rs in pieces for r in rs]
+        if self._write_runs_preserving_first(runs, text):
+            self.add_fidelity_note(
+                state,
+                location,
+                "Edited paragraph: mixed inline formatting was collapsed into the "
+                "first run's style.",
+            )
+        if any(kind == "hyperlink" for kind, _el, _rs in pieces):
+            self.add_fidelity_note(
+                state,
+                location,
+                "Edited paragraph: it contained a hyperlink whose text was replaced "
+                "by your edit, so the link is no longer shown.",
+            )
+
+    # ------------------
     # PROCESSING DOCX
     # ------------------
     def process_docx(
@@ -2034,7 +2221,12 @@ class TranslationBackend:
         total_elements = len(doc.paragraphs) + sum(len(t.rows)*len(t.columns) for t in doc.tables)
         processed = 0
         text_accum = ""
+        # Token accounting covers BOTH sides of the translation: the source we
+        # sent and the translation we got back. Counting one side under-reports
+        # what the run actually cost.
+        token_text = ""
         start_time = time.time()
+        state.fidelity_notes.clear()
 
         # Paragraphs
         for idx, para in enumerate(doc.paragraphs):
@@ -2044,16 +2236,22 @@ class TranslationBackend:
             if self._is_cancel_requested(job_id):
                 break
             seg_start = time.time()
-            new_text = (
-                self._translate_text_with_context(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
-                if do_translate else original
+            location = f"docx:paragraph:{idx}"
+            new_text = self.rewrite_docx_paragraph(
+                para,
+                target_language,
+                location=location,
+                do_translate=do_translate,
+                correlation_id=correlation_id,
+                file_metrics=metrics,
+                state=state,
             )
-            para.text = new_text
             text_accum += new_text + "\n"
+            token_text += original + "\n" + new_text + "\n"
             seg_id = self.generate_segment_id()
             state.segment_map[seg_id] = {
                 "type": "paragraph",
-                "location": f"docx:paragraph:{idx}",
+                "location": location,
                 "original": original,
                 "translated": new_text,
                 "metadata": {"format": "docx", "index": idx},
@@ -2087,21 +2285,24 @@ class TranslationBackend:
                         if self._is_cancel_requested(job_id):
                             break
                         seg_start = time.time()
-                        new_text = (
-                            self._translate_text_with_context(
-                                original,
-                                target_language,
-                                correlation_id=correlation_id,
-                                file_metrics=metrics,
-                            )
-                            if do_translate else original
+                        cell_location = (
+                            f"docx:table:{t_idx}:row:{r_idx}:col:{c_idx}:para:{p_idx}"
                         )
-                        para.text = new_text
+                        new_text = self.rewrite_docx_paragraph(
+                            para,
+                            target_language,
+                            location=cell_location,
+                            do_translate=do_translate,
+                            correlation_id=correlation_id,
+                            file_metrics=metrics,
+                            state=state,
+                        )
                         text_accum += new_text + "\n"
+                        token_text += original + "\n" + new_text + "\n"
                         seg_id = self.generate_segment_id()
                         state.segment_map[seg_id] = {
                             "type": "table_cell",
-                            "location": f"docx:table:{t_idx}:row:{r_idx}:col:{c_idx}:para:{p_idx}",
+                            "location": cell_location,
                             "original": original,
                             "translated": new_text,
                             "metadata": {"format": "docx", "table_index": t_idx, "row": r_idx, "col": c_idx},
@@ -2122,7 +2323,7 @@ class TranslationBackend:
         doc.save(out_stream)
         out_stream.seek(0)
         state.output_stream = out_stream
-        tokens = self.calculate_tokens(text_accum)
+        tokens = self.calculate_tokens(token_text)
         metrics.finish_file(
             file_type="docx",
             segment_count=processed,
@@ -2163,6 +2364,7 @@ class TranslationBackend:
         total_elements = sum(len(slide.shapes) for slide in prs.slides)
         processed = 0
         text_accum = ""
+        token_text = ""
         start_time = time.time()
 
         for s_idx, slide in enumerate(prs.slides):
@@ -2198,6 +2400,7 @@ class TranslationBackend:
                 }
 
                 text_accum += new_text + "\n"
+                token_text += original_text + "\n" + new_text + "\n"
                 processed += 1
                 self.update_progress(
                     processed,
@@ -2213,7 +2416,7 @@ class TranslationBackend:
         prs.save(out_stream)
         out_stream.seek(0)
         state.output_stream = out_stream
-        tokens = self.calculate_tokens(text_accum)
+        tokens = self.calculate_tokens(token_text)
         metrics.finish_file(
             file_type="pptx",
             segment_count=processed,
@@ -2438,6 +2641,9 @@ class TranslationBackend:
         # 2) Prepare for translation overlays
         processed = 0
         start_time = time.time()
+        # Both sides of every block, so the reported token count is the real one
+        # instead of the hardcoded zero this used to show.
+        token_text = ""
         state.pdf_overlay_ocg = doc.add_ocg("Translated", on=True)
 
         # 3) Translate & redraw each block
@@ -2470,6 +2676,7 @@ class TranslationBackend:
                     )
                 )
                 state.segment_map[seg_id]["translated"] = new_text
+                token_text += original + "\n" + new_text + "\n"
 
                 last_css = self._render_pdf_block(page, bbox, new_text, run_state=state)
                 state.segment_map[seg_id]["last_css"] = last_css
@@ -2494,7 +2701,7 @@ class TranslationBackend:
         out_stream.seek(0)
         state.output_stream = out_stream
 
-        tokens = self.calculate_tokens("")  # or track actual text if desired
+        tokens = self.calculate_tokens(token_text)
         logging.info(f"[PDF] Done – {processed}/{total_blocks} blocks processed, tokens={tokens}")
         metrics.finish_file(
             file_type="pdf",
@@ -2557,7 +2764,11 @@ class TranslationBackend:
         seg_type = seg["type"]
         if seg_type in ["paragraph", "table_cell"]:
             if "object" in seg:
-                seg["object"].text = updated
+                # Same reason as process_docx: assigning .text wipes every run
+                # (and every hyperlink) in the paragraph.
+                self._overwrite_docx_paragraph(
+                    seg["object"], updated, location=seg.get("location", ""), state=state
+                )
         elif seg_type == "pptx_shape":
             if "object" in seg and hasattr(seg["object"], "text_frame") and seg["object"].text_frame:
                 seg["object"].text_frame.text = updated
@@ -2572,6 +2783,125 @@ class TranslationBackend:
         if regenerate:
             self.regenerate_output_stream(run_state=state)
         return updated
+
+    # ------------------
+    # UPLOAD VALIDATION
+    # ------------------
+    #: First bytes -> the format they actually indicate.
+    _CONTENT_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+        (b"%PDF", "pdf"),
+        (b"PK\x03\x04", "zip"),
+        (b"PK\x05\x06", "zip"),
+        (b"PK\x07\x08", "zip"),
+        (b"\x89PNG\r\n\x1a\n", "png"),
+        (b"\xff\xd8\xff", "jpg"),
+        (b"GIF87a", "gif"),
+        (b"GIF89a", "gif"),
+        (b"{\\rtf", "rtf"),
+        (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "legacy Office (.doc/.xls/.ppt)"),
+    )
+
+    #: Extension -> the content family it must have.
+    _EXPECTED_CONTENT = {
+        "docx": "zip",
+        "pptx": "zip",
+        "pdf": "pdf",
+        "png": "png",
+        "jpg": "jpg",
+        "jpeg": "jpg",
+        "webp": "webp",
+    }
+
+    _FRIENDLY_CONTENT = {
+        "pdf": "a PDF",
+        "zip": "a ZIP archive",
+        "png": "a PNG image",
+        "jpg": "a JPEG image",
+        "gif": "a GIF image",
+        "webp": "a WebP image",
+        "rtf": "an RTF document",
+    }
+
+    @classmethod
+    def _sniff_content(cls, head: bytes) -> str | None:
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "webp"
+        for signature, name in cls._CONTENT_SIGNATURES:
+            if head.startswith(signature):
+                return name
+        return None
+
+    @classmethod
+    def validate_upload(cls, input_stream, file_extension: str, file_name: str | None = None) -> None:
+        """Raise a ValueError that names the file AND the real problem.
+
+        Covers the two cases that used to be indistinguishable to a user:
+        a 0-byte file, and a file whose contents do not match its extension.
+        """
+        import zipfile
+
+        ext = (file_extension or "").lower().lstrip(".")
+        label = f'"{file_name}"' if file_name else "This file"
+
+        if not hasattr(input_stream, "read") or not hasattr(input_stream, "seek"):
+            return
+        position = input_stream.tell()
+        try:
+            input_stream.seek(0, 2)
+            size = input_stream.tell()
+            input_stream.seek(0)
+            head = input_stream.read(16)
+            if size == 0:
+                raise ValueError(
+                    f"{label} is empty (0 bytes), so there is nothing to translate. "
+                    "It was probably not saved or not fully uploaded. Re-export it and try again."
+                )
+
+            expected = cls._EXPECTED_CONTENT.get(ext)
+            if expected is None:
+                return
+            actual = cls._sniff_content(head)
+            if actual != expected:
+                described = cls._FRIENDLY_CONTENT.get(actual, actual and f"a {actual} file")
+                if described:
+                    raise ValueError(
+                        f"{label} is named .{ext}, but its contents are {described}. "
+                        f"Rename it to the correct extension, or upload the real .{ext} file."
+                    )
+                raise ValueError(
+                    f"{label} is named .{ext}, but its contents are not a valid .{ext} file "
+                    "(the header is unrecognised). It may be corrupted or only partly uploaded."
+                )
+
+            if ext in {"docx", "pptx"}:
+                input_stream.seek(0)
+                markers = {"docx": "word/document.xml", "pptx": "ppt/presentation.xml"}
+                try:
+                    names = set(zipfile.ZipFile(input_stream).namelist())
+                except zipfile.BadZipFile:
+                    raise ValueError(
+                        f"{label} is a damaged .{ext} file: the Office package inside it "
+                        "could not be opened. Re-save it from Word/PowerPoint and try again."
+                    ) from None
+                if markers[ext] not in names:
+                    other = next(
+                        (o for o, m in markers.items() if o != ext and m in names), None
+                    )
+                    if other:
+                        raise ValueError(
+                            f"{label} is named .{ext}, but it is actually a .{other} file. "
+                            f"Rename it to .{other} and upload it again."
+                        )
+                    raise ValueError(
+                        f"{label} is a ZIP archive, but not a .{ext} document "
+                        "(it has no Office content inside). Upload the document itself, "
+                        "not a zipped folder."
+                    )
+        finally:
+            try:
+                input_stream.seek(position)
+            except Exception:  # pragma: no cover - non-seekable exotic streams
+                pass
 
     # ------------------
     # ROUTING
@@ -2591,13 +2921,19 @@ class TranslationBackend:
         job_id: str | None = None,
         run_state: TranslationRunState | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
+        file_name: str | None = None,
     ):
         self.reset_cancel(job_id)
+        # Dispatching on the extension alone let an empty file and a mislabeled
+        # file surface the same raw python-docx "File is not a zip file". Sniff
+        # first so each problem gets its own, specific message.
+        self.validate_upload(input_stream, file_extension, file_name=file_name)
         state = self._resolve_run_state(job_id=job_id, run_state=run_state)
         if job_id is None and run_state is None:
             state = TranslationRunState()
         # Per-run state must not leak across sequential requests.
         state.segment_map.clear()
+        state.fidelity_notes.clear()
         state.current_document = None
         state.current_presentation = None
         state.current_pdf = None
