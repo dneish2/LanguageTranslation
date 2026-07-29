@@ -95,7 +95,8 @@ def test_text_mode_happy_path_updates_progress_and_result(monkeypatch):
     progress = DummyProgress()
     label = DummyLabel()
 
-    monkeypatch.setattr(ui_app.backend, "translate_text", lambda text, lang: f"{lang}:{text}")
+    monkeypatch.setattr(ui_app.backend, "translate_live",
+                        lambda text, lang, profile=None: (f"{lang}:{text}", "hosted:test"))
 
     rendered = {}
     ui_app.show_mobile_voice_result = lambda original, translated, language: rendered.update(
@@ -104,7 +105,7 @@ def test_text_mode_happy_path_updates_progress_and_result(monkeypatch):
         language=language,
     )
 
-    ui_app._run_mobile_voice_translation("hello", "German", progress, label)
+    ui_app._run_mobile_text_translation("hello", "German", progress, label)
 
     assert progress.values == [40, 100]
     assert label.text == "Translation complete."
@@ -425,9 +426,9 @@ def test_mobile_voice_translation_failure_offers_retry_via_start_mobile_translat
     ui_app = _build_mobile_ui()
     captured = {}
     ui_app.show_error = lambda error, retry=None: captured.update(error=error, retry=retry)
-    ui_app.backend.translate_text = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    ui_app.backend.translate_live = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
 
-    ui_app._run_mobile_voice_translation("hello", "German", DummyProgress(), DummyLabel())
+    ui_app._run_mobile_text_translation("hello", "German", DummyProgress(), DummyLabel())
 
     assert "boom" in str(captured["error"])
     assert captured["retry"] == ui_app.start_mobile_translation

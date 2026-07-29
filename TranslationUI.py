@@ -6,7 +6,7 @@ import json
 import time
 import secrets
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace as dataclass_replace
 from io import BytesIO
 from pathlib import Path
 from threading import Lock, Thread
@@ -29,6 +29,7 @@ from TranslationBackend import (
     TranslationBackend,
     TranslationRunState,
     SUPPORTED_DOCUMENT_EXTENSIONS,
+    current_cache_scope,
     ollama_suits_translation,
     probe_local_llm,
 )
@@ -494,6 +495,11 @@ class TranslationUI(VoicePageMixin):
         if mode in {"Text", "Document", "Image/Camera"}:
             self.input_mode = mode
             self.mobile_input_mode = mode
+        # Pin this browser's cache partition HERE, while a request context (and
+        # therefore the browser cookie) still exists. Every workspace button
+        # runs in an event handler, where that lookup would otherwise fall
+        # through to the shared partition. See session_cache_scope.
+        self.session_cache_scope
         self._inject_theme()
         self._inject_api_token()
         self._inject_workspace_text_live_translation_js()
@@ -825,8 +831,15 @@ class TranslationUI(VoicePageMixin):
                         ui.spinner(size="sm")
                         ui.label("Running every engine…").classes(theme.DATA)
                     candidates = self.backend.comparison_candidates(self.active_profile)
-                    results = await asyncio.to_thread(
-                        self.backend.compare_translations, text, target.value or "Spanish", candidates)
+                    # Event handler: no request context, so a scope resolved
+                    # inside the worker collapses to the shared partition and
+                    # this page's translations become readable by every other
+                    # session. Pin it here (asyncio.to_thread copies the
+                    # context, so the override travels with the call).
+                    with self.backend.cache_scope(self.session_cache_scope):
+                        results = await asyncio.to_thread(
+                            self.backend.compare_translations, text,
+                            target.value or "Spanish", candidates)
                     render(results)
                     run_row.clear()
                     with run_row:
@@ -1238,13 +1251,17 @@ class TranslationUI(VoicePageMixin):
             # Passage's own hosted key even for a user who had pointed the app
             # at their own endpoint — their photo went to the wrong place.
             profile = self.active_profile
+            # Third fact, and the one that made the leak a LEAK rather than a
+            # mislabel: the cache partition. Resolved on this thread, applied
+            # inside the worker — see session_cache_scope and D1.
+            scope = self.session_cache_scope
 
             def image_task():
                 # Established INSIDE the worker, for the same reason
                 # queue_translation_job does it: ContextVars are per-thread.
-                with self.backend.using_profile(profile):
+                with self.backend.cache_scope(scope), self.backend.using_profile(profile):
                     self._run_mobile_image_translation(language, progress_ui, label_ui,
-                                                       recorder)
+                                                       recorder, profile)
 
             Thread(target=image_task).start()
             return
@@ -1258,41 +1275,77 @@ class TranslationUI(VoicePageMixin):
         progress_ui, label_ui = self._render_progress_ui("Translating text...")
 
         recorder = self._engine_recorder()
+        # THE PRIMARY SURFACE. Everything a worker needs about WHO is asking is
+        # bound here, on the submitting thread, and re-established inside the
+        # thread — ContextVars do not cross a thread boundary, so a worker that
+        # simply starts and calls the backend runs as nobody: no profile (a BYO
+        # user's confidential text goes to Passage's key) and no cache scope
+        # (the result lands in the process-wide "shared" partition, where the
+        # NEXT session to type the same sentence is served those exact bytes).
+        # Both of those were reproduced live on this button. The document path
+        # (start_translation_job) has always done it this way; this is that.
+        profile = self.active_profile
+        scope = self.session_cache_scope
 
-        def voice_task():
-            self._run_mobile_voice_translation(source_text, language, progress_ui,
-                                               label_ui, recorder)
+        def text_task():
+            with self.backend.cache_scope(scope), self.backend.using_profile(profile):
+                self._run_mobile_text_translation(source_text, language, progress_ui,
+                                                  label_ui, recorder, profile)
 
-        Thread(target=voice_task).start()
+        Thread(target=text_task).start()
 
-    def _run_mobile_voice_translation(self, voice_text, language, progress_ui, label_ui,
-                                      recorder=None):
+    def _run_mobile_text_translation(self, voice_text, language, progress_ui, label_ui,
+                                     recorder=None, profile=None):
+        """The workspace Text tab's Translate button.
+
+        Three things changed here, all of them consequences of "book what
+        actually ran", not preferences:
+
+        1. SURFACE. This is the Text tab. It was filed under VOICE, so /engines
+           attributed Text-tab work to a microphone the user never opened.
+        2. ENGINE. `translate_text` is the hosted-key entry point and its label
+           was a hardcoded `hosted:` literal, so a BYO session was told (and
+           billed as if) Passage's model answered. `translate_live` takes the
+           profile explicitly and RETURNS the engine that served the call, so
+           the label cannot disagree with the work.
+        3. BILLING. `translate_live` is also the keystroke preview's entry
+           point, and shares its cache partition. Typing a sentence and then
+           pressing Translate is ONE action by the user; going through the same
+           door means the button is answered from the preview's own cache
+           instead of paying a second time to translate identical bytes. The
+           receipt then says cache — nothing ran, nothing sent, not metered.
+        """
         try:
             progress_ui.set_value(40)
             label_ui.text = "Calling translation model..."
-            # translate_text always runs on Passage's own hosted key, so this
-            # is metered work — and it was invisible to /engines until now.
             translated = self._run_recorded(
                 recorder or self._engine_recorder(),
-                self.backend.translate_text, (voice_text, language),
-                surface=policy.Surface.VOICE, engine=f"hosted:{TEXT_MODEL}",
-                chars=len(voice_text or ""))
+                self.backend.translate_live, (voice_text, language, profile),
+                surface=policy.Surface.TEXT,
+                engine=self._text_engine_label(profile),
+                chars=len(voice_text or ""),
+                unwrap=lambda result: (result[0], result[1]))
             progress_ui.set_value(100)
             label_ui.text = "Translation complete."
             self.current_count = 1
             self.current_tokens = 0
             self.show_mobile_voice_result(voice_text, translated, language)
         except Exception as ex:
-            logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
+            logging.error("[UI] Workspace text translation error: %s", ex, exc_info=True)
             self.show_error(ex, retry=self.start_mobile_translation)
 
     def _run_mobile_image_translation(self, language, progress_ui, label_ui,
-                                      recorder=None):
+                                      recorder=None, profile=None):
         # `recorder` is the engine-ledger binding captured on the request
-        # thread, where session storage exists. The vision path runs on
-        # Passage's hosted key, so this is metered work — and /engines never
-        # saw it. chars come from the result: the source text is inside the
-        # photo and its length isn't knowable until the model has read it.
+        # thread, where session storage exists. chars come from the result: the
+        # source text is inside the photo and its length isn't knowable until
+        # the model has read it.
+        #
+        # The engine label is DERIVED FROM THE PROFILE THAT IS ABOUT TO BE
+        # APPLIED, exactly as the document path derives its own. It used to be
+        # the literal f"hosted:{VISION_MODEL}", which meant a BYO session whose
+        # photo went to their own endpoint was told Passage's vision model had
+        # read it, and was billed for inference Passage never bought.
         try:
             progress_ui.set_value(40)
             label_ui.text = "Reading and translating image text..."
@@ -1300,7 +1353,8 @@ class TranslationUI(VoicePageMixin):
                 recorder or self._engine_recorder(),
                 self.backend.translate_image_text_blocks,
                 (self.image_upload_bytes, self.image_upload_name, language),
-                surface=policy.Surface.IMAGE, engine=f"hosted:{VISION_MODEL}",
+                surface=policy.Surface.IMAGE,
+                engine=self._vision_engine_label(profile),
                 chars=None, chars_of=_image_source_chars,
             )
             progress_ui.set_value(100)
@@ -1474,17 +1528,23 @@ class TranslationUI(VoicePageMixin):
         # Bound here, on the request context: the poll callback that books the
         # run may have no session storage of its own.
         doc_recorder = self._engine_recorder()
-        self.active_job_id = self.backend.start_translation_job(
-            input_stream=self.uploaded_file,
-            file_extension=self.uploaded_file_extension,
-            target_language=target_language,
-            processed=processed,
-            font_size=font_size,
-            autofit=autofit,
-            correlation_id=correlation_id,
-            profile=profile,
-            file_name=self.uploaded_file_name,
-        )
+        # start_translation_job captures current_cache_scope() at submit time —
+        # but THIS is a NiceGUI event handler, with no request context to
+        # resolve one from, so the capture would have collapsed to the shared
+        # partition. Establish the session's pinned partition around the
+        # submit so the worker inherits the right one.
+        with self.backend.cache_scope(self.session_cache_scope):
+            self.active_job_id = self.backend.start_translation_job(
+                input_stream=self.uploaded_file,
+                file_extension=self.uploaded_file_extension,
+                target_language=target_language,
+                processed=processed,
+                font_size=font_size,
+                autofit=autofit,
+                correlation_id=correlation_id,
+                profile=profile,
+                file_name=self.uploaded_file_name,
+            )
 
         def poll_job():
             if not self.active_job_id:
@@ -1774,11 +1834,19 @@ class TranslationUI(VoicePageMixin):
                 return
             ui.notify("Re-­translating...", type="info")
             original = seg_info["original"]
-            new_trans = self._run_recorded(
-                self._engine_recorder(), self.backend.translate_text,
-                (original, self.current_target_language),
-                surface=policy.Surface.DOCUMENT, engine=f"hosted:{TEXT_MODEL}",
-                chars=len(original or ""))
+            # A segment re-translation is the same credential decision as the
+            # document it belongs to: the job honoured the session's endpoint,
+            # so this must too, and must be booked under whatever it honoured
+            # rather than a hosted literal.
+            profile = self.active_profile
+            with self.backend.cache_scope(self.session_cache_scope), \
+                    self.backend.using_profile(profile):
+                new_trans = self._run_recorded(
+                    self._engine_recorder(), self.backend.translate_text,
+                    (original, self.current_target_language),
+                    surface=policy.Surface.DOCUMENT,
+                    engine=self._text_engine_label(profile),
+                    chars=len(original or ""))
             self.backend.update_segment(
                 seg_id, new_trans, self.current_target_language, run_state=self.document_run_state,
             )
@@ -2041,6 +2109,42 @@ class TranslationUI(VoicePageMixin):
             return None
 
     @property
+    def session_cache_scope(self) -> str:
+        """The cache partition THIS browser session may read and write.
+
+        `current_cache_scope()` is only trustworthy where a NiceGUI request
+        context exists. A NiceGUI *event handler* (every button on the
+        workspace) runs outside one, so asking there can fall through to the
+        process-wide "shared" partition — which is not a partition at all: it
+        is the one bucket every visitor shares, and writing a translation into
+        it is how one session's confidential text ended up on another
+        session's screen.
+
+        So the scope is resolved once, on the page request where the browser
+        cookie is readable, and pinned into the same per-visitor storage that
+        holds the provider profile. Every later handler and every worker
+        thread reads the pinned value. "shared" is never pinned and never
+        returned while any better identity exists: if we cannot identify the
+        session we fabricate one rather than pool it with everyone else.
+        """
+        try:
+            store = app.storage.user
+        except RuntimeError:
+            store = None
+        if store is not None:
+            pinned = store.get("cache_scope")
+            if pinned:
+                return pinned
+        scope = current_cache_scope()
+        if scope == "shared":
+            # No cookie, no client: an unidentifiable caller gets its OWN
+            # partition, because sharing is the failure mode we are fixing.
+            scope = f"session:{uuid.uuid4()}"
+        if store is not None:
+            store["cache_scope"] = scope
+        return scope
+
+    @property
     def engine_runs(self) -> list:
         """This session's record of which engine served what. Same
         session-cookie storage as recent_threads, and degrades to a throwaway
@@ -2062,7 +2166,7 @@ class TranslationUI(VoicePageMixin):
     def _record_engine_run(self, *, surface, engine: str, latency_ms: int, chars: int,
                            runs_store: list | None = None,
                            usage_store: dict | None = None,
-                           profile=None) -> policy.EngineRun | None:
+                           profile=None, origin: str | None = None) -> policy.EngineRun | None:
         """Book one COMPLETED request against what actually served it.
 
         Everything comes from `policy.classify_run`, including whether the text
@@ -2079,6 +2183,19 @@ class TranslationUI(VoicePageMixin):
         try:
             run = policy.classify_run(engine, profile if profile is not None
                                       else self.active_profile)
+            # A cache hit is two separate facts and they must not be collapsed:
+            # WHAT HAPPENED for this request (nothing ran, nothing was sent,
+            # nobody is billed) and WHO PRODUCED THE BYTES on screen. Policy
+            # owns the first; `origin` carries the second. Naming the producer
+            # in the `engine` column while keeping cache's metering and privacy
+            # is why the receipt is built here instead of being classified from
+            # a label like "cache:hosted:…", which policy would have to guess at.
+            if origin and run.ran is policy.Ran.CACHE:
+                run = dataclass_replace(
+                    run, engine=origin,
+                    privacy=("Answered from this session's cache on this machine — no "
+                             "model ran and nothing was sent anywhere for this request. "
+                             f"These words were originally produced by {origin}."))
             engine_ledger.record_run(
                 self.engine_runs if runs_store is None else runs_store,
                 surface=str(getattr(surface, "value", surface)), run=run,
@@ -2105,51 +2222,76 @@ class TranslationUI(VoicePageMixin):
         """
         runs, used, profile = self.engine_runs, self.usage_store, self.active_profile
 
-        def record(*, surface, engine: str, latency_ms: int, chars: int):
+        def record(*, surface, engine: str, latency_ms: int, chars: int,
+                   origin: str | None = None):
             return self._record_engine_run(
                 surface=surface, engine=engine, latency_ms=latency_ms, chars=chars,
-                runs_store=runs, usage_store=used, profile=profile)
+                runs_store=runs, usage_store=used, profile=profile, origin=origin)
 
         return record
 
-    def _cache_hits(self) -> int | None:
-        """The backend's cache-hit counter, or None if it can't be read.
+    def _run_recorded(self, record, fn, args=(), *, surface, engine: str | None = None,
+                      chars: int | None = None, chars_of=None, unwrap=None):
+        """Call `fn` and book the run against what ACTUALLY served it.
 
-        `translate_text` and the vision path don't return an engine label, so
-        the only honest way to tell a cache hit from a hosted call is to watch
-        this counter across the call. Without it every re-translation of the
-        same sentence would be billed as a fresh hosted run.
-        """
-        try:
-            return int(getattr(self.backend.metrics, "cache_hits"))
-        except Exception:
-            return None
+        Cache provenance is a per-call fact read from
+        ``TranslationBackend.capture_provenance()``, never inferred. It used to
+        be inferred by sampling ``backend.metrics.cache_hits`` before and after
+        the call — a process-wide counter that every session bumps. Any other
+        session getting a keystroke cache hit during a slow vision call flipped
+        that call's receipt to "cache", i.e. the words "no model ran and
+        nothing was sent anywhere" printed over a photograph that had just been
+        base64'd to a hosted model. A shared counter cannot answer a per-call
+        question, so the counter is not consulted at all any more.
 
-    def _run_recorded(self, record, fn, args=(), *, surface, engine: str,
-                      chars: int | None = None, chars_of=None):
-        """Call `fn`, then record it under the engine that really served it —
-        downgrading to "cache" when the backend's cache answered instead.
-
+        `unwrap` is for callees that return (text, engine): the engine THEY
+        report wins over the caller's expectation, so the label can never
+        describe a different model than the one that answered.
         `chars_of` covers the image case, where the source text is inside a
         photo and its length is not knowable until the model has read it.
         """
-        before = self._cache_hits()
-        started = time.perf_counter()
-        result = fn(*args)
-        after = self._cache_hits()
+        with self.backend.capture_provenance() as provenance:
+            started = time.perf_counter()
+            result = fn(*args)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+        reported = None
+        if unwrap is not None:
+            result, reported = unwrap(result)
         if chars is None:
             try:
                 chars = int(chars_of(result)) if chars_of else 0
             except Exception:
                 chars = 0
-        label = engine
+        # Precedence, and the reasons for it:
+        #
+        #  1. `reported` — the callee returned the engine it routed to. Nothing
+        #     is closer to the truth than the function that made the call.
+        #  2. `engine` — the caller's label, DERIVED FROM THE PROFILE THAT WAS
+        #     APPLIED to this run (see _text_engine_label / _vision_engine_label),
+        #     which is how the document path has always named its runs.
+        #  3. `provenance.engine` — a fallback only, because it is the identity
+        #     of the LAST sub-call inside a multi-call operation and it is a
+        #     provider *identity*, not a user-facing name. Both matter here: an
+        #     image run is a vision read followed by a text translation, so
+        #     preferring it printed "hosted:<TEXT model>" on the receipt for a
+        #     photograph; and for a BYO endpoint it is an opaque
+        #     "endpoint:<sha256 prefix>", where the document path says
+        #     "byo:private-a". Two surfaces naming the same endpoint differently
+        #     is how a user loses the ability to check where their data went.
+        produced_by = reported or engine or provenance.engine
+        origin = None
         if not chars:
             label = "none"
-        elif before is not None and after is not None and after > before:
-            label = "cache"
+        elif provenance.from_cache:
+            # Nothing ran and nothing was sent FOR THIS REQUEST; the bytes were
+            # made earlier by `origin`. Both facts survive — see
+            # _record_engine_run.
+            label, origin = "cache", produced_by
+        else:
+            label = produced_by or "none"
         try:
-            record(surface=surface, engine=label,
-                   latency_ms=int((time.perf_counter() - started) * 1000), chars=chars)
+            record(surface=surface, engine=label, origin=origin,
+                   latency_ms=latency_ms, chars=chars)
         except Exception:
             LOGGER.debug("engine run not recorded", exc_info=True)
         return result
@@ -2318,17 +2460,49 @@ class TranslationUI(VoicePageMixin):
             # (free, and measurably faster here), hosted otherwise. The engine
             # comes back with the translation so the UI can show which model
             # answered rather than leaving the user guessing.
+            profile = self.active_profile
+            # Pin the partition while the request context still exists, and
+            # then ESTABLISH it explicitly rather than trusting the backend to
+            # rediscover it. Pinning alone left this call keyed by
+            # `_ambient_cache_scope()`, which only answers under a live NiceGUI
+            # request and falls through to the process-wide "shared" partition
+            # otherwise — and when the pinned scope was a fabricated one (an
+            # unidentifiable caller gets its own partition rather than the
+            # pool), the keystroke preview and the Translate button on the SAME
+            # session wrote into two different partitions, so the button paid a
+            # second time to translate bytes the preview had already
+            # translated.
+            scope = self.session_cache_scope
             started = time.perf_counter()
-            translated, engine = await asyncio.to_thread(
-                self.backend.translate_live,
-                cleaned_text,
-                language,
-                self.active_profile,
-            )
+            # asyncio.to_thread copies the context, so both the scope set here
+            # and the provenance record are the ones the backend sees — and no
+            # other session can reach either.
+            with self.backend.cache_scope(scope), \
+                    self.backend.capture_provenance() as provenance:
+                translated, engine = await asyncio.to_thread(
+                    self.backend.translate_live,
+                    cleaned_text,
+                    language,
+                    profile,
+                )
+            # A cache hit means NOTHING RAN and NOTHING WAS SENT. The label
+            # still names whoever produced the bytes (translate_live returns
+            # the stored label, not "cache"), but metering and the privacy
+            # sentence have to follow what happened for THIS request. Before
+            # this, a repeat keystroke on the same sentence was billed again
+            # and told the user their text had just been sent to a hosted
+            # model — neither of which occurred.
+            from_cache = provenance.from_cache and bool(cleaned_text)
             run = self._record_engine_run(
-                surface=policy.Surface.LIVE_TEXT, engine=engine,
+                surface=policy.Surface.LIVE_TEXT,
+                engine="cache" if from_cache else engine,
+                origin=engine if from_cache else None,
                 latency_ms=int((time.perf_counter() - started) * 1000),
-                chars=len(cleaned_text)) or policy.classify_run(engine, self.active_profile)
+                chars=len(cleaned_text))
+            if run is None:  # bookkeeping failed; the response still must not lie
+                run = policy.classify_run("cache" if from_cache else engine, profile)
+                if from_cache:
+                    run = dataclass_replace(run, engine=engine)
             _log_event(
                 "ui.text_translate_succeeded",
                 correlation_id=correlation_id,
@@ -2405,13 +2579,23 @@ class TranslationUI(VoicePageMixin):
         # storage is unreadable from a worker thread), applied inside it.
         profile = self.active_profile
         engine = self._text_engine_label(profile)
+        # Same two captures as everywhere else: WHO is asking (profile) and
+        # WHICH cache partition they own. The SSE generator below is resumed
+        # after the response has started, where neither is resolvable.
+        scope = self.session_cache_scope
+        recorder = self._engine_recorder()
         started = time.perf_counter()
 
         if not should_stream:
-            translated = await asyncio.to_thread(
-                self._translate_text_on_profile, cleaned_text, language, profile)
-            self._record_engine_run(
-                surface=policy.Surface.LIVE_TEXT, engine=engine,
+            with self.backend.cache_scope(scope), \
+                    self.backend.capture_provenance() as provenance:
+                translated = await asyncio.to_thread(
+                    self._translate_text_on_profile, cleaned_text, language, profile)
+            from_cache = provenance.from_cache and bool(cleaned_text)
+            recorder(
+                surface=policy.Surface.LIVE_TEXT,
+                engine="cache" if from_cache else engine,
+                origin=engine if from_cache else None,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 chars=len(cleaned_text))
             self._record_chat_thread(cleaned_text, translated, language)
@@ -2432,16 +2616,21 @@ class TranslationUI(VoicePageMixin):
         async def event_generator():
             yield f"event: start\ndata: {json.dumps({'target_language': language, 'original_text': cleaned_text, 'engine': engine})}\n\n"
             try:
-                final_text, partials = await asyncio.to_thread(
-                    self._stream_translate_text_on_profile,
-                    cleaned_text,
-                    language,
-                    profile,
-                )
+                with self.backend.cache_scope(scope), \
+                        self.backend.capture_provenance() as provenance:
+                    final_text, partials = await asyncio.to_thread(
+                        self._stream_translate_text_on_profile,
+                        cleaned_text,
+                        language,
+                        profile,
+                    )
                 for partial in partials[:-1]:
                     yield f"event: partial\ndata: {json.dumps({'translated_text': partial})}\n\n"
-                self._record_engine_run(
-                    surface=policy.Surface.LIVE_TEXT, engine=engine,
+                from_cache = provenance.from_cache and bool(cleaned_text)
+                recorder(
+                    surface=policy.Surface.LIVE_TEXT,
+                    engine="cache" if from_cache else engine,
+                    origin=engine if from_cache else None,
                     latency_ms=int((time.perf_counter() - started) * 1000),
                     chars=len(cleaned_text))
                 self._record_chat_thread(cleaned_text, final_text, language)
@@ -2467,6 +2656,19 @@ class TranslationUI(VoicePageMixin):
             return profile.describe()
         return f"hosted:{TEXT_MODEL}"
 
+    @staticmethod
+    def _vision_engine_label(profile) -> str:
+        """Name the engine an IMAGE call will ACTUALLY run on.
+
+        The same rule as _text_engine_label and for the same reason, on the
+        surface where it was still a hardcoded literal: a photo sent to the
+        user's own endpoint was booked as Passage's hosted vision model,
+        metered, and described to the user as having gone somewhere it did not.
+        """
+        if profile is not None and getattr(profile, "kind", None) != provider_profiles.KIND_APP:
+            return profile.describe()
+        return f"hosted:{VISION_MODEL}"
+
     def _translate_text_on_profile(self, text: str, language: str, profile) -> str:
         """Runs in a worker thread: contextvars do not propagate into a thread,
         so the endpoint override is established HERE, not at the route."""
@@ -2476,6 +2678,20 @@ class TranslationUI(VoicePageMixin):
     def _stream_translate_text_on_profile(self, text: str, language: str, profile):
         with self.backend.using_profile(profile):
             return self.backend.stream_translate_text(text, language)
+
+    def _run_image_on_profile(self, recorder, profile, payload: bytes, filename: str,
+                              language: str):
+        """Runs in a worker thread: the endpoint override is established HERE,
+        and the ledger label is derived from the same profile that establishes
+        it, so 'where it went' and 'what we booked' cannot disagree."""
+        with self.backend.using_profile(profile):
+            return self._run_recorded(
+                recorder, self.backend.translate_image_text_blocks,
+                (payload, filename, language),
+                surface=policy.Surface.IMAGE,
+                engine=self._vision_engine_label(profile),
+                chars=None, chars_of=_image_source_chars,
+            )
 
     async def api_image_translate(
         self,
@@ -2496,13 +2712,24 @@ class TranslationUI(VoicePageMixin):
                     headers={"X-Correlation-Id": correlation_id},
                 )
             recorder = self._engine_recorder()
-            result = await asyncio.to_thread(
-                self._run_recorded, recorder,
-                self.backend.translate_image_text_blocks,
-                (payload, file.filename or "uploaded_image", language or "es"),
-                surface=policy.Surface.IMAGE, engine=f"hosted:{VISION_MODEL}",
-                chars=None, chars_of=_image_source_chars,
-            )
+            # Same credential boundary the text route already draws, on the
+            # route that ships an entire photograph: resolved on the request
+            # context, applied inside the worker (ContextVars do not cross the
+            # to_thread boundary on their own — asyncio copies the context, but
+            # the override has to exist in it before the copy is taken, which
+            # is what this does), and the label derived from it rather than
+            # assumed hosted.
+            profile = self.active_profile
+            # Established, not merely pinned — same reason as the text route:
+            # the backend's ambient lookup only answers under a live NiceGUI
+            # request, so leaving it to rediscover the partition is how work
+            # lands in the pooled "shared" bucket.
+            scope = self.session_cache_scope
+            with self.backend.cache_scope(scope):
+                result = await asyncio.to_thread(
+                    self._run_image_on_profile, recorder, profile,
+                    payload, file.filename or "uploaded_image", language or "es",
+                )
             return JSONResponse(result, headers={"X-Correlation-Id": correlation_id})
         except ValueError as err:
             return JSONResponse(

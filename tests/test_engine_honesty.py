@@ -274,18 +274,21 @@ def test_an_unrecognised_engine_is_admitted_not_assumed_local(monkeypatch):
 # D1 / C2 — documents, images and voice were invisible to /engines entirely.
 # ---------------------------------------------------------------------------
 
-def test_a_voice_translation_is_recorded_and_metered(monkeypatch):
+def test_a_workspace_text_translation_is_recorded_and_metered(monkeypatch):
     ui_app = TranslationUI()
     runs, used = _session(monkeypatch, ui_app)
-    monkeypatch.setattr(ui_app.backend, "translate_text", lambda text, language: "hallo")
+    monkeypatch.setattr(ui_app.backend, "translate_live",
+                        lambda text, language, profile=None: ("hallo", f"hosted:{TEXT_MODEL}"))
     ui_app.show_mobile_voice_result = lambda *a, **k: None
 
     assert runs == []  # the old behaviour: "Nothing translated yet", forever
 
-    ui_app._run_mobile_voice_translation("hello there", "German", DummyProgress(), DummyLabel())
+    ui_app._run_mobile_text_translation("hello there", "German", DummyProgress(), DummyLabel())
 
     entry = engine_ledger.LedgerEntry(**runs[0])
-    assert entry.surface == "voice"
+    # The Text tab, filed under the Text tab. This row used to say "voice",
+    # so /engines attributed typing to a microphone that was never opened.
+    assert entry.surface == "text"
     assert entry.engine == f"hosted:{TEXT_MODEL}"   # which path ran
     assert entry.destination == "sent out" and entry.metered is True
     assert usage.summary(used).metered_chars == len("hello there")
@@ -381,24 +384,27 @@ def test_the_recorder_survives_a_worker_thread_without_session_storage(monkeypat
     assert len(runs) == 1 and runs[0]["chars"] == 1200
 
 
-def test_a_backend_cache_hit_downgrades_the_engine_label(monkeypatch):
-    """`translate_text` returns no engine label, so the only honest way to
-    tell a cache hit from a hosted call is the backend's own counter. Without
-    this, re-translating the same sentence bills every time."""
+def test_a_backend_cache_hit_is_unmetered_but_still_names_its_producer(monkeypatch):
+    """A cache hit is TWO facts. Nothing ran and nothing was sent for this
+    request (so: not metered, "this machine"), and the words on screen were
+    made earlier by a specific engine (so: that engine is still named).
+
+    Driven through the REAL cache — a planted entry and the real
+    `translate_live` — rather than by nudging a counter, because a counter is
+    exactly what could not answer this question: it is process-wide, so one
+    session's hit used to relabel another session's in-flight hosted call."""
     ui_app = TranslationUI()
     runs, used = _session(monkeypatch, ui_app)
 
-    def cached(text, language):
-        ui_app.backend.metrics.record_cache_hit()
-        return "hola"
-
-    monkeypatch.setattr(ui_app.backend, "translate_text", cached)
+    key = ui_app.backend._normalize_cache_key(
+        "hello there", "Spanish", mode="live", profile=None)
+    ui_app.backend._cache_put(key, "hola", f"hosted:{TEXT_MODEL}")
     ui_app.show_mobile_voice_result = lambda *a, **k: None
 
-    ui_app._run_mobile_voice_translation("hello there", "Spanish", DummyProgress(), DummyLabel())
+    ui_app._run_mobile_text_translation("hello there", "Spanish", DummyProgress(), DummyLabel())
 
     entry = engine_ledger.LedgerEntry(**runs[0])
-    assert entry.engine == "cache"          # not hosted: nothing was sent
+    assert entry.engine == f"hosted:{TEXT_MODEL}"   # who produced the bytes
     assert entry.destination == "this machine" and entry.metered is False
     assert usage.summary(used).metered_runs == 0
 
