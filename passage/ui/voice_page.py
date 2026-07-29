@@ -5,6 +5,7 @@ without redesigning the app's state model.
 """
 import asyncio
 import logging
+import time
 import uuid
 from urllib.parse import quote
 
@@ -14,8 +15,45 @@ from starlette.responses import Response
 
 import theme
 from api_security import MAX_UPLOAD_BYTES
-from passage import local_voice
+from passage import local_voice, policy
 from passage.ui.common import LANGUAGES, log_event
+
+
+def voice_engine_label(meta: dict, translation_label: str) -> str:
+    """The single engine label this recording is BOOKED against.
+
+    A voice request is three steps that each choose their own engine, but the
+    ledger row is one engine. Picking the wrong one of the three is how a
+    receipt over-claims privacy, so the rule is deliberately asymmetric:
+
+      * if ANY step ran on Passage's hosted key, the row says hosted — even
+        when the words themselves went to the user's own endpoint. Audio did
+        leave for Passage, and Passage paid for it; saying "your endpoint,
+        not metered" over that would be the over-claim.
+      * only when every step stayed on this machine is the row local.
+      * otherwise the row names the endpoint the WORDS went to, which is the
+        step a user cares about most.
+
+    `translation_label` is derived from the profile that was actually applied
+    (see TranslationUI._text_engine_label), not from meta: the backend fills
+    meta["translation"] with a hosted literal because it has never been told
+    about profiles.
+    """
+    steps = [meta.get("stt") or "hosted", translation_label, meta.get("tts") or "hosted"]
+    hosted = [s for s in steps if _is_passage_hosted(s)]
+    return hosted[0] if hosted else translation_label
+
+
+def _is_passage_hosted(step: str) -> bool:
+    """A step that ran on Passage's own key. An absent or unrecognised label
+    counts as hosted: the honest default is the one that cannot over-claim."""
+    return step == "hosted" or step.startswith(("hosted:", "app:"))
+
+
+def _recording_stayed_local(meta: dict) -> bool:
+    """True only when the AUDIO never left this machine — both the transcriber
+    and the synthesiser ran locally."""
+    return all((meta.get(step) or "hosted").startswith("local") for step in ("stt", "tts"))
 
 
 def format_engine_line(meta: dict) -> str:
@@ -658,6 +696,42 @@ class VoicePageMixin:
         # SyntaxError that silently killed this whole script block.
         ui.add_head_html(VOICE_PAGE_JS)
 
+    def _run_voice_on_profile(self, recorder, profile, data: bytes, language: str):
+        """Runs in a worker thread: the endpoint override is established HERE,
+        because ContextVars are not set by the route on this thread's behalf.
+
+        Returns the backend's (source, translation, audio, meta) tuple with
+        meta["translation"] corrected to the engine that really answered, so
+        the sentence the page prints and the row the ledger stores are built
+        from the same fact.
+        """
+        translation_label = self._text_engine_label(profile)
+        with self.backend.using_profile(profile), \
+                self.backend.capture_provenance() as provenance:
+            started = time.perf_counter()
+            source_text, translated_text, audio_out, meta = \
+                self.backend.translate_audio(data, language)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+
+        meta = dict(meta or {})
+        meta["translation"] = translation_label
+        chars = len(source_text or "")
+        label, origin = voice_engine_label(meta, translation_label), None
+        if not chars:
+            label = "none"
+        elif provenance.from_cache and _recording_stayed_local(meta):
+            # `from_cache` only ever describes the TRANSLATION step — it is
+            # written by the backend's translation cache and knows nothing
+            # about speech. Booking "cache" on the strength of it alone would
+            # print "nothing was sent anywhere" over a recording that had just
+            # been uploaded to a hosted transcriber, which is precisely the
+            # over-claim this surface exists to prevent. The label is only
+            # allowed when the audio itself never left.
+            label, origin = "cache", label
+        recorder(surface=policy.Surface.VOICE, engine=label, origin=origin,
+                 latency_ms=latency_ms, chars=chars)
+        return source_text, translated_text, audio_out, meta
+
     async def api_voice_translate(
         self,
         request: Request,
@@ -683,9 +757,27 @@ class VoicePageMixin:
                     media_type="text/plain",
                     headers={"X-Correlation-Id": correlation_id},
                 )
-            original_text, translated_text, audio_bytes, meta = await asyncio.to_thread(
-                self.backend.translate_audio, data, language
-            )
+            # The spoken path is a translation like every other surface, and
+            # until now it was the only one that ran on neither the session's
+            # endpoint nor the session's ledger:
+            #
+            #  * no `using_profile`, so a BYO user's transcript went to
+            #    Passage's key while the /voice paste-a-transcript fallback
+            #    (api_text_translate_stream) honoured their endpoint — the same
+            #    sentence spoken and pasted went to two different companies;
+            #  * no ledger call, so after Surface.VOICE lost its last producer
+            #    /engines said "Nothing translated yet" over a recording that
+            #    had been transcribed, translated and billed.
+            #
+            # Both are resolved here, on the request context, and applied
+            # inside the worker (asyncio.to_thread copies the context, but the
+            # overrides have to exist in it before the copy is taken).
+            profile = self.active_profile
+            recorder = self._engine_recorder()
+            with self.backend.cache_scope(self.session_cache_scope):
+                original_text, translated_text, audio_bytes, meta = await asyncio.to_thread(
+                    self._run_voice_on_profile, recorder, profile, data, language
+                )
             safe_original = (original_text or "")[:400]
             safe_translated = (translated_text or "")[:400]
             header_orig = quote(safe_original, safe="")
