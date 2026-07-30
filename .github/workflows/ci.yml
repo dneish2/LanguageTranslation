@@ -52,6 +52,61 @@ permissions:
   contents: read
 
 jobs:
+  # Can this PR still merge? GitHub already knows, and shows it as a banner —
+  # but a banner is not a check, so it does not appear in `gh pr checks`, in a
+  # status API rollup, or anywhere a script or an agent looks. PR #41 sat
+  # CONFLICTING with four green ticks above it, which reads as "ready".
+  #
+  # Worse, the failure is silent in the other direction too: GitHub cannot
+  # build the merge commit for a conflicting PR, so every pull_request-
+  # triggered workflow simply never fires. The deploy gate did not go red, it
+  # went ABSENT — and an absent check looks like a check that passed.
+  #
+  # This turns both symptoms into one red X with the conflicting paths named.
+  mergeable:
+    name: merges cleanly into the base branch
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The merge test needs real history on both sides, not a shallow tip.
+          fetch-depth: 0
+          # Check out the PR's own head, not GitHub's synthetic merge commit —
+          # that commit only exists when the merge already succeeds, so using
+          # it would make this job structurally incapable of failing.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Merge the base branch in a scratch tree
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git config user.name  "ci"
+          git config user.email "ci@example.invalid"
+          git fetch --no-tags origin "$BASE"
+          if git merge --no-commit --no-ff "origin/$BASE"; then
+            git merge --abort 2>/dev/null || true
+            echo "Merges cleanly into origin/$BASE." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### This branch does not merge cleanly into \`$BASE\`"
+            echo
+            echo "Conflicting paths:"
+            echo '```'
+            git diff --name-only --diff-filter=U
+            echo '```'
+            echo
+            echo "Fix it on the branch — \`git merge origin/$BASE\`, resolve, push —"
+            echo "rather than waiting for the merge button to offer it."
+            echo
+            echo "If the base branch was SQUASH-merged from this same branch, every"
+            echo "file touched by both sides conflicts as add/add even though nothing"
+            echo "is actually missing. That is the usual cause here."
+          } >> "$GITHUB_STEP_SUMMARY"
+          git merge --abort 2>/dev/null || true
+          exit 1
+
   suite:
     name: tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
