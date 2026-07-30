@@ -6,10 +6,10 @@ import json
 import time
 import secrets
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace as dataclass_replace
 from io import BytesIO
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -20,14 +20,23 @@ from starlette.responses import Response, JSONResponse, StreamingResponse
 import theme
 from api_security import ApiGuard, client_ip, gate_disabled, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES
 from TranslationBackend import (
+    LIVE_LOCAL_MODEL,
+    LIVE_LOCAL_PREFERENCE,
+    LIVE_PROBE_TTL_SECONDS,
     OLLAMA_BASE_URL,
     TEXT_MODEL,
+    VISION_MODEL,
     TranslationBackend,
     TranslationRunState,
     SUPPORTED_DOCUMENT_EXTENSIONS,
+    current_cache_scope,
+    ollama_suits_translation,
+    probe_local_llm,
 )
 from passage.ui.common import LANGUAGES, log_event as _log_event
 from passage import __version__ as passage_version
+from passage import diagnostics
+from passage import compare
 from passage import engine_ledger
 from passage import local_voice
 from passage import policy
@@ -45,6 +54,225 @@ LOGGER = logging.getLogger("translation.ui")
 # restart resets everyone's history, an acceptable tradeoff for a
 # convenience feature versus hardcoding (or persisting) a secret.
 _STORAGE_SECRET = secrets.token_urlsafe(32)
+
+
+# ─────────────────── ONE local probe, off the event loop ────────────────── #
+#
+# /api/health used to call available_local_models(), diagnostics.collect()
+# (which probes again) and choose_local_model() (which probes a third and a
+# fourth time), SYNCHRONOUSLY, from an `async def`. Measured against an
+# endpoint that accepts the connection and then says nothing: 15.31 s wall
+# clock, four outbound probes, and a 50 ms heartbeat task that recorded ZERO
+# ticks for the whole 15.31 s — the loop was blocked, so a single
+# unauthenticated GET stalled every other connected client. /diagnostics and
+# /engines had the same shape (7-8 s renders).
+#
+# Two fixes, both needed:
+#   1. the probe work runs in a thread (asyncio.to_thread), so the loop keeps
+#      serving while it waits;
+#   2. it is ONE probe per request, and everything else — the model list, the
+#      chosen model, the diagnostics section — is DERIVED from that single
+#      result instead of re-probing.
+#
+# The answer is then reused for LIVE_PROBE_TTL_SECONDS, the same 60 s window
+# the keystroke path already trusts (TranslationBackend.LIVE_PROBE_TTL_SECONDS)
+# rather than a second, differently-tuned cache. A cached diagnostic that does
+# not say how old it is would be worse than a slow one, so every consumer is
+# handed `age_seconds`/`cached` and both surfaces print it.
+
+#: Where a backend's snapshot lives. An attribute on the backend instance, not
+#: a module global keyed by id(), so the shared production backend shares one
+#: probe while a test's stub backend keeps its own.
+_SNAPSHOT_ATTR = "_passage_probe_snapshot"
+_snapshot_lock = Lock()
+
+
+def _choose_from_probe(models: list[str]) -> str | None:
+    """The model that would run, decided from an ALREADY-TAKEN probe.
+
+    Mirrors TranslationBackend.choose_local_model — explicit override wins,
+    then measured preference order, then any installed model that suits
+    translation — but reads the model list off the probe result instead of
+    issuing another HTTP call for it.
+    """
+    if LIVE_LOCAL_MODEL:
+        return LIVE_LOCAL_MODEL
+    installed = set(models)
+    for candidate in LIVE_LOCAL_PREFERENCE:
+        if candidate in installed:
+            return candidate
+    return sorted(installed)[0] if installed else None
+
+
+def _image_source_chars(result: Any) -> int:
+    """Characters of source text a photo turned out to contain.
+
+    The metered unit is source characters (passage/usage.py), and for an image
+    that number does not exist until the model has read the picture — so it is
+    counted from the result rather than guessed from the file size.
+    """
+    blocks = (result or {}).get("translated_blocks") or []
+    return sum(len(b.get("source_text") or "") for b in blocks)
+
+
+def _take_local_snapshot(backend: Any) -> dict[str, Any]:
+    """Run exactly one probe and derive everything from it. Blocking: callers
+    must run this in a thread (or accept a stale snapshot)."""
+    probe = getattr(backend, "probe_local_llm", None) or probe_local_llm
+    try:
+        report = dict(probe() or {})
+    except Exception as error:  # a dead endpoint is a finding, never a 500
+        report = {"reachable": False, "outcome": "error", "models": [],
+                  "endpoint": None, "timeout_seconds": None,
+                  "elapsed_ms": None, "detail": str(error)[:300]}
+    models = [name for name in (report.get("models") or [])
+              if "embed" not in name and ollama_suits_translation(name)]
+    # THE FORECAST IS THE ROUTER'S ANSWER, NOT A LIST OF INSTALLED MODELS.
+    # `models` deliberately still lists everything installed, because that is
+    # what diagnostics needs — but deriving the forecast from it printed "your
+    # next translation will run on X on this machine" on a server where local
+    # routing was switched off (PASSAGE_LIVE_LOCAL=0) or where
+    # PASSAGE_LIVE_LOCAL_MODEL named a model that is not pulled. probe_local_llm
+    # now answers the routing question directly, through the same
+    # usable_local_model() the live router consults, so the page cannot promise
+    # a run the router will not make. _choose_from_probe stays as the fallback
+    # for an injected probe that predates these keys.
+    can_serve = report.get("can_serve")
+    if can_serve is None:
+        chosen = _choose_from_probe(models)
+        can_serve = bool(report.get("reachable") and chosen)
+    else:
+        can_serve = bool(can_serve)
+        chosen = report.get("chosen_model") if can_serve else None
+    snapshot = {
+        "probe": report,
+        "models": models,
+        "chosen_model": chosen,
+        "can_serve": can_serve,
+        "probed_at": time.time(),
+        "ttl_seconds": LIVE_PROBE_TTL_SECONDS,
+    }
+    # Parity with available_local_models(), which records the same thing so a
+    # caller can tell "refused" from "too slow".
+    try:
+        backend.last_local_probe = report
+    except Exception:  # pragma: no cover - read-only stub
+        pass
+    with _snapshot_lock:
+        try:
+            setattr(backend, _SNAPSHOT_ATTR, snapshot)
+        except Exception:  # pragma: no cover - read-only stub
+            pass
+    return snapshot
+
+
+def _pending_snapshot() -> dict[str, Any]:
+    """What a page renders before its first probe has landed. Deliberately
+    NOT reported as reachable=False: "we have not asked yet" and "we asked and
+    nothing answered" are different facts, and collapsing them is the exact
+    mistake the probe outcomes exist to prevent."""
+    return {
+        "probe": {"reachable": None, "outcome": "probing", "models": [],
+                  "endpoint": None, "timeout_seconds": None,
+                  "elapsed_ms": None, "detail": "probe in flight"},
+        "models": [],
+        "chosen_model": None,
+        "can_serve": False,
+        "probed_at": time.time(),
+        "ttl_seconds": LIVE_PROBE_TTL_SECONDS,
+        "pending": True,
+    }
+
+
+def _fresh_snapshot(backend: Any) -> dict[str, Any] | None:
+    """The cached snapshot if it is still inside the TTL, else None. Never
+    probes, never blocks."""
+    with _snapshot_lock:
+        snapshot = getattr(backend, _SNAPSHOT_ATTR, None)
+    if not isinstance(snapshot, dict):
+        return None
+    if time.time() - snapshot["probed_at"] >= snapshot.get(
+            "ttl_seconds", LIVE_PROBE_TTL_SECONDS):
+        return None
+    return snapshot
+
+
+def _cached_snapshot(backend: Any) -> dict[str, Any] | None:
+    """The last snapshot whatever its age, or None. Never probes, never
+    blocks. Callers MUST report the age — see age_seconds()."""
+    with _snapshot_lock:
+        snapshot = getattr(backend, _SNAPSHOT_ATTR, None)
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def snapshot_age_seconds(snapshot: dict[str, Any]) -> float:
+    return max(0.0, time.time() - snapshot["probed_at"])
+
+
+def describe_snapshot_age(snapshot: dict[str, Any] | None) -> str:
+    """The freshness line both surfaces print. A cache that hides its age is
+    how a diagnostic starts lying."""
+    if snapshot is None or snapshot.get("pending"):
+        return "probing this machine now…"
+    age = snapshot_age_seconds(snapshot)
+    if age < 1.0:
+        return "probed just now"
+    return f"probed {int(age)}s ago (re-probed after {int(snapshot['ttl_seconds'])}s)"
+
+
+async def local_snapshot_async(backend: Any) -> dict[str, Any]:
+    """A snapshot without blocking the event loop: the cached one when fresh,
+    otherwise ONE probe on a worker thread."""
+    fresh = _fresh_snapshot(backend)
+    if fresh is not None:
+        return fresh
+    return await asyncio.to_thread(_take_local_snapshot, backend)
+
+
+def snapshot_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The freshness facts that ride along with any cached answer."""
+    age = snapshot_age_seconds(snapshot)
+    return {
+        "age_seconds": round(age, 3),
+        "cached": age >= 1.0,
+        # An un-landed probe has an age, but it is the age of the WAIT, not of
+        # an answer. Carried so the pasteable block can say "no answer yet"
+        # instead of dating a reading that does not exist.
+        "pending": bool(snapshot.get("pending")),
+        "ttl_seconds": snapshot["ttl_seconds"],
+        "outcome": snapshot["probe"].get("outcome"),
+        "elapsed_ms": snapshot["probe"].get("elapsed_ms"),
+    }
+
+
+class _SnapshotBackend:
+    """A read-only stand-in handed to diagnostics.collect() so it reuses the
+    snapshot's single probe instead of taking its own (collect() calls
+    ``probe_local_llm`` and ``choose_local_model`` off whatever it is given).
+
+    diagnostics.py is not modified for this — it already accepts an injected
+    probe, which is exactly the seam needed.
+    """
+
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        self._snapshot = snapshot
+
+    def probe_local_llm(self) -> dict[str, Any]:
+        return self._snapshot["probe"]
+
+    def choose_local_model(self) -> str | None:
+        return self._snapshot["chosen_model"]
+
+
+def collect_diagnostics(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """diagnostics.collect() driven by an already-taken probe, with the
+    probe's age stamped into the local_llm section so a reader can never
+    mistake a 59-second-old answer for a live one."""
+    report = diagnostics.collect(_SnapshotBackend(snapshot))
+    section = report.get("local_llm")
+    if isinstance(section, dict):
+        section.update(snapshot_payload(snapshot))
+    return report
 
 
 class TranslationUI(VoicePageMixin):
@@ -82,6 +310,11 @@ class TranslationUI(VoicePageMixin):
         # ── SEGMENT EDITING ─────────────────────────────────────────────
         self.original_segments_map: dict[str, str] = {}
         self.translated_segments_map: dict[str, str] = {}
+        # seg_id -> the live textarea element rendered by show_result(). Save All
+        # Edits reads THESE; without the registry it could only re-serialise
+        # segments the per-segment Update button had already applied, i.e. it
+        # silently discarded every in-page edit while reporting success.
+        self.segment_editors: dict[str, Any] = {}
         # This client's own document state — never read self.backend.segment_map
         # /.output_stream/etc. (those ambient properties proxy the backend's
         # SHARED self._active_run_state pointer, reassigned by get_job_result()
@@ -125,6 +358,10 @@ class TranslationUI(VoicePageMixin):
         self.image_translation_result: dict[str, Any] | None = None
         self.current_source_language = "English"
         self.current_target_language = "Spanish"
+        # Languages whose Piper voice this page load has already asked for.
+        # Per-instance, i.e. per page load, which is the right scope: the
+        # download itself is process-wide and idempotent.
+        self._voice_prefetch_requested: set[str] = set()
 
         # ── UI CONSISTENCY STANDARDS (Passage "Press" tokens, theme.py) ──
         self.button_primary_classes = theme.BTN_PRIMARY
@@ -228,6 +465,49 @@ class TranslationUI(VoicePageMixin):
 
     # ──────────────────────────────────── MAIN PAGE ─────────────────────────────────────────
 
+    def request_voice_prefetch(self, language: str | None = None) -> None:
+        """Fetch the Piper voice for the language the user is ACTUALLY
+        targeting, in the background, as soon as that language is known — and
+        again whenever it changes.
+
+        This used to fire once from main_page() with `self.current_target_language`,
+        which was always the "Spanish" hardcoded in __init__: start_ui builds a
+        FRESH TranslationUI per page load, and the prefetch ran before the
+        language input (and therefore its bind_value) existed. en_US/es_ES ship
+        with the image, so prefetch_voice no-opped every time and the fetch path
+        was unreachable for every other language — a user translating into
+        German got hosted TTS forever. The language now has to be passed in by
+        whoever knows it (the "To" input's change handler, the voice page), so
+        no caller can accidentally read a default.
+
+        Same shape as `backend.prewarm_live()`, for the same reason: a voice is
+        ~63MB, so doing it lazily at the moment someone presses speak would put
+        a minutes-long download on the request path. Here nobody is waiting.
+
+        Deliberately non-blocking and deliberately silent. `prefetch_voice`
+        returns immediately, spawns a daemon thread, no-ops when local voice is
+        off / the voice is already installed / the language has no Piper voice,
+        and swallows its own failures. Page render must never wait on it, and a
+        failed download must never reach the UI - a translation that finds no
+        voice simply uses hosted TTS and names it in meta["tts"].
+        """
+        language = (language if language is not None else self.current_target_language) or ""
+        language = language.strip()
+        if not language:
+            return
+        # A change handler fires on every keystroke; one request per language
+        # per page is enough (prefetch_voice itself is idempotent, but there is
+        # no reason to hand it "G", "Ge", "Ger"... either).
+        if language.lower() in self._voice_prefetch_requested:
+            return
+        self._voice_prefetch_requested.add(language.lower())
+        try:
+            local_voice.prefetch_voice(language)
+        except Exception as error:
+            # Belt and braces: even the act of *starting* the prefetch must not
+            # be able to take the page down.
+            logging.info("[UI] voice prefetch skipped (%s)", error)
+
     def main_page(self, mode: str | None = None):
         # A fresh instance per page load (see start_ui) has no memory of what
         # mode was active on /voice — carry it across the navigation via
@@ -235,12 +515,21 @@ class TranslationUI(VoicePageMixin):
         if mode in {"Text", "Document", "Image/Camera"}:
             self.input_mode = mode
             self.mobile_input_mode = mode
+        # Pin this browser's cache partition HERE, while a request context (and
+        # therefore the browser cookie) still exists. Every workspace button
+        # runs in an event handler, where that lookup would otherwise fall
+        # through to the shared partition. See session_cache_scope.
+        self.session_cache_scope
         self._inject_theme()
         self._inject_api_token()
         self._inject_workspace_text_live_translation_js()
         # Get the local live model into VRAM while the user is still reading
         # the page, not on their first keystroke. Fire-and-forget.
         self.backend.prewarm_live()
+        # The voice prefetch deliberately does NOT happen here: at this point
+        # the "To" input does not exist yet, so the only language available is
+        # the __init__ default. It fires from the input's change handler (and
+        # once with that input's real value) — see request_voice_prefetch.
         # Header: wordmark goes home; the mode tabs are the only navigation.
         with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
             with ui.row().classes("w-full items-center gap-3"):
@@ -294,6 +583,37 @@ class TranslationUI(VoicePageMixin):
                 .classes("p-mode-tab ml-auto")\
                 .tooltip("Choose where translation runs")
 
+    @staticmethod
+    def describe_local_default(snap: dict[str, Any]) -> str:
+        """The "local default:" detail line, from the routing facts.
+
+        `chosen_model` is None whenever the router will NOT serve locally, and
+        that is three different situations: routing switched off, the named
+        model not installed / nothing installed that suits translation, and an
+        endpoint that did not answer. Rendering `chosen_model or 'none
+        installed'` asserted the one of those that is usually false — live
+        with PASSAGE_LIVE_LOCAL=0 the page printed "local default: none
+        installed" and then, in the same render, listed seven installed
+        models. "Not used" and "not there" are different claims.
+        """
+        if snap.get("pending"):
+            return "local default: still checking this machine"
+        if snap.get("chosen_model"):
+            return f"local default: {snap['chosen_model']}"
+        probe = snap.get("probe") or {}
+        if probe.get("routing_enabled") is False:
+            return "local default: not used (local routing is switched off)"
+        if probe.get("reachable") is False:
+            return "local default: not used (local engine did not answer)"
+        installed = list(probe.get("models") or []) or list(snap.get("models") or [])
+        if not installed:
+            return "local default: none installed"
+        import TranslationBackend as backend_module
+        named = getattr(backend_module, "LIVE_LOCAL_MODEL", "") or ""
+        if named:
+            return f"local default: not used ({named} is not installed)"
+        return "local default: not used (no installed model suits translation)"
+
     def engines_page(self):
         """Where your text has actually been going.
 
@@ -317,20 +637,40 @@ class TranslationUI(VoicePageMixin):
 
         profile = self.active_profile
         summary = engine_ledger.summarise(self.engine_runs)
+        # This render must not probe. It used to call choose_local_model() and
+        # available_local_models() inline — three blocking probes on the event
+        # loop, a 7.6 s render against a silent Ollama that also froze every
+        # other client. Render whatever was last probed (labelled with its
+        # age), and let a timer fill in a fresh probe from a worker thread.
+        snapshot = _cached_snapshot(self.backend) or _pending_snapshot()
         with ui.column().classes("w-full items-center p-4"):
             with ui.column().classes("w-full max-w-5xl gap-4"):
                 ui.label("Where your text goes").classes("p-display text-xl")
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
-                    ui.label("Right now").classes(theme.DATA)
-                    local_default = self.backend.choose_local_model()
-                    ui.label(policy.describe_privacy(
-                        profile, local_first_model=local_default)).classes("text-base")
-                    bits = [f"engine: {profile.describe() if profile else 'auto (local first)'}"]
-                    bits.append("metered" if policy.is_metered(
-                        profile, local_first_model=local_default) else "not metered")
-                    bits.append(f"local default: {local_default or 'none installed'}")
-                    ui.label(" · ".join(bits)).classes(theme.DATA)
+                    ui.label("Next translation").classes(theme.DATA)
+                    privacy_label = ui.label("").classes("text-base")
+                    detail_label = ui.label("").classes(theme.DATA)
+                    freshness_label = ui.label("").classes("text-xs p-muted-text")
+
+                    def render_right_now(snap: dict[str, Any]) -> None:
+                        local_default = snap["chosen_model"]
+                        # A FORECAST from a capability probe, now labelled as
+                        # one. What actually happened is the section below,
+                        # read from the ledger. This block used to be phrased
+                        # as a guarantee and could sit directly above a ledger
+                        # that contradicted it.
+                        privacy_label.set_text(policy.describe_privacy(
+                            profile, local_first_model=local_default,
+                            hosted_available=getattr(self.backend, "provider", None) is not None))
+                        bits = [f"engine: {profile.describe() if profile else 'auto (local first)'}"]
+                        bits.append("metered" if policy.is_metered(
+                            profile, local_first_model=local_default) else "not metered")
+                        bits.append(self.describe_local_default(snap))
+                        detail_label.set_text(" · ".join(bits))
+                        freshness_label.set_text(describe_snapshot_age(snap))
+
+                    render_right_now(snapshot)
                     ui.button("Change engine", on_click=self.open_engine_settings)\
                         .classes(f"{theme.BTN_SECONDARY_SM} mt-1")
 
@@ -340,16 +680,41 @@ class TranslationUI(VoicePageMixin):
                         ui.label("Nothing translated yet.").classes("text-sm p-muted-text")
                     else:
                         local, remote = summary["local"], summary["remote"]
-                        share = int(summary["local_share_of_chars"] * 100)
-                        ui.label(f"{share}% of your text stayed on this machine")\
-                            .classes("text-base")
-                        # A bar, because a ratio is the whole point and a
-                        # number makes you do the comparison yourself.
-                        with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
-                                .style("background: var(--p-rule, #d6cbb4)"):
-                            if share:
-                                ui.element("div").classes("h-full")\
-                                    .style(f"width:{share}%; background: var(--p-ok, #3F6B4A)")
+                        # The share describes the text the user actually had.
+                        # Cache hits are excluded from it (see
+                        # engine_ledger.summarise): counting a re-read as new
+                        # local characters printed "80% of your text stayed on
+                        # this machine" over a session whose every character
+                        # had been sent to a hosted model. `None` means there
+                        # was no new text to describe, and it is said rather
+                        # than rounded to a percentage nobody earned.
+                        fraction = summary["local_share_of_chars"]
+                        share = 0 if fraction is None else int(fraction * 100)
+                        if fraction is None:
+                            # Two different facts, and only one of them is
+                            # about caching. A ledger of nothing but empty
+                            # inputs (a picture-only DOCX) also has no new
+                            # characters, and claiming its answers "came from
+                            # this session's cache" describes a cache that
+                            # never happened — printed above a cache line
+                            # reading 0.
+                            ui.label(
+                                "No new text was translated this session — "
+                                "every answer came from this session's cache."
+                                if summary["cache"]["runs"]
+                                else "No text was translated this session."
+                            ).classes("text-base")
+                        else:
+                            ui.label(f"{share}% of the {summary['new_chars']} characters "
+                                     "you translated stayed on this machine")\
+                                .classes("text-base")
+                            # A bar, because a ratio is the whole point and a
+                            # number makes you do the comparison yourself.
+                            with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
+                                    .style("background: var(--p-rule, #d6cbb4)"):
+                                if share:
+                                    ui.element("div").classes("h-full")\
+                                        .style(f"width:{share}%; background: var(--p-ok, #3F6B4A)")
                         ui.label(
                             f"local: {local['runs']} runs · {local['chars']} chars"
                             + (f" · {local['median_ms']} ms median" if local["median_ms"] is not None else "")
@@ -358,20 +723,44 @@ class TranslationUI(VoicePageMixin):
                             f"sent out: {remote['runs']} runs · {remote['chars']} chars"
                             + (f" · {remote['median_ms']} ms median" if remote["median_ms"] is not None else "")
                         ).classes(theme.DATA)
+                        # Never folded into either side above: an engine label
+                        # nobody could classify is not evidence the text
+                        # stayed here, and not evidence it left.
+                        if summary["unknown"]["runs"]:
+                            ui.label(
+                                f"destination not known: {summary['unknown']['runs']} runs · "
+                                f"{summary['unknown']['chars']} chars"
+                            ).classes(theme.DATA)
+                        # Re-reads, on their own line. They are not runs of the
+                        # engine named below and they are not new text above.
+                        if summary["cache"]["runs"]:
+                            hits = summary["cache"]["runs"]
+                            ui.label(
+                                f"answered from this session's cache: {hits} "
+                                f"time{'s' if hits != 1 else ''} — no model ran and "
+                                "nothing was sent"
+                            ).classes(theme.DATA)
                         for name, count in summary["engines"].items():
                             ui.label(f"{name} — {count} run{'s' if count != 1 else ''}")\
                                 .classes(theme.DATA)
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Voice").classes(theme.DATA)
-                    ui.label(policy.describe_voice_privacy(
-                        self.current_target_language)).classes("text-base")
-                    ui.label(local_voice.describe()).classes(theme.DATA)
+                    # One probe feeds both lines. They used to be derived from
+                    # two different places, which is how the privacy sentence
+                    # came to contradict the capability line under it.
+                    voice = engine_ledger.voice_state()
+                    ui.label(voice["privacy"]).classes("text-base")
+                    ui.label(voice["detail"]).classes(theme.DATA)
 
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Metered usage").classes(theme.DATA)
                     used = usage.summary(self.usage_store)
-                    ui.label(usage.describe(used)).classes("text-base")
+                    # `total_runs` keeps the zero case honest: "everything ran
+                    # locally or on your own key" used to be printed on a
+                    # session where nothing had run at all.
+                    ui.label(usage.describe(used, total_runs=summary["total_runs"]))\
+                        .classes("text-base")
                     if used.metered_runs:
                         with ui.element("div").classes("w-full flex h-3 rounded overflow-hidden")\
                                 .style("background: var(--p-rule, #d6cbb4)"):
@@ -386,18 +775,38 @@ class TranslationUI(VoicePageMixin):
                 with ui.column().classes(f"w-full gap-2 p-4 {theme.WELL}"):
                     ui.label("Models on this machine").classes(theme.DATA)
                     bench = self._load_bench_rows()
-                    installed = self.backend.available_local_models()
-                    if not installed:
-                        ui.label("No local models reachable — everything runs hosted.")\
-                            .classes("text-sm p-muted-text")
-                    for name in installed:
-                        row = bench.get(name)
-                        detail = "not benchmarked yet"
-                        if row:
-                            detail = (f"{row.get('size_gb', 0):.1f} GB · {row.get('median_ms')} ms"
-                                      f" · agreement {row.get('consensus')}")
-                        marker = " (default)" if name == self.backend.choose_local_model() else ""
-                        ui.label(f"{name}{marker} — {detail}").classes(theme.DATA)
+                    models_box = ui.column().classes("w-full gap-1")
+
+                    def render_models(snap: dict[str, Any]) -> None:
+                        models_box.clear()
+                        with models_box:
+                            if snap.get("pending"):
+                                ui.label("Checking this machine…")\
+                                    .classes("text-sm p-muted-text")
+                                return
+                            installed = snap["models"]
+                            if not installed:
+                                ui.label("No local models reachable — everything runs hosted.")\
+                                    .classes("text-sm p-muted-text")
+                            for name in installed:
+                                row = bench.get(name)
+                                detail = "not benchmarked yet"
+                                if row:
+                                    detail = (f"{row.get('size_gb', 0):.1f} GB · {row.get('median_ms')} ms"
+                                              f" · agreement {row.get('consensus')}")
+                                marker = " (default)" if name == snap["chosen_model"] else ""
+                                ui.label(f"{name}{marker} — {detail}").classes(theme.DATA)
+
+                    render_models(snapshot)
+
+                    async def refresh_local_state() -> None:
+                        """One probe, on a worker thread, after the page is
+                        already on screen. The render never waits for it."""
+                        snap = await local_snapshot_async(self.backend)
+                        render_right_now(snap)
+                        render_models(snap)
+
+                    ui.timer(0.05, refresh_local_state, once=True)
                     ui.label(
                         "Agreement is how closely a model matches the others on a fixed "
                         "suite; it rewards the mainstream reading, so a low score is a "
@@ -507,8 +916,54 @@ class TranslationUI(VoicePageMixin):
                         ui.spinner(size="sm")
                         ui.label("Running every engine…").classes(theme.DATA)
                     candidates = self.backend.comparison_candidates(self.active_profile)
-                    results = await asyncio.to_thread(
-                        self.backend.compare_translations, text, target.value or "Spanish", candidates)
+                    # Bound here, on the request context, for the same reason
+                    # the cache scope is: the recording happens after a worker
+                    # thread call and app.storage.user is not reachable from
+                    # there.
+                    recorder = self._engine_recorder()
+                    # Event handler: no request context, so a scope resolved
+                    # inside the worker collapses to the shared partition and
+                    # this page's translations become readable by every other
+                    # session. Pin it here (asyncio.to_thread copies the
+                    # context, so the override travels with the call).
+                    with self.backend.cache_scope(self.session_cache_scope):
+                        results = await asyncio.to_thread(
+                            self.backend.compare_translations, text,
+                            target.value or "Spanish", candidates)
+                    # One row per engine. Compare is a fan-out: collapsing it
+                    # into a single "compare" run would name an engine that did
+                    # not exist and would hide the hosted call, which is
+                    # precisely the text that left the machine.
+                    #
+                    # A DELIVERED LEG IS A DISCLOSURE; AN ATTEMPTED ONE IS NOT.
+                    # `ok` is false for two unlike things and only one of them
+                    # is about where the text went. A 429, a timeout or an
+                    # empty reply happens after the bytes are handed over, so
+                    # it changes what the user GOT, not where their words WENT
+                    # — recorded, shown as sent out, and `delivered=False`
+                    # keeps it off the bill. A connection that never opened
+                    # sent nothing: `r.ok or not r.is_local` booked one anyway
+                    # and told an offline user "sent out: 1 runs · 57 chars"
+                    # while dragging the local share to 0%, about text that
+                    # never left. That is a lie to precisely the user this app
+                    # is for, so an unreached leg writes no row — the same
+                    # rule, for the same reason, as a failed LOCAL leg.
+                    #
+                    # Not filed as `unknown` either, though the ledger has that
+                    # bucket: an unknown row would sit in this fan-out's group
+                    # and pull the share off 100% for a session where nothing
+                    # was sent. Unknown is for when you cannot tell; a refusal
+                    # is knowably nothing-left.
+                    #
+                    # `text_id` ties these rows to ONE piece of the user's text
+                    # so the privacy share counts the sentence they typed, not
+                    # the sentence times the models they have installed.
+                    text_id = f"compare:{uuid.uuid4().hex}"
+                    for r in results:
+                        if r.ok or (not r.is_local and r.reached):
+                            recorder(surface=policy.Surface.COMPARE, engine=r.engine,
+                                     latency_ms=r.latency_ms or 0, chars=len(text),
+                                     delivered=r.ok, text_id=text_id)
                     render(results)
                     run_row.clear()
                     with run_row:
@@ -653,6 +1108,9 @@ class TranslationUI(VoicePageMixin):
         source = self.source_language_input.value if self.source_language_input else self.current_source_language
         target = self.target_language_input.value if self.target_language_input else self.current_target_language
         self.current_source_language, self.current_target_language = target, source
+        # The swap is a language CHANGE like any other; the new target's voice
+        # should start downloading now, not when someone presses speak.
+        self.request_voice_prefetch(self.current_target_language)
         self.refresh_upload_ui()
 
     def _describe_segment_for_editor(self, index: int, seg_info: dict) -> str:
@@ -776,6 +1234,13 @@ class TranslationUI(VoicePageMixin):
                         placeholder="Target language",
                         autocomplete=LANGUAGES,
                     ).bind_value(self, "current_target_language").classes("min-w-[120px] flex-1")
+                    # The voice for the language they are ACTUALLY targeting,
+                    # fetched now and again on every change. This is the only
+                    # place the real target language is first known on a page
+                    # load, so it is the only place the prefetch can start.
+                    self.target_language_input.on_value_change(
+                        lambda event: self.request_voice_prefetch(event.value))
+                    self.request_voice_prefetch(self.target_language_input.value)
                     self.translate_button = ui.button("Translate", on_click=self.start_mobile_translation).classes(self.button_primary_classes)
                     self.translate_button.props(f"id={self.text_status_scope}_manual_translate")
 
@@ -861,6 +1326,8 @@ class TranslationUI(VoicePageMixin):
                 type="negative",
             )
             return
+        if self._reject_oversize_upload(event.file):
+            return
         self.uploaded_file_name = name
         self.uploaded_file_extension = extension
         self.uploaded_file = BytesIO(await event.file.read())
@@ -870,6 +1337,9 @@ class TranslationUI(VoicePageMixin):
     def start_mobile_translation(self):
         language = self.target_language_input.value if self.target_language_input else self.current_target_language
         self.current_target_language = language
+        # Last-chance backstop: even if no change handler ever fired (an API
+        # caller, a restored thread), the language is unambiguous here.
+        self.request_voice_prefetch(language)
         if not language:
             self.show_error("Please enter a valid target language.")
             return
@@ -895,8 +1365,27 @@ class TranslationUI(VoicePageMixin):
             self._set_translate_button_busy(True)
             progress_ui, label_ui = self._render_progress_ui("Reading image text...")
 
+            # Bound on THIS thread, where session storage exists (see
+            # _engine_recorder): the work below runs off the event loop.
+            recorder = self._engine_recorder()
+            # Same reason, second fact: the session's ENGINE choice also only
+            # exists on this thread (active_profile reads app.storage.user),
+            # and the ContextVar the backend consults does not cross into a
+            # bare Thread. Without capturing it here the image path ran on
+            # Passage's own hosted key even for a user who had pointed the app
+            # at their own endpoint — their photo went to the wrong place.
+            profile = self.active_profile
+            # Third fact, and the one that made the leak a LEAK rather than a
+            # mislabel: the cache partition. Resolved on this thread, applied
+            # inside the worker — see session_cache_scope and D1.
+            scope = self.session_cache_scope
+
             def image_task():
-                self._run_mobile_image_translation(language, progress_ui, label_ui)
+                # Established INSIDE the worker, for the same reason
+                # queue_translation_job does it: ContextVars are per-thread.
+                with self.backend.cache_scope(scope), self.backend.using_profile(profile):
+                    self._run_mobile_image_translation(language, progress_ui, label_ui,
+                                                       recorder, profile)
 
             Thread(target=image_task).start()
             return
@@ -909,33 +1398,88 @@ class TranslationUI(VoicePageMixin):
         self._set_translate_button_busy(True)
         progress_ui, label_ui = self._render_progress_ui("Translating text...")
 
-        def voice_task():
-            self._run_mobile_voice_translation(source_text, language, progress_ui, label_ui)
+        recorder = self._engine_recorder()
+        # THE PRIMARY SURFACE. Everything a worker needs about WHO is asking is
+        # bound here, on the submitting thread, and re-established inside the
+        # thread — ContextVars do not cross a thread boundary, so a worker that
+        # simply starts and calls the backend runs as nobody: no profile (a BYO
+        # user's confidential text goes to Passage's key) and no cache scope
+        # (the result lands in the process-wide "shared" partition, where the
+        # NEXT session to type the same sentence is served those exact bytes).
+        # Both of those were reproduced live on this button. The document path
+        # (start_translation_job) has always done it this way; this is that.
+        profile = self.active_profile
+        scope = self.session_cache_scope
 
-        Thread(target=voice_task).start()
+        def text_task():
+            with self.backend.cache_scope(scope), self.backend.using_profile(profile):
+                self._run_mobile_text_translation(source_text, language, progress_ui,
+                                                  label_ui, recorder, profile)
 
-    def _run_mobile_voice_translation(self, voice_text, language, progress_ui, label_ui):
+        Thread(target=text_task).start()
+
+    def _run_mobile_text_translation(self, voice_text, language, progress_ui, label_ui,
+                                     recorder=None, profile=None):
+        """The workspace Text tab's Translate button.
+
+        Three things changed here, all of them consequences of "book what
+        actually ran", not preferences:
+
+        1. SURFACE. This is the Text tab. It was filed under VOICE, so /engines
+           attributed Text-tab work to a microphone the user never opened.
+        2. ENGINE. `translate_text` is the hosted-key entry point and its label
+           was a hardcoded `hosted:` literal, so a BYO session was told (and
+           billed as if) Passage's model answered. `translate_live` takes the
+           profile explicitly and RETURNS the engine that served the call, so
+           the label cannot disagree with the work.
+        3. BILLING. `translate_live` is also the keystroke preview's entry
+           point, and shares its cache partition. Typing a sentence and then
+           pressing Translate is ONE action by the user; going through the same
+           door means the button is answered from the preview's own cache
+           instead of paying a second time to translate identical bytes. The
+           receipt then says cache — nothing ran, nothing sent, not metered.
+        """
         try:
             progress_ui.set_value(40)
             label_ui.text = "Calling translation model..."
-            translated = self.backend.translate_text(voice_text, language)
+            translated = self._run_recorded(
+                recorder or self._engine_recorder(),
+                self.backend.translate_live, (voice_text, language, profile),
+                surface=policy.Surface.TEXT,
+                engine=self._text_engine_label(profile),
+                chars=len(voice_text or ""),
+                unwrap=lambda result: (result[0], result[1]))
             progress_ui.set_value(100)
             label_ui.text = "Translation complete."
             self.current_count = 1
             self.current_tokens = 0
             self.show_mobile_voice_result(voice_text, translated, language)
         except Exception as ex:
-            logging.error("[UI] Mobile voice translation error: %s", ex, exc_info=True)
+            logging.error("[UI] Workspace text translation error: %s", ex, exc_info=True)
             self.show_error(ex, retry=self.start_mobile_translation)
 
-    def _run_mobile_image_translation(self, language, progress_ui, label_ui):
+    def _run_mobile_image_translation(self, language, progress_ui, label_ui,
+                                      recorder=None, profile=None):
+        # `recorder` is the engine-ledger binding captured on the request
+        # thread, where session storage exists. chars come from the result: the
+        # source text is inside the photo and its length isn't knowable until
+        # the model has read it.
+        #
+        # The engine label is DERIVED FROM THE PROFILE THAT IS ABOUT TO BE
+        # APPLIED, exactly as the document path derives its own. It used to be
+        # the literal f"hosted:{VISION_MODEL}", which meant a BYO session whose
+        # photo went to their own endpoint was told Passage's vision model had
+        # read it, and was billed for inference Passage never bought.
         try:
             progress_ui.set_value(40)
             label_ui.text = "Reading and translating image text..."
-            self.image_translation_result = self.backend.translate_image_text_blocks(
-                self.image_upload_bytes,
-                self.image_upload_name,
-                language,
+            self.image_translation_result = self._run_recorded(
+                recorder or self._engine_recorder(),
+                self.backend.translate_image_text_blocks,
+                (self.image_upload_bytes, self.image_upload_name, language),
+                surface=policy.Surface.IMAGE,
+                engine=self._vision_engine_label(profile),
+                chars=None, chars_of=_image_source_chars,
             )
             progress_ui.set_value(100)
             label_ui.text = "Translation complete."
@@ -944,7 +1488,36 @@ class TranslationUI(VoicePageMixin):
             logging.error("[UI] Mobile image translation error: %s", ex, exc_info=True)
             self.show_error(ex, retry=self.start_mobile_translation)
 
+    @staticmethod
+    def upload_exceeds_limit(file_upload) -> bool:
+        """True when an upload is over MAX_UPLOAD_BYTES, asked BEFORE reading it.
+
+        The limit used to be enforced at exactly one place — the image API
+        route — and only after the whole body was already in memory. The two
+        browser upload handlers checked the extension and then did
+        ``await event.file.read()`` on anything, so a 900 MB file named .png
+        was a memory event, not a rejection. NiceGUI's FileUpload knows its
+        size without reading (bytes already in a buffer, or a stat on the
+        spooled temp file), so the answer costs nothing.
+        """
+        size = getattr(file_upload, "size", None)
+        if not callable(size):
+            return False  # unknown size: fall through to the downstream limit
+        return size() > MAX_UPLOAD_BYTES
+
+    def _reject_oversize_upload(self, file_upload) -> bool:
+        if not self.upload_exceeds_limit(file_upload):
+            return False
+        limit_mb = MAX_UPLOAD_BYTES / (1024 * 1024)
+        ui.notify(
+            f"That file is too large. The limit is {limit_mb:.0f} MB.",
+            type="negative",
+        )
+        return True
+
     async def handle_mobile_image_upload(self, event):
+        if self._reject_oversize_upload(event.file):
+            return
         self.image_upload_name = event.file.name
         self.image_upload_bytes = await event.file.read()
         ui.notify(f"Selected image '{self.image_upload_name}'", type="positive")
@@ -1076,16 +1649,26 @@ class TranslationUI(VoicePageMixin):
         # job always used the process default, so "bring your own key" quietly
         # excluded the surface that costs the most.
         profile = self.active_profile
-        self.active_job_id = self.backend.start_translation_job(
-            input_stream=self.uploaded_file,
-            file_extension=self.uploaded_file_extension,
-            target_language=target_language,
-            processed=processed,
-            font_size=font_size,
-            autofit=autofit,
-            correlation_id=correlation_id,
-            profile=profile,
-        )
+        # Bound here, on the request context: the poll callback that books the
+        # run may have no session storage of its own.
+        doc_recorder = self._engine_recorder()
+        # start_translation_job captures current_cache_scope() at submit time —
+        # but THIS is a NiceGUI event handler, with no request context to
+        # resolve one from, so the capture would have collapsed to the shared
+        # partition. Establish the session's pinned partition around the
+        # submit so the worker inherits the right one.
+        with self.backend.cache_scope(self.session_cache_scope):
+            self.active_job_id = self.backend.start_translation_job(
+                input_stream=self.uploaded_file,
+                file_extension=self.uploaded_file_extension,
+                target_language=target_language,
+                processed=processed,
+                font_size=font_size,
+                autofit=autofit,
+                correlation_id=correlation_id,
+                profile=profile,
+                file_name=self.uploaded_file_name,
+            )
 
         def poll_job():
             if not self.active_job_id:
@@ -1160,6 +1743,49 @@ class TranslationUI(VoicePageMixin):
                         output=seg_info.get("translated", ""),
                         engine=engine,
                     )
+                # The surface engine_ledger.summarise was written for ("one
+                # document is one entry but a lot of text") and the one it
+                # never saw: /engines said "Nothing translated yet" after a
+                # whole document had gone to a hosted model on Passage's key.
+                # `processed` runs are excluded because no model ran there —
+                # that path only regenerates the output file.
+                #
+                # Cache provenance, on the surface where it was still missing.
+                # This was the ONE ledger call site that booked the
+                # profile-derived label unconditionally: translating the same
+                # file twice in a session made zero outbound calls the second
+                # time and still wrote a row saying "sent to
+                # hosted:<model>, metered", i.e. printed "sent out" over text
+                # that never left the machine and billed for it twice.
+                #
+                # It cannot use capture_provenance() the way every other call
+                # site does: that record is ContextVar-scoped and the document
+                # job runs on a plain Thread, which ContextVars do not cross
+                # (start_translation_job re-establishes cache scope and profile
+                # inside the worker for exactly this reason). The job's own
+                # MetricsCollector is the per-job equivalent — created for this
+                # job in _run_translation_job and threaded through the whole
+                # file translation — NOT the process-wide backend.metrics
+                # counter whose sampling caused the original mislabelling.
+                #
+                # "Nothing was sent" requires EVERY chunk to have been a hit,
+                # so a miss anywhere keeps the run booked against the engine
+                # (the same rule as CallProvenance.from_cache). `origin` keeps
+                # the second fact: who produced these words the first time.
+                doc_metrics = result.get("metrics") or {}
+                chars = sum(len(s.get("original") or "") for s in seg_map.values())
+                served_from_cache = (int(doc_metrics.get("cache_hits") or 0) > 0
+                                     and int(doc_metrics.get("cache_misses") or 0) == 0)
+                if not chars:
+                    label, origin = "none", None
+                elif served_from_cache:
+                    label, origin = "cache", engine
+                else:
+                    label, origin = engine, None
+                doc_recorder(
+                    surface=policy.Surface.DOCUMENT, engine=label, origin=origin,
+                    latency_ms=int((time.time() - started) * 1000),
+                    chars=chars)
 
             if not processed and self.uploaded_file_name:
                 self._record_thread({
@@ -1206,6 +1832,9 @@ class TranslationUI(VoicePageMixin):
                     .classes("p-display text-2xl")
 
                 # ── SEGMENT EDITOR ──────────────────────────────
+                # Rebuilt on every render, so the registry is rebuilt too:
+                # stale elements from a previous render must never be read.
+                self.segment_editors.clear()
                 if self.advanced_mode and self.original_segments_map:
                     ui.separator().classes("my-4")
                     ui.label("Segment review").classes("p-display text-xl mb-2")
@@ -1255,6 +1884,7 @@ class TranslationUI(VoicePageMixin):
                                       .props("autogrow rows=3")\
                                       .classes(f"w-full text-sm {theme.PANEL_TARGET}")
                                     textarea.segment_id = seg_id
+                                    self.segment_editors[seg_id] = textarea
 
                                 with ui.row().classes("w-full items-center gap-2"):
                                     refine = ui.input(placeholder="Refinement instructions (optional)")\
@@ -1267,6 +1897,11 @@ class TranslationUI(VoicePageMixin):
                                               on_click=lambda _, s=seg_id, ta=textarea:
                                                 self.retranslate_segment_callback(s, ta)
                                              ).props("size=sm no-caps").classes(theme.BTN_SECONDARY_SM)
+
+                # ── FIDELITY NOTICES ────────────────────────────
+                # Formatting that could not be carried across translation is
+                # stated, not silently dropped.
+                self._render_fidelity_notes()
 
                 if self.uploaded_file_extension in {"png", "jpg", "jpeg", "webp"}:
                     ui.separator().classes("my-3")
@@ -1356,7 +1991,19 @@ class TranslationUI(VoicePageMixin):
                 return
             ui.notify("Re-­translating...", type="info")
             original = seg_info["original"]
-            new_trans = self.backend.translate_text(original, self.current_target_language)
+            # A segment re-translation is the same credential decision as the
+            # document it belongs to: the job honoured the session's endpoint,
+            # so this must too, and must be booked under whatever it honoured
+            # rather than a hosted literal.
+            profile = self.active_profile
+            with self.backend.cache_scope(self.session_cache_scope), \
+                    self.backend.using_profile(profile):
+                new_trans = self._run_recorded(
+                    self._engine_recorder(), self.backend.translate_text,
+                    (original, self.current_target_language),
+                    surface=policy.Surface.DOCUMENT,
+                    engine=self._text_engine_label(profile),
+                    chars=len(original or ""))
             self.backend.update_segment(
                 seg_id, new_trans, self.current_target_language, run_state=self.document_run_state,
             )
@@ -1439,10 +2086,104 @@ class TranslationUI(VoicePageMixin):
             logging.error(f"[UI] Error bulk approving: {ex}", exc_info=True)
             ui.notify(f"Bulk approval failed: {ex}", type="negative")
 
+    def _render_fidelity_notes(self) -> None:
+        """Show what the rewrite could NOT preserve (DOCX runs / hyperlinks)."""
+        notes = list(getattr(self.document_run_state, "fidelity_notes", []) or [])
+        if not notes:
+            return
+        grouped: dict[str, list[str]] = {}
+        for note in notes:
+            grouped.setdefault(note["message"], []).append(note["location"])
+        ui.separator().classes("my-3")
+        with ui.expansion(
+            f"Formatting notes ({len(notes)})", icon="report_problem"
+        ).classes(f"w-full {theme.WELL}"):
+            ui.label(
+                "Translated wording does not line up with the original text spans, "
+                "so some inline formatting could not be carried across:"
+            ).classes("text-sm mb-2")
+            for message, locations in grouped.items():
+                shown = ", ".join(locations[:5])
+                if len(locations) > 5:
+                    shown += f" (+{len(locations) - 5} more)"
+                ui.label(f"- {message}").classes("text-sm")
+                ui.label(shown).classes(f"{theme.DATA} text-xs mb-2")
+
     def save_all_edits(self):
+        """Apply every segment editor's CURRENT contents to the document.
+
+        This used to call regenerate_output_stream() and nothing else, which
+        re-serialised the document from segments that only the per-segment
+        Update button ever wrote. Typing in a box and pressing Save All Edits
+        therefore produced a green success toast, an unchanged download, and no
+        trace row - the edit was lost from both the document and the dataset.
+        Now the editors are the source of truth, edits are recorded as traces
+        exactly like the per-segment path, and a save with nothing to save says
+        so instead of claiming success.
+        """
         try:
+            if not self.segment_editors:
+                ui.notify(
+                    "No segment editors are open, so there is nothing to save. "
+                    "Turn on segment review to edit translations.",
+                    type="warning",
+                )
+                return
+
+            changed, failed = [], []
+            for seg_id, textarea in list(self.segment_editors.items()):
+                if seg_id not in self.document_run_state.segment_map:
+                    continue  # deleted since this render
+                current = textarea.value or ""
+                # The machine's output, captured before we overwrite it: the gap
+                # between it and the human's text is the only ground truth here.
+                machine_output = self.translated_segments_map.get(seg_id, "")
+                if current.strip() == (machine_output or "").strip():
+                    continue
+                try:
+                    updated = self.backend.update_segment(
+                        seg_id,
+                        current,
+                        self.current_target_language,
+                        regenerate=False,
+                        run_state=self.document_run_state,
+                    )
+                except Exception as seg_ex:  # one bad segment must not eat the rest
+                    logging.error(
+                        f"[UI] save_all_edits failed on {seg_id}: {seg_ex}", exc_info=True
+                    )
+                    failed.append(seg_id)
+                    continue
+                textarea.value = updated
+                self.translated_segments_map[seg_id] = updated
+                traces.record_edit(
+                    trace_id=self.document_trace_id,
+                    segment_id=seg_id,
+                    before=machine_output,
+                    after=updated,
+                )
+                changed.append(seg_id)
+
+            # Rebuild the download stream once, after the edits are in the doc.
             self.backend.regenerate_output_stream(run_state=self.document_run_state)
-            ui.notify("All edits saved to document!", type="positive")
+
+            if failed and not changed:
+                ui.notify(
+                    f"Nothing was saved: {len(failed)} segment(s) failed to apply.",
+                    type="negative",
+                )
+            elif failed:
+                ui.notify(
+                    f"Saved {len(changed)} edit(s); {len(failed)} failed and were not applied.",
+                    type="warning",
+                )
+            elif changed:
+                ui.notify(f"Saved {len(changed)} edit(s) to the document.", type="positive")
+            else:
+                ui.notify(
+                    "No changes to save - the document already matches the editors.",
+                    type="info",
+                )
         except Exception as ex:
             logging.error(f"[UI] Error saving edits: {ex}", exc_info=True)
             ui.notify(f"Save failed: {ex}", type="negative")
@@ -1525,6 +2266,42 @@ class TranslationUI(VoicePageMixin):
             return None
 
     @property
+    def session_cache_scope(self) -> str:
+        """The cache partition THIS browser session may read and write.
+
+        `current_cache_scope()` is only trustworthy where a NiceGUI request
+        context exists. A NiceGUI *event handler* (every button on the
+        workspace) runs outside one, so asking there can fall through to the
+        process-wide "shared" partition — which is not a partition at all: it
+        is the one bucket every visitor shares, and writing a translation into
+        it is how one session's confidential text ended up on another
+        session's screen.
+
+        So the scope is resolved once, on the page request where the browser
+        cookie is readable, and pinned into the same per-visitor storage that
+        holds the provider profile. Every later handler and every worker
+        thread reads the pinned value. "shared" is never pinned and never
+        returned while any better identity exists: if we cannot identify the
+        session we fabricate one rather than pool it with everyone else.
+        """
+        try:
+            store = app.storage.user
+        except RuntimeError:
+            store = None
+        if store is not None:
+            pinned = store.get("cache_scope")
+            if pinned:
+                return pinned
+        scope = current_cache_scope()
+        if scope == "shared":
+            # No cookie, no client: an unidentifiable caller gets its OWN
+            # partition, because sharing is the failure mode we are fixing.
+            scope = f"session:{uuid.uuid4()}"
+        if store is not None:
+            store["cache_scope"] = scope
+        return scope
+
+    @property
     def engine_runs(self) -> list:
         """This session's record of which engine served what. Same
         session-cookie storage as recent_threads, and degrades to a throwaway
@@ -1543,24 +2320,233 @@ class TranslationUI(VoicePageMixin):
         except RuntimeError:
             return {}
 
-    def _record_engine_run(self, *, surface, engine: str, latency_ms: int, chars: int) -> None:
+    def _record_engine_run(self, *, surface, engine: str, latency_ms: int, chars: int,
+                           runs_store: list | None = None,
+                           usage_store: dict | None = None,
+                           profile=None, origin: str | None = None,
+                           delivered: bool = True,
+                           text_id: str | None = None) -> policy.EngineRun | None:
+        """Book one COMPLETED request against what actually served it.
+
+        Everything comes from `policy.classify_run`, including whether the text
+        left the machine and whether Passage pays. This used to decide for
+        itself with `engine.startswith("local")`, which meant a cache hit —
+        nothing ran, nothing sent — was filed as "sent out" and billed, while
+        the same request's JSON body told the user it was free.
+
+        `runs_store`/`usage_store` may be passed in by a caller that already
+        has them: the mobile paths do their work on a worker thread, where
+        `app.storage.user` raises and the properties degrade to throwaway
+        containers — i.e. the record would be written to nothing.
+        """
         try:
-            is_local = engine.startswith("local")
-            engine_ledger.record(
-                self.engine_runs, surface=str(getattr(surface, "value", surface)),
-                engine=engine, is_local=is_local,
-                latency_ms=latency_ms, chars=chars, when=time.time())
-            # Only work Passage paid for reaches the counter — a local or BYO
-            # run is never recorded, not recorded-then-zeroed.
-            # The engine label already records where it actually ran, which is
-            # a stronger signal than what was configured — a hosted fallback
-            # after a local failure IS metered, and asking policy about the
-            # profile alone would miss that.
-            metered = (not is_local) and policy.is_metered(
-                self.active_profile, local_first_model=None)
-            usage.record(self.usage_store, chars=chars, metered=metered)
+            run = policy.classify_run(engine, profile if profile is not None
+                                      else self.active_profile)
+            # A cache hit is two separate facts and they must not be collapsed:
+            # WHAT HAPPENED for this request (nothing ran, nothing was sent,
+            # nobody is billed) and WHO PRODUCED THE BYTES on screen. Policy
+            # owns the first; `origin` carries the second. Naming the producer
+            # in the `engine` column while keeping cache's metering and privacy
+            # is why the receipt is built here instead of being classified from
+            # a label like "cache:hosted:…", which policy would have to guess at.
+            if origin and run.ran is policy.Ran.CACHE:
+                run = dataclass_replace(
+                    run, engine=origin,
+                    privacy=("Answered from this session's cache on this machine — no "
+                             "model ran and nothing was sent anywhere for this request. "
+                             f"These words were originally produced by {origin}."))
+            # BEING TOLD AND BEING BILLED ARE TWO DIFFERENT FACTS. `delivered`
+            # is False when the bytes reached the engine and no answer came
+            # back (a 429, a timeout, an empty reply). The text left this
+            # machine, so the row is written and the disclosure stands; the
+            # user just doesn't pay for a translation they never received.
+            # Metering is all this changes: `run.privacy` is read by exactly
+            # one surface (/api/text_translate's body) and nothing on that path
+            # can pass delivered=False, so a sentence written here would be
+            # code that renders nowhere and reads like shipped behaviour.
+            if not delivered and run.metered:
+                run = dataclass_replace(run, metered=False)
+            engine_ledger.record_run(
+                self.engine_runs if runs_store is None else runs_store,
+                surface=str(getattr(surface, "value", surface)), run=run,
+                latency_ms=latency_ms, chars=chars, when=time.time(), text_id=text_id)
+            # Only work Passage paid for reaches the counter — a local, cached
+            # or BYO run is never recorded, not recorded-then-zeroed.
+            usage.record(self.usage_store if usage_store is None else usage_store,
+                         chars=chars, metered=run.metered)
+            return run
         except Exception:  # never let bookkeeping break a translation
             LOGGER.debug("engine run not recorded", exc_info=True)
+            return None
+
+    def _engine_recorder(self):
+        """A recorder bound to THIS request's session storage, safe to call
+        from a worker thread.
+
+        Documents, images and voice all finish off the event loop, where
+        `app.storage.user` is unavailable; capturing the containers here (on
+        the request context) is what makes those surfaces visible on /engines
+        at all. Until this existed, `_record_engine_run` had exactly one call
+        site and the page said "Nothing translated yet" after a document had
+        demonstrably been sent to a hosted model on Passage's key.
+        """
+        runs, used, profile = self.engine_runs, self.usage_store, self.active_profile
+
+        def record(*, surface, engine: str, latency_ms: int, chars: int,
+                   origin: str | None = None, delivered: bool = True,
+                   text_id: str | None = None):
+            return self._record_engine_run(
+                surface=surface, engine=engine, latency_ms=latency_ms, chars=chars,
+                runs_store=runs, usage_store=used, profile=profile, origin=origin,
+                delivered=delivered, text_id=text_id)
+
+        return record
+
+    def _run_recorded(self, record, fn, args=(), *, surface, engine: str | None = None,
+                      chars: int | None = None, chars_of=None, unwrap=None):
+        """Call `fn` and book the run against what ACTUALLY served it.
+
+        Cache provenance is a per-call fact read from
+        ``TranslationBackend.capture_provenance()``, never inferred. It used to
+        be inferred by sampling ``backend.metrics.cache_hits`` before and after
+        the call — a process-wide counter that every session bumps. Any other
+        session getting a keystroke cache hit during a slow vision call flipped
+        that call's receipt to "cache", i.e. the words "no model ran and
+        nothing was sent anywhere" printed over a photograph that had just been
+        base64'd to a hosted model. A shared counter cannot answer a per-call
+        question, so the counter is not consulted at all any more.
+
+        `unwrap` is for callees that return (text, engine): the engine THEY
+        report wins over the caller's expectation, so the label can never
+        describe a different model than the one that answered.
+        `chars_of` covers the image case, where the source text is inside a
+        photo and its length is not knowable until the model has read it.
+        """
+        with self.backend.capture_provenance() as provenance:
+            started = time.perf_counter()
+            try:
+                result = fn(*args)
+            except Exception as error:
+                # A CALL THAT WAS DELIVERED AND THEN FAILED IS STILL A
+                # DISCLOSURE, and this is the one place that used to lose it.
+                # `fn` raising escaped the whole function, so the `record(...)`
+                # below never ran: photograph something with no readable text,
+                # the vision model receives the image and answers "nothing
+                # here", `TranslationBackend` raises, and /engines says
+                # "Nothing translated yet." about a photo that had
+                # demonstrably been base64'd to a hosted model on Passage's
+                # key. Booking it here — off the provenance that was written
+                # when the outbound call was made, not off state read later —
+                # is the fix for the shape, not just for that one path.
+                self._record_attempted_run(
+                    record, error, provenance, surface=surface, engine=engine,
+                    latency_ms=int((time.perf_counter() - started) * 1000))
+                raise
+            latency_ms = int((time.perf_counter() - started) * 1000)
+        reported = None
+        if unwrap is not None:
+            result, reported = unwrap(result)
+        if chars is None:
+            try:
+                chars = int(chars_of(result)) if chars_of else 0
+            except Exception:
+                chars = 0
+        # Precedence, and the reasons for it:
+        #
+        #  1. `reported` — the callee returned the engine it routed to. Nothing
+        #     is closer to the truth than the function that made the call.
+        #  2. `engine` — the caller's label, DERIVED FROM THE PROFILE THAT WAS
+        #     APPLIED to this run (see _text_engine_label / _vision_engine_label),
+        #     which is how the document path has always named its runs.
+        #  3. `provenance.engine` — a fallback only, because it is the identity
+        #     of the LAST sub-call inside a multi-call operation and it is a
+        #     provider *identity*, not a user-facing name. Both matter here: an
+        #     image run is a vision read followed by a text translation, so
+        #     preferring it printed "hosted:<TEXT model>" on the receipt for a
+        #     photograph; and for a BYO endpoint it is an opaque
+        #     "endpoint:<sha256 prefix>", where the document path says
+        #     "byo:private-a". Two surfaces naming the same endpoint differently
+        #     is how a user loses the ability to check where their data went.
+        produced_by = reported or engine or provenance.engine
+        origin = None
+        if not chars:
+            label = "none"
+        elif provenance.from_cache:
+            # Nothing ran and nothing was sent FOR THIS REQUEST; the bytes were
+            # made earlier by `origin`. Both facts survive — see
+            # _record_engine_run.
+            label, origin = "cache", produced_by
+        else:
+            label = produced_by or "none"
+        try:
+            record(surface=surface, engine=label, origin=origin,
+                   latency_ms=latency_ms, chars=chars)
+        except Exception:
+            LOGGER.debug("engine run not recorded", exc_info=True)
+        return result
+
+    def _record_attempted_run(self, record, error: BaseException, provenance, *,
+                              surface, engine: str | None, latency_ms: int) -> None:
+        """Book the disclosure owed by a call that failed AFTER its bytes left.
+
+        Four cases are deliberately silent, and each one is silent for the same
+        reason the Compare page is (see `run_comparison`'s caller): a row here
+        is a statement that the user's text is on somebody else's computer, and
+        writing one when it isn't tells an offline user their words were sent
+        out — a lie told to precisely the person who chose this app.
+
+        1. **Nothing was ever called.** THE PROOF OF DEPARTURE IS PROVENANCE,
+           NEVER THE CALLER'S `engine` ARGUMENT. That argument is derived from
+           the profile that WOULD have served the request — an expectation
+           formed before the call, which is exactly the render-time-derived
+           claim this whole class of defect is made of. Trusting it booked
+           "sent to hosted:gpt-5.4-mini" for a non-image file that was rejected
+           by validation before a single byte left. `provenance.engine` is
+           written by `_note_engine` at the point of the outbound call, so its
+           presence is evidence and its absence is too.
+        2. **It came from cache.** Nothing ran and nothing was sent for this
+           request; a later failure downstream doesn't change that.
+        3. **It ran locally.** Knowably on this machine, so there is nothing to
+           disclose. A failed local leg writes no row on the Compare page for
+           the same reason.
+        4. **The connection never opened.** `compare.reached_the_engine` reads
+           the exception chain for a connect-phase failure. DECISIONS.md §9
+           records both this rule and the residual case it still gets wrong.
+
+        Everything else is treated as delivered, because ambiguity has to err
+        towards disclosure: being told your text may have left when it didn't
+        is recoverable and the opposite is not. An unrecognised engine label is
+        included on purpose — the ledger files it under `unknown`, which is
+        reported on its own line and inflates neither the local share nor the
+        sent-out one.
+
+        `chars=0` because the amount of text is genuinely not knowable: on the
+        image path the source text is inside the photo and the model never got
+        as far as reporting it. `delivered=False` keeps the row off the bill —
+        the text left the machine, so the disclosure stands, but the user does
+        not pay for a translation they never received. That preserves the
+        "an erroring request is never metered" rule this path already had,
+        rather than trading it for the disclosure.
+        """
+        if not getattr(provenance, "engine", None) or getattr(provenance, "from_cache", False):
+            return
+        # Provenance decides WHETHER to disclose; the caller's label decides
+        # WHAT TO CALL IT. Same precedence, and the same reasons, as the
+        # success path: `provenance.engine` is a provider identity — an opaque
+        # "endpoint:<sha256 prefix>" for a BYO endpoint, and the identity of
+        # the LAST sub-call in a multi-call operation — where `engine` is the
+        # user-facing name the document path has always used. Two surfaces
+        # naming the same endpoint differently is how a user loses the ability
+        # to check where their data went.
+        produced_by = engine or provenance.engine
+        try:
+            run = policy.classify_run(produced_by, self.active_profile)
+            if run.left_machine is False or not compare.reached_the_engine(error):
+                return
+            record(surface=surface, engine=produced_by, latency_ms=latency_ms,
+                   chars=0, delivered=False)
+        except Exception:  # bookkeeping must never replace the real error
+            LOGGER.debug("attempted engine run not recorded", exc_info=True)
 
     def _set_active_profile(self, profile) -> None:
         try:
@@ -1726,17 +2712,49 @@ class TranslationUI(VoicePageMixin):
             # (free, and measurably faster here), hosted otherwise. The engine
             # comes back with the translation so the UI can show which model
             # answered rather than leaving the user guessing.
+            profile = self.active_profile
+            # Pin the partition while the request context still exists, and
+            # then ESTABLISH it explicitly rather than trusting the backend to
+            # rediscover it. Pinning alone left this call keyed by
+            # `_ambient_cache_scope()`, which only answers under a live NiceGUI
+            # request and falls through to the process-wide "shared" partition
+            # otherwise — and when the pinned scope was a fabricated one (an
+            # unidentifiable caller gets its own partition rather than the
+            # pool), the keystroke preview and the Translate button on the SAME
+            # session wrote into two different partitions, so the button paid a
+            # second time to translate bytes the preview had already
+            # translated.
+            scope = self.session_cache_scope
             started = time.perf_counter()
-            translated, engine = await asyncio.to_thread(
-                self.backend.translate_live,
-                cleaned_text,
-                language,
-                self.active_profile,
-            )
-            self._record_engine_run(
-                surface=policy.Surface.LIVE_TEXT, engine=engine,
+            # asyncio.to_thread copies the context, so both the scope set here
+            # and the provenance record are the ones the backend sees — and no
+            # other session can reach either.
+            with self.backend.cache_scope(scope), \
+                    self.backend.capture_provenance() as provenance:
+                translated, engine = await asyncio.to_thread(
+                    self.backend.translate_live,
+                    cleaned_text,
+                    language,
+                    profile,
+                )
+            # A cache hit means NOTHING RAN and NOTHING WAS SENT. The label
+            # still names whoever produced the bytes (translate_live returns
+            # the stored label, not "cache"), but metering and the privacy
+            # sentence have to follow what happened for THIS request. Before
+            # this, a repeat keystroke on the same sentence was billed again
+            # and told the user their text had just been sent to a hosted
+            # model — neither of which occurred.
+            from_cache = provenance.from_cache and bool(cleaned_text)
+            run = self._record_engine_run(
+                surface=policy.Surface.LIVE_TEXT,
+                engine="cache" if from_cache else engine,
+                origin=engine if from_cache else None,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 chars=len(cleaned_text))
+            if run is None:  # bookkeeping failed; the response still must not lie
+                run = policy.classify_run("cache" if from_cache else engine, profile)
+                if from_cache:
+                    run = dataclass_replace(run, engine=engine)
             _log_event(
                 "ui.text_translate_succeeded",
                 correlation_id=correlation_id,
@@ -1754,12 +2772,17 @@ class TranslationUI(VoicePageMixin):
                     "translated_text": translated,
                     "target_language": language,
                     "engine": engine,
-                    "privacy": policy.describe_privacy(
-                        self.active_profile,
-                        local_first_model=self.backend.choose_local_model()),
-                    "metered": policy.is_metered(
-                        self.active_profile,
-                        local_first_model=self.backend.choose_local_model()),
+                    # Both derived from the engine that ACTUALLY served this
+                    # request, never from a reachability snapshot. They used
+                    # to come from `local_snapshot["chosen_model"]`, so one
+                    # body could report engine "hosted:gpt-5.4-nano" while
+                    # promising the text ran on a local model and was not
+                    # metered. A claim about where data went has to be a
+                    # function of what ran.
+                    "privacy": run.privacy,
+                    "metered": run.metered,
+                    "ran_on": run.ran.value,
+                    "left_machine": run.left_machine,
                 },
                 headers={"X-Correlation-Id": correlation_id},
             )
@@ -1801,8 +2824,32 @@ class TranslationUI(VoicePageMixin):
         threshold = int(os.getenv("LIVE_TEXT_STREAMING_CHAR_THRESHOLD", "250"))
         should_stream = live_streaming_enabled or len(cleaned_text) >= threshold
 
+        # This endpoint used to pass NO profile, so a visitor who had
+        # configured their own endpoint had their transcript translated on
+        # PASSAGE'S key — the credential boundary the picker exists to draw,
+        # crossed silently. Resolved here, on the request context (session
+        # storage is unreadable from a worker thread), applied inside it.
+        profile = self.active_profile
+        engine = self._text_engine_label(profile)
+        # Same two captures as everywhere else: WHO is asking (profile) and
+        # WHICH cache partition they own. The SSE generator below is resumed
+        # after the response has started, where neither is resolvable.
+        scope = self.session_cache_scope
+        recorder = self._engine_recorder()
+        started = time.perf_counter()
+
         if not should_stream:
-            translated = await asyncio.to_thread(self.backend.translate_text, cleaned_text, language)
+            with self.backend.cache_scope(scope), \
+                    self.backend.capture_provenance() as provenance:
+                translated = await asyncio.to_thread(
+                    self._translate_text_on_profile, cleaned_text, language, profile)
+            from_cache = provenance.from_cache and bool(cleaned_text)
+            recorder(
+                surface=policy.Surface.LIVE_TEXT,
+                engine="cache" if from_cache else engine,
+                origin=engine if from_cache else None,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                chars=len(cleaned_text))
             self._record_chat_thread(cleaned_text, translated, language)
             return JSONResponse(
                 {
@@ -1810,30 +2857,121 @@ class TranslationUI(VoicePageMixin):
                     "original_text": cleaned_text,
                     "translated_text": translated,
                     "target_language": language,
+                    "engine": engine,
                 },
-                headers={"X-Correlation-Id": correlation_id},
+                # The /voice page has a reader for this header; until now no
+                # server code produced it, so the transcript engine line was
+                # permanently stuck on "the server did not name the engine".
+                headers={"X-Correlation-Id": correlation_id, "X-Text-Engine": engine},
             )
 
         async def event_generator():
-            yield f"event: start\ndata: {json.dumps({'target_language': language, 'original_text': cleaned_text})}\n\n"
+            yield f"event: start\ndata: {json.dumps({'target_language': language, 'original_text': cleaned_text, 'engine': engine})}\n\n"
             try:
-                final_text, partials = await asyncio.to_thread(
-                    self.backend.stream_translate_text,
-                    cleaned_text,
-                    language,
-                )
+                with self.backend.cache_scope(scope), \
+                        self.backend.capture_provenance() as provenance:
+                    final_text, partials = await asyncio.to_thread(
+                        self._stream_translate_text_on_profile,
+                        cleaned_text,
+                        language,
+                        profile,
+                    )
                 for partial in partials[:-1]:
                     yield f"event: partial\ndata: {json.dumps({'translated_text': partial})}\n\n"
+                from_cache = provenance.from_cache and bool(cleaned_text)
+                recorder(
+                    surface=policy.Surface.LIVE_TEXT,
+                    engine="cache" if from_cache else engine,
+                    origin=engine if from_cache else None,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    chars=len(cleaned_text))
                 self._record_chat_thread(cleaned_text, final_text, language)
-                yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True})}\n\n"
+                yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True, 'engine': engine})}\n\n"
             except Exception as e:
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Correlation-Id": correlation_id},
+            headers={"Cache-Control": "no-cache", "X-Correlation-Id": correlation_id,
+                     "X-Text-Engine": engine},
         )
+
+    @staticmethod
+    def _text_engine_label(profile) -> str:
+        """Name the engine a text call will ACTUALLY run on.
+
+        Derived from the profile that is about to be applied rather than
+        assumed hosted, so the label, the header and the work cannot disagree.
+        """
+        if profile is not None and getattr(profile, "kind", None) != provider_profiles.KIND_APP:
+            return profile.describe()
+        return f"hosted:{TEXT_MODEL}"
+
+    @staticmethod
+    def _vision_engine_label(profile) -> str:
+        """Name the engine an IMAGE call will ACTUALLY run on.
+
+        The same rule as _text_engine_label and for the same reason, on the
+        surface where it was still a hardcoded literal: a photo sent to the
+        user's own endpoint was booked as Passage's hosted vision model,
+        metered, and described to the user as having gone somewhere it did not.
+        """
+        if profile is not None and getattr(profile, "kind", None) != provider_profiles.KIND_APP:
+            return profile.describe()
+        return f"hosted:{VISION_MODEL}"
+
+    def _translate_text_on_profile(self, text: str, language: str, profile) -> str:
+        """Runs in a worker thread: contextvars do not propagate into a thread,
+        so the endpoint override is established HERE, not at the route."""
+        with self.backend.using_profile(profile):
+            return self.backend.translate_text(text, language)
+
+    def _stream_translate_text_on_profile(self, text: str, language: str, profile):
+        with self.backend.using_profile(profile):
+            return self.backend.stream_translate_text(text, language)
+
+    def _translate_image_as_json(self, payload: bytes, filename: str, language: str) -> dict:
+        """`translate_image_text_blocks`, in a shape JSONResponse can send.
+
+        `overlay_png` (raw PNG bytes) becomes `overlay_png_base64`, and the
+        whole payload is round-tripped through `json.dumps` here so that a
+        non-serialisable value is an exception rather than a 500 the caller
+        has already been billed for. The in-process UI path does NOT go
+        through this: it consumes the bytes directly (see
+        show_mobile_image_result), which is why every UI-driven probe of this
+        bug passed while every API call returned 500.
+        """
+        result = self.backend.translate_image_text_blocks(payload, filename, language)
+        payload_out = dict(result or {})
+        overlay = payload_out.pop("overlay_png", None)
+        payload_out["overlay_png_base64"] = (
+            base64.b64encode(overlay).decode("ascii") if overlay else None)
+        json.dumps(payload_out)
+        return payload_out
+
+    def _run_image_on_profile(self, recorder, profile, payload: bytes, filename: str,
+                              language: str):
+        """Runs in a worker thread: the endpoint override is established HERE,
+        and the ledger label is derived from the same profile that establishes
+        it, so 'where it went' and 'what we booked' cannot disagree.
+
+        The result is made JSON-safe INSIDE the recorded call, not after it.
+        `translate_image_text_blocks` returns `overlay_png` as raw PNG bytes,
+        which `JSONResponse` cannot serialise — so every image this route
+        successfully translated came back to the caller as a 500 while the
+        ledger row had already been written and metered: the user paid for an
+        error. Converting here means a payload that cannot be serialised
+        raises before `_run_recorded` books anything, so an erroring request
+        is never metered."""
+        with self.backend.using_profile(profile):
+            return self._run_recorded(
+                recorder, self._translate_image_as_json,
+                (payload, filename, language),
+                surface=policy.Surface.IMAGE,
+                engine=self._vision_engine_label(profile),
+                chars=None, chars_of=_image_source_chars,
+            )
 
     async def api_image_translate(
         self,
@@ -1853,12 +2991,25 @@ class TranslationUI(VoicePageMixin):
                     status_code=413,
                     headers={"X-Correlation-Id": correlation_id},
                 )
-            result = await asyncio.to_thread(
-                self.backend.translate_image_text_blocks,
-                payload,
-                file.filename or "uploaded_image",
-                language or "es",
-            )
+            recorder = self._engine_recorder()
+            # Same credential boundary the text route already draws, on the
+            # route that ships an entire photograph: resolved on the request
+            # context, applied inside the worker (ContextVars do not cross the
+            # to_thread boundary on their own — asyncio copies the context, but
+            # the override has to exist in it before the copy is taken, which
+            # is what this does), and the label derived from it rather than
+            # assumed hosted.
+            profile = self.active_profile
+            # Established, not merely pinned — same reason as the text route:
+            # the backend's ambient lookup only answers under a live NiceGUI
+            # request, so leaving it to rediscover the partition is how work
+            # lands in the pooled "shared" bucket.
+            scope = self.session_cache_scope
+            with self.backend.cache_scope(scope):
+                result = await asyncio.to_thread(
+                    self._run_image_on_profile, recorder, profile,
+                    payload, file.filename or "uploaded_image", language or "es",
+                )
             return JSONResponse(result, headers={"X-Correlation-Id": correlation_id})
         except ValueError as err:
             return JSONResponse(
@@ -1894,14 +3045,110 @@ class TranslationUI(VoicePageMixin):
         configured and which local models are reachable, because "up but
         unable to translate" is the failure worth catching.
         """
-        local = self.backend.available_local_models()
+        # ONE probe, on a worker thread. This route is unauthenticated by
+        # design, and the previous version took four blocking probes directly
+        # on the event loop: a single GET against an unreachable Ollama froze
+        # the whole server for 8-15 s (measured), which is a denial of service
+        # anyone could trigger. Nothing here may block the loop.
+        snapshot = await local_snapshot_async(self.backend)
+        report = await asyncio.to_thread(collect_diagnostics, snapshot)
         return JSONResponse({
             "status": "ok",
             "version": passage_version,
             "hosted_provider": self.backend.provider is not None,
-            "local_models": local,
-            "local_default": self.backend.choose_local_model(),
+            "local_models": list(snapshot["models"]),
+            "local_default": snapshot["chosen_model"],
+            # How old the local answer is. Reusing a probe is only acceptable
+            # if the reader is told; an undated cache turns a diagnostic into
+            # a confident guess.
+            "local_probe": snapshot_payload(snapshot),
+            # PORTABILITY_PLAN.md §5 Phase B. Kept alongside the original keys
+            # rather than replacing them: something out there health-checks this
+            # route, and a diagnostic is not worth breaking a deploy probe for.
+            # Ungated like the rest of /api/health, and carrying no secret and
+            # no home-directory path, so it is safe for an unauthenticated
+            # caller (see passage/diagnostics.redact_path).
+            "diagnostics": report,
         })
+
+    def diagnostics_page(self) -> None:
+        """One page a real device can answer "does this work here?" with.
+
+        The plan (§4) is blunt that real iOS Safari, real Android Chrome, OS
+        permission dialogs and actual mic hardware are NOT reachable from CI or
+        from this development machine. For those the diagnostic IS the test, so
+        this page is built to be read and copied on a phone: a plain text block,
+        a copy button, no interaction required beyond loading it.
+
+        The browser half is gathered in the browser (see
+        diagnostics.BROWSER_PROBE_JS) and merged in, because the server cannot
+        observe a secure context or the sample rate a browser granted.
+        """
+        self._inject_theme()
+        # Same rule as /engines and /api/health: no probe on the render path.
+        # This page took 7.8 s against a silent endpoint and blocked the loop
+        # for everyone while it did. Start from the last probe (its age is
+        # printed under the block) and refresh from a thread.
+        snapshot = _cached_snapshot(self.backend) or _pending_snapshot()
+        report = collect_diagnostics(snapshot)
+
+        with ui.header().classes(f"items-center {theme.HEADER} px-4 py-1"):
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.html(f'<span class="{theme.WORDMARK}">Passage<b>.</b></span>')\
+                    .on("click", lambda: ui.navigate.to("/"))
+                ui.element("div").classes("p-header-sep")
+                ui.label("Diagnostics").classes(theme.DATA)
+
+        with ui.column().classes("w-full items-center p-4"):
+            with ui.column().classes("w-full max-w-3xl gap-4"):
+                ui.label("What this machine resolved").classes("p-display text-xl")
+                ui.label(
+                    "Every line is a probe of this device, not a guess from its "
+                    "name. Copy the block and paste it back with any report."
+                ).classes("text-sm p-muted-text")
+
+                text_area = ui.markdown(
+                    f"```\n{diagnostics.format_text(report)}\n```"
+                ).classes("w-full text-xs")
+
+                state: dict[str, Any] = {"report": report}
+
+                age_label = ui.label(describe_snapshot_age(snapshot))\
+                    .classes("text-xs p-muted-text")
+
+                async def refresh_local_llm() -> None:
+                    """The local-LLM section, re-derived from ONE probe taken
+                    on a worker thread. Never blocks the page or the loop."""
+                    snap = await local_snapshot_async(self.backend)
+                    fresh = await asyncio.to_thread(collect_diagnostics, snap)
+                    fresh["browser"] = state["report"].get(
+                        "browser", diagnostics.browser_placeholder())
+                    state["report"] = fresh
+                    age_label.set_text(describe_snapshot_age(snap))
+                    text_area.set_content(
+                        f"```\n{diagnostics.format_text(fresh)}\n```")
+
+                async def gather_browser() -> None:
+                    try:
+                        browser = await ui.run_javascript(
+                            diagnostics.BROWSER_PROBE_JS, timeout=10.0)
+                    except Exception as error:  # pragma: no cover - browser only
+                        browser = {"collected": False,
+                                   "note": f"browser probe failed: {error}"}
+                    if isinstance(browser, dict):
+                        state["report"]["browser"] = browser
+                        text_area.set_content(
+                            f"```\n{diagnostics.format_text(state['report'])}\n```")
+
+                async def copy_all() -> None:
+                    payload = json.dumps(diagnostics.format_text(state["report"]))
+                    await ui.run_javascript(
+                        f"navigator.clipboard && navigator.clipboard.writeText({payload})")
+                    ui.notify("Copied")
+
+                ui.button("Copy", on_click=copy_all).classes(theme.BTN_SECONDARY_SM)
+                ui.timer(0.05, refresh_local_llm, once=True)
+                ui.timer(0.1, gather_browser, once=True)
 
 
 def start_ui() -> None:
@@ -1950,6 +3197,7 @@ def start_ui() -> None:
     ui.page("/voice")(lambda: new_page_ui().voice_translation_page())
     ui.page("/compare")(lambda: new_page_ui().compare_page())
     ui.page("/engines")(lambda: new_page_ui().engines_page())
+    ui.page("/diagnostics")(lambda: new_page_ui().diagnostics_page())
     # /mobile is retired — one responsive layout; keep old bookmarks working
     ui.page("/mobile")(lambda: ui.navigate.to("/"))
     app.add_static_files("/static", str(Path(__file__).resolve().parent / "static"))

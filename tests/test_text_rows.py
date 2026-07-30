@@ -11,15 +11,10 @@ from passage import text_rows
 
 
 def _font(size=18):
-    from PIL import ImageFont
-    for path in (r"C:\Windows\Fonts\arial.ttf",
-                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                 "/Library/Fonts/Arial.ttf"):
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
+    # Same probe the overlay itself uses, so the fixture cannot silently
+    # disagree with production about which face this machine has.
+    from image_compositor import resolve_font
+    return resolve_font(size)["font"]
 
 
 def _page(lines=6, width=400, gap=34, top=24, texture=False):

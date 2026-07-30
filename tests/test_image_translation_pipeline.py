@@ -57,6 +57,16 @@ class _Upload:
         return self._payload
 
 
+def _real_png(width: int = 40, height: int = 20) -> bytes:
+    """A genuine PNG. The pipeline now decodes the bytes BEFORE sending them
+    anywhere, so a placeholder like b"abc" is (correctly) refused as not an
+    image — see tests/test_overlay_ordering.py for that guarantee."""
+    from PIL import Image
+    buf = BytesIO()
+    Image.new("RGB", (width, height), (255, 255, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def test_backend_image_ocr_translation_success(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     ui_app = TranslationUI()
@@ -64,7 +74,7 @@ def test_backend_image_ocr_translation_success(monkeypatch):
     backend.provider = _Provider(json.dumps({"recognized_blocks": [{"text": "hello", "confidence": 0.91}]}))
     monkeypatch.setattr(backend, "translate_text", lambda text, lang: f"{lang}:{text}")
 
-    result = backend.translate_image_text_blocks(b"abc", "sample.png", "Spanish")
+    result = backend.translate_image_text_blocks(_real_png(), "sample.png", "Spanish")
 
     assert result["translated_blocks"][0]["translated_text"] == "Spanish:hello"
     assert result["confidence_metadata"]["block_count"] == 1

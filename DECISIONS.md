@@ -10,7 +10,7 @@ Anything marked **NEEDS DAVID** is genuinely blocked and must not be invented.
 
 ## 1. Whisper model size — `base` vs `small`
 
-**Resolution: keep `base`, and add a documented escape hatch.**
+**Resolution: keep `base`, and add a documented escape hatch. — IMPLEMENTED.**
 
 `base` transcribes a 6.6 s clip in 0.6 s and was accurate on the test audio. `small` is slower and
 better on accents and noise. The honest caveat: every measurement so far used a *synthetic* fixture
@@ -24,9 +24,16 @@ Act on it:
   (accents, background noise, a phone mic) and measure word error rate both ways. That is a
   half-hour of work and would replace an assumption with a fact.
 
+**As implemented:** `WHISPER_MODEL` in `passage/local_voice.py` is the single line that names a
+size anywhere in the app, defaulting to `PASSAGE_WHISPER_MODEL` or `base`. The engine label the
+user sees (`meta["stt"] == f"local:{WHISPER_MODEL}"`) is derived from the same constant, so
+changing the size changes the label with nothing else to keep in sync. The caveat is recorded in
+`RESEARCH.md` §4a, including the protocol for the WER study that would settle it. Still
+unvalidated on real speech.
+
 ## 2. Should local voice default ON when the models are installed?
 
-**Resolution: yes — default on when the models are actually present.**
+**Resolution: yes — default on when the models are actually present. — IMPLEMENTED.**
 
 It is both faster (1.51 s vs 7.62 s) and more private, so defaulting off penalises the better
 option. The original argument for off was "don't silently change where someone's audio is
@@ -42,9 +49,22 @@ Act on it:
 - `/engines` already reports voice privacy; make sure it reflects auto-detection rather than the
   raw env var.
 
+**As implemented, with two changes worth recording:**
+
+1. The tri-state accepts the obvious spellings, not just `1`/`0`. The first cut treated every
+   value other than `1`/`0` as auto, so `PASSAGE_LOCAL_VOICE=false` on a machine with the models
+   installed turned local voice **on** — a config value doing the opposite of what it says.
+   `_TRUTHY`/`_FALSEY` now cover `1/0`, `true/false`, `yes/no`, `y/n`, `on/off`, `t/f`, case- and
+   whitespace-insensitive. An unrecognised value is treated as a typo rather than a mode: it warns
+   once, `status()`/`describe()` surface it as not understood, and behaviour falls back to auto.
+2. The mode is resolved **per call**, not frozen at import. An import-time constant would have made
+   `/engines` stale the moment the fetch-on-demand helper finished a download, and would have
+   stopped tests re-probing after installing a voice.
+
 ## 3. Ship Piper voices, or fetch on demand?
 
-**Resolution: fetch on demand, and pre-fetch the current target language in the background.**
+**Resolution: fetch on demand, and pre-fetch the current target language in the background.
+— IMPLEMENTED.**
 
 Each voice is ~63 MB. Bundling several bloats the image; pure on-demand means the first use of a
 language is slow *and needs the network* — the worst possible failure for a feature whose entire
@@ -55,6 +75,22 @@ Act on it:
 - When the workspace loads and local voice is active, kick off a background fetch for the current
   target language (same pattern as `prewarm_live()` — off the render path, failures silent).
 - Never block a translation on a voice download: if it isn't there yet, use hosted TTS and say so.
+
+**As implemented, with three changes worth recording:**
+
+1. `local_voice.ensure_voice()` downloads into `models/piper/` under a per-voice lock and a
+   timeout, and `prefetch_voice()` is the fire-and-forget background wrapper.
+2. There is exactly **one** voice-presence probe, not a loose one and a strict one. The two-probe
+   version had them disagree about the same directory: `voice_file_for` returned the
+   alphabetically first `.onnx`, so a stale `es_ES-carlfm-x_low.onnx` left by a Ctrl-C'd
+   `piper.download_voices` answered forever for `es_ES-davefx-medium`. The strict probe never went
+   true even after a clean 63 MB download, so the prefetch re-downloaded on every page load while
+   the loose probe handed `synthesize()` the broken file and local TTS failed on every request.
+   The probe now selects the first *complete* `.onnx`/config pair.
+3. Prefetch is triggered from both surfaces. `TranslationUI.request_voice_prefetch()` is the
+   workspace hook (deduped per page load, since a fresh `TranslationUI` is built per load), and
+   `/voice` prefers that hook but falls back to `local_voice.prefetch_voice` directly, so `/voice`
+   cannot be the surface that silently never prefetches.
 
 ## 4. Camera overlay — coloured section headings
 
@@ -87,11 +123,148 @@ parsing) can be measured once — the distinction is whether sampling is in the 
 
 ---
 
+## 7. Session durability: NiceGUI's statefulness, and where persistence should live
+
+**Resolution: pin the Cloud Run config first; move state to a store only for what must survive.
+Not yet implemented — the config change needs a deploy, the store needs credentials.**
+
+Observed locally: long-lived sessions drop and reconnect. There are two separate causes and they
+should not be conflated.
+
+**Cause one, fixed.** NiceGUI holds a socket.io connection per client with a heartbeat on the
+asyncio event loop. Block the loop and the heartbeat stops, the browser declares the connection
+dead, and the client reconnects. `/api/health` was doing exactly that: four sequential blocking
+`urllib` probes on the loop, measured at **15.31 s wall clock with zero 50 ms heartbeat ticks**
+against an unresponsive Ollama socket. After the fix, 2.53 s and 41 ticks (median of 5, 5/5
+improved). Disconnects that clustered around a slow or stopped Ollama should be gone.
+
+**Cause two, structural and unfixed.** NiceGUI is server-stateful: UI elements live in process
+memory keyed to a client id, and `start_ui`'s `new_page_ui()` builds a fresh `TranslationUI` per
+page load. Three Cloud Run defaults are hostile to that, and the current `deploy.yml` sets none of
+them — it passes only `service`, `region`, `image` and `OPENAI_API_KEY`:
+
+| default | effect |
+|---|---|
+| request timeout 300 s | the WebSocket *is* the request, so it is killed every 5 minutes |
+| session affinity off | a reconnect can land on an instance that has none of this client's state |
+| min-instances 0 | scale-to-zero when idle takes every live session with it |
+
+Act on it, in this order:
+1. **Config, not code. — TWO OF THE THREE DONE.** `deploy.yml` now passes
+   `--timeout=3600 --session-affinity`. Both are free, and taking them separately is the point:
+   the table above lists three defaults together, which made it easy to reject all three as a
+   bundle because the third one bills. `--min-instances=1` is deliberately NOT set — it bills
+   continuously for an app with no users, and scale-to-zero taking idle sessions with it is the
+   acceptable half of that trade. Revisit it the day someone other than David is mid-document.
+   `--concurrency` is still untuned against the per-client memory cost. Cloud Run session affinity
+   is *best-effort*, so this reduces state loss rather than eliminating it. **Unverified** —
+   reasoned from documented behaviour, not observed on the real service. The honest test is to
+   deploy, open a session, and watch when it drops.
+2. **Then persist only what must survive a reconnect.** Not everything should. The current
+   cache-scope work already keys on `app.storage.browser['id']`, which is cookie-backed and does
+   survive; the translation cache is in-process and deliberately ephemeral.
+
+**What goes where, if a store lands:**
+- **Supabase (Postgres)** for per-user rows: usage/credits, saved provider profiles, thread
+  history, and `passage/traces.py` output. `passage/usage.py` was written for this — the note in
+  §5 already says `usage` becomes a read against a `passage_usage` table keyed by uid with nothing
+  above it changing. This is the higher-value half.
+- **GCS** only for blobs, and note the policy constraint: `passage/policy.py` forbids durably
+  storing an original upload. So GCS is for *derived* artifacts — a rendered overlay image, a
+  translated document a user asked to keep — never the source file. Adding a bucket without that
+  rule would quietly break a policy the app currently enforces in code.
+
+**BLOCKED on David** for the Supabase half: URL + anon key (see below). The Cloud Run flags are
+not blocked and can ship whenever a deploy is wanted.
+
+## 8. A photo with no readable text left no ledger row
+
+**Resolution: record the disclosure when the call happens, not when the result renders.
+— IMPLEMENTED.**
+
+Photograph something with nothing readable in it. The image is base64'd and sent to the hosted
+vision model, the model finds no text, and `TranslationBackend` raises
+`ValueError("No text recognized in image.")`. That exception propagated out through
+`_run_recorded` *before* the `record(...)` call at the end of it, so no ledger row was written at
+all — and `/engines` said "Nothing translated yet." after a photograph had demonstrably been sent
+to a hosted model on Passage's key.
+
+Reproduced by: running `w_launch.py` with `PROBE_NO_BLOCKS=1`, photographing/uploading any image
+on `/`, then opening `/engines`. Now covered without a browser by
+`test_a_photo_the_model_read_but_found_no_text_in_is_still_disclosed`, which drives the real route
+with the fake vision endpoint returning zero recognised blocks.
+
+It is the same class of defect as the Compare one fixed here — **a call that was DELIVERED and
+then failed is still a disclosure** — and this one qualifies: the vision model received the photo
+and answered, it just found no text. But it lives in a different place: Compare booked the row and
+filtered it out, whereas the image path never reaches its booking at all because the exception
+escapes first.
+
+**As implemented.** `_run_recorded` now catches, books, and re-raises: `_record_attempted_run`
+writes the row from the provenance that was already captured, and the original exception continues
+on untouched. Because this sits on the path every surface uses, it closes the defect at the shape
+rather than at the one place the shape was noticed — which is what makes it the last item in this
+section rather than the fourth entry in a list of three.
+
+Four cases stay silent, each for the reason the Compare page is silent about them: a row here is a
+statement that the user's text is on somebody else's computer, and writing one when it isn't tells
+an offline user their words were sent out.
+
+1. Nothing was ever called.
+2. It came from cache — nothing ran and nothing was sent for this request.
+3. It ran locally, knowably, so there is nothing to disclose.
+4. The connection never opened (`compare.reached_the_engine`, §9's rule and §9's residual).
+
+Everything else is disclosed, including an engine label policy cannot classify: that lands in the
+ledger's `unknown` bucket, which is reported on its own line and inflates neither the local share
+nor the sent-out one. The row carries `chars=0`, because the source text was inside the photo and
+the model never got as far as reporting it — unknowable, and said so rather than guessed — and
+`delivered=False`, which keeps the existing "an erroring request is never metered" rule intact
+instead of trading it away for the disclosure. The text left; the user just doesn't pay for a
+translation they never received.
+
+**One thing worth recording, because it is the same mistake one level up.** The first cut named the
+engine from `_run_recorded`'s `engine` argument, which is derived from the profile that *would*
+have served the request. That is an expectation formed before the call — precisely the
+render-time-derived claim this whole class of defect is made of — and it booked "sent to
+hosted:gpt-5.4-mini" for a non-image file that validation rejected before a single byte left. It
+was caught by an existing test (`test_an_image_request_that_errors_is_not_metered`) whose docstring
+had already stated the rule: *rejected before anything leaves, and nothing is booked.* Provenance
+is now the sole proof of departure — it is written by `_note_engine` at the point of the outbound
+call, so its presence is evidence and its absence is too — and the caller's label is used only to
+*name* what provenance says was already reached. A test that feeds in a label proves nothing;
+`tests/test_voice_and_doc_ledger.py` drives the real route against fake endpoints that count their
+own calls, so the outbound call genuinely happens and production writes its own provenance.
+
+---
+
+## 9. Where the delivered-vs-attempted line is drawn, and what it can still get wrong
+
+`/engines` discloses a leg as "sent out" when its bytes reached someone else's machine, and stays
+silent when the connection never opened — otherwise an offline session reads "sent out: 1 runs ·
+57 chars" about text that never left, which is a lie told to precisely the user who chose this
+app. The two cases are indistinguishable from `ok`, so `compare.reached_the_engine` reads the
+exception: a connect-phase failure (refused, DNS, unreachable) means nothing left; everything
+else — 429, 500, a timeout waiting for the answer, an empty reply — means it did.
+
+**The residual, accepted knowingly.** The openai SDK collapses *every* transport failure into
+`APIConnectionError` with the message "Connection error.", including the rare ones that happen
+after the connection is up and some bytes are already on the wire (a write error, a protocol
+error mid-request). Those are read here as never-sent, so a request that partially left could go
+undisclosed. It is not distinguishable without reaching into the SDK's transport, and the
+alternative — treating every "Connection error." as a disclosure — is the offline false positive
+this section exists to prevent, which is both far more common and aimed at the user who cares
+most. Ambiguity elsewhere errs the other way: anything not knowably a connect failure is treated
+as delivered.
+
+---
+
 ## NEEDS DAVID — genuinely blocked
 
 - **Supabase URL + anon key.** Auth verification is ported and live-tested against a throwaway
   project; the sign-in UI and any durable per-user storage need the real values. Both are designed
-  to be public (they ship in every browser bundle), unlike the service-role key.
+  to be public (they ship in every browser bundle), unlike the service-role key. This is also the
+  gate on §7's persistence half.
 - **Whether traces get a UI, and what it shows.** `passage/traces.py` records document runs,
   machine output and human edits, and computes edit rate per engine. What to *display* — a
   per-segment timeline, an edit-rate dashboard, an LLM-as-judge view — is a product decision, and
@@ -99,3 +272,12 @@ parsing) can be measured once — the distinction is whether sampling is in the 
 - **Second-machine benchmarks.** Every latency figure in `RESEARCH.md` is one GPU's opinion. The
   *ranking* should travel; the absolute numbers should not be quoted as portable until someone
   runs the harness elsewhere. See `PORTABILITY.md` for the Apple Silicon analysis.
+- **Local LLM inference on Apple Silicon.** CI run 30395914573 confirmed the `macos-14` runner is
+  arm64, which is the only Apple Silicon fact this project owns. The runners have no Ollama and no
+  GPU, so nothing about local model inference there is verified and none of it can be verified
+  without either a manual Ollama job or a real Mac.
+- **Real arm64 speech.** The nightly macOS `faster-whisper`/`piper` job is schedule/dispatch only
+  and has not yet run once. Until it does, real speech execution on arm64 is unverified.
+- **Real devices.** iOS Safari, Android Chrome, OS-level permission dialogs, and actual microphone
+  and camera hardware cannot be reached from CI or from this machine. `PORTABILITY_PLAN.md` §5
+  Phase E is the cheap unblock: open `/diagnostics` on a phone and on the M1 and paste the output.

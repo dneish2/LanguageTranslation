@@ -1,6 +1,7 @@
 import logging
 import os
 import base64
+import hashlib
 import re
 import string
 import sys
@@ -233,7 +234,207 @@ LIVE_LOCAL_MODEL = os.getenv("PASSAGE_LIVE_LOCAL_MODEL", "")
 #: keystroke path more than once a minute — an unreachable Ollama would
 #: otherwise add its connect timeout to every keystroke.
 LIVE_PROBE_TTL_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TTL", "60"))
-LIVE_PROBE_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TIMEOUT", "0.6"))
+#: How long to wait for a local endpoint to answer a reachability probe.
+#: 0.6s was fitted to this development machine, where Ollama answers in
+#: milliseconds. On a slower or busier machine — a laptop under load, a cold
+#: server — that expires while the endpoint is perfectly alive, and because
+#: every local path falls back to hosted silently, the resulting FALSE
+#: NEGATIVE is indistinguishable from "no local model installed". 2.5s is
+#: still bounded (the probe never runs on the render path: prewarm_live()
+#: runs it on a thread, and the answer is cached for LIVE_PROBE_TTL_SECONDS),
+#: and it is forgiving enough that a present-but-slow Ollama reads as present.
+LIVE_PROBE_TIMEOUT_SECONDS = float(os.getenv("PASSAGE_LIVE_PROBE_TIMEOUT", "2.5"))
+
+#: Probe outcomes. The point of these is that "we waited and nobody answered"
+#: and "the port actively refused" are DIFFERENT facts with different fixes —
+#: raise the timeout vs. start Ollama — and collapsing both into
+#: "unavailable" is what hid the problem in the first place.
+PROBE_OK = "ok"
+PROBE_TIMEOUT = "timeout"
+PROBE_REFUSED = "refused"
+PROBE_DNS = "dns_error"
+PROBE_HTTP_ERROR = "http_error"
+PROBE_ERROR = "error"
+
+
+def classify_probe_error(error: BaseException) -> str:
+    """Which kind of failure this was: timeout, refusal, DNS, HTTP or other.
+
+    urllib buries the real cause inside URLError.reason, sometimes two deep,
+    so unwrap before deciding. Pure function; no I/O.
+    """
+    import socket
+    import urllib.error
+
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, urllib.error.HTTPError):
+            return PROBE_HTTP_ERROR
+        if isinstance(current, (socket.timeout, TimeoutError)):
+            return PROBE_TIMEOUT
+        if isinstance(current, ConnectionRefusedError):
+            return PROBE_REFUSED
+        if isinstance(current, socket.gaierror):
+            return PROBE_DNS
+        if isinstance(current, ConnectionError):
+            return PROBE_REFUSED
+        reason = getattr(current, "reason", None)
+        current = reason if isinstance(reason, BaseException) else None
+    # Some stacks stringify the timeout rather than raising one.
+    text = str(error).lower()
+    if "timed out" in text or "timeout" in text:
+        return PROBE_TIMEOUT
+    if "refused" in text:
+        return PROBE_REFUSED
+    return PROBE_ERROR
+
+
+def probe_tcp(host: str, port: int, timeout: float) -> str:
+    """Is this port open, refused, or silent? Returns PROBE_OK/REFUSED/TIMEOUT.
+
+    Exists because of a measured Windows behaviour: a *refused* connection on
+    a socket that has a timeout set surfaces from `socket.create_connection`
+    as `TimeoutError('timed out')` after the full timeout elapses, while the
+    same connect with no timeout raises `ConnectionRefusedError(10061)` in
+    ~2s. urllib always sets a timeout, so on Windows "nothing is listening"
+    and "listening but slow" arrive identically — which would defeat the
+    entire point of recording the difference. A non-blocking connect plus a
+    select() on the exception set reports the refusal explicitly instead.
+    (Verified on Windows; the POSIX path already raised ConnectionRefusedError
+    and this agrees with it — behaviour on macOS is UNVERIFIED here.)
+    """
+    import select
+    import socket
+
+    sock = socket.socket()
+    try:
+        sock.setblocking(False)
+        err = sock.connect_ex((host, port))
+        if err == 0:
+            return PROBE_OK
+        readable, writable, exceptional = select.select([], [sock], [sock], timeout)
+        if exceptional:
+            return PROBE_REFUSED
+        if writable:
+            return PROBE_OK if sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_ERROR) == 0 else PROBE_REFUSED
+        return PROBE_TIMEOUT
+    except OSError:
+        return PROBE_REFUSED
+    finally:
+        sock.close()
+
+
+#: Budget for the follow-up "is anything listening at all?" check. Measured
+#: on Windows: a refused loopback connect takes ~2s to be reported (SYN
+#: retries), so a shorter budget would mislabel every refusal as a timeout —
+#: the exact collapse this work removes. Only ever spent when the endpoint has
+#: ALREADY failed, and the answer is then cached for LIVE_PROBE_TTL_SECONDS.
+PROBE_REFUSAL_CHECK_SECONDS = float(os.getenv("PASSAGE_PROBE_REFUSAL_CHECK", "3.0"))
+
+
+def _refine_timeout_outcome(outcome: str, endpoint: str, budget: float) -> str:
+    """Turn an ambiguous timeout into a refusal when the port is simply shut.
+
+    Cheap and bounded: only runs when the first probe already failed, and only
+    ever waits `budget` seconds.
+    """
+    if outcome != PROBE_TIMEOUT:
+        return outcome
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(endpoint)
+    if not parsed.hostname:
+        return outcome
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return PROBE_REFUSED if probe_tcp(
+        parsed.hostname, port, budget) == PROBE_REFUSED else PROBE_TIMEOUT
+
+
+def usable_local_model(installed: list[str] | tuple[str, ...] | None) -> str | None:
+    """Which local model can actually serve the NEXT live request, or None.
+
+    One function so the probe (which forecasts) and the live path (which
+    routes) cannot disagree. Two ways it says None that the old forecast
+    ignored, and which put "your next translation will run on X on this
+    machine" above "0% of your text stayed on this machine":
+
+      * live-local routing is switched off (PASSAGE_LIVE_LOCAL=0), so no local
+        model will be asked no matter what is installed;
+      * PASSAGE_LIVE_LOCAL_MODEL names a model that is NOT installed, so the
+        request will fail over to hosted on its first call.
+
+    An explicit PASSAGE_LIVE_LOCAL_MODEL still wins over the preference order
+    whenever it IS installed. `installed=None` means "not known" (the endpoint
+    could not be listed), which is itself a reason not to forecast local.
+    """
+    if not LIVE_LOCAL_ENABLED:
+        return None
+    if installed is None:
+        return None
+    names = set(installed)
+    if LIVE_LOCAL_MODEL:
+        return LIVE_LOCAL_MODEL if LIVE_LOCAL_MODEL in names else None
+    suitable = [n for n in names if "embed" not in n and ollama_suits_translation(n)]
+    for candidate in LIVE_LOCAL_PREFERENCE:
+        if candidate in suitable:
+            return candidate
+    return sorted(suitable)[0] if suitable else None
+
+
+def probe_local_llm(
+    base_url: str | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Ask the local Ollama what it has, and record HOW the answer went.
+
+    Returns a structured, importable report — this is what /diagnostics
+    consumes, and the only place the timeout/refusal distinction is made:
+
+      ``reachable``  bool
+      ``outcome``    one of PROBE_OK / PROBE_TIMEOUT / PROBE_REFUSED /
+                     PROBE_DNS / PROBE_HTTP_ERROR / PROBE_ERROR
+      ``models``     installed model tags (empty unless reachable)
+      ``endpoint``   the URL probed
+      ``timeout_seconds`` / ``elapsed_ms``
+      ``detail``     the error text, or ""
+
+    No global state is touched; safe to call from anywhere.
+    """
+    import urllib.request
+
+    base = (base_url or OLLAMA_BASE_URL).rstrip("/").removesuffix("/v1")
+    limit = LIVE_PROBE_TIMEOUT_SECONDS if timeout is None else float(timeout)
+    endpoint = f"{base}/api/tags"
+    started = time.time()
+    try:
+        with urllib.request.urlopen(endpoint, timeout=limit) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        models = [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
+        outcome, detail, reachable = PROBE_OK, "", True
+    except Exception as error:  # noqa: BLE001 - every failure is a report, not a crash
+        models, reachable = [], False
+        outcome = _refine_timeout_outcome(
+            classify_probe_error(error), endpoint, PROBE_REFUSAL_CHECK_SECONDS)
+        detail = str(error)[:300]
+    chosen = usable_local_model(models if reachable else None)
+    return {
+        "reachable": reachable,
+        "outcome": outcome,
+        "models": models,
+        "endpoint": endpoint,
+        "timeout_seconds": limit,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "detail": detail,
+        # Reachability is NOT the same question as "will the next translation
+        # actually run here". These three answer that one, and any forecast
+        # shown to a user must be derived from them:
+        "routing_enabled": LIVE_LOCAL_ENABLED,
+        "chosen_model": chosen,
+        "can_serve": bool(reachable and chosen),
+    }
 
 
 def _pixel_bbox(raw: Any, image_bytes: bytes) -> list[int] | None:
@@ -308,6 +509,18 @@ def _mask_protected_spans(text: str) -> tuple[str, list[str]]:
     return _PROTECTED_SPAN_RE.sub(take, text), spans
 
 
+#: Lenient: matches the placeholder as the model MANGLED it, not as we wrote
+#: it. Masking is a deterministic mechanism, so a restore that silently half
+#: worked must be detected rather than shipped — "[[PSG:0]]" reaching a user's
+#: screen is machinery leaking into the product.
+_PLACEHOLDER_DEBRIS_RE = re.compile(r"\[{1,2}\s*P\s*S\s*G\s*[:：]?\s*\d*\s*\]{0,2}", re.IGNORECASE)
+
+
+def detect_placeholder_debris(text: str) -> list[str]:
+    """Every placeholder-shaped fragment left in `text`. Empty when clean."""
+    return _PLACEHOLDER_DEBRIS_RE.findall(text or "")
+
+
 def _restore_protected_spans(text: str, spans: list[str]) -> str:
     """Put the original URLs/emails back. Any placeholder the model dropped or
     mangled beyond recognition simply doesn't come back — that is no worse than
@@ -325,6 +538,18 @@ def _restore_protected_spans(text: str, spans: list[str]) -> str:
             "[Backend] %d/%d protected spans survived translation",
             count, len(spans),
         )
+    # A mangled or out-of-range placeholder does not match the strict pattern,
+    # so it used to travel all the way to the user's screen as "[[PSG:0]]".
+    # Detect it here and take it out: the URL is already lost either way, and
+    # visible internals are the worse of the two failures.
+    debris = detect_placeholder_debris(restored)
+    if debris:
+        logging.error(
+            "[Backend] placeholder restore failed; removing %d leaked fragment(s): %s",
+            len(debris), debris[:5],
+        )
+        restored = _PLACEHOLDER_DEBRIS_RE.sub("", restored)
+        restored = re.sub(r"[ \t]{2,}", " ", restored)
     return restored
 
 
@@ -372,11 +597,192 @@ SUPPORTED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp"})
 #: ContextVar, not an attribute: the backend is shared by every client.
 _active_provider: ContextVar[Any] = ContextVar("passage_active_provider", default=None)
 
+#: Cache-isolation scope for the CURRENT request (see current_cache_scope).
+#: Also a ContextVar for the same reason as _active_provider: the translation
+#: cache lives on the one shared backend instance, so anything that decides who
+#: may read a cache entry has to be per-request, never an attribute.
+_active_cache_scope: ContextVar[str | None] = ContextVar("passage_cache_scope", default=None)
+
+@dataclass
+class CallProvenance:
+    """What actually served ONE specific translate call.
+
+    This exists because "was that a cache hit?" used to be inferred by sampling
+    a process-wide counter (backend.metrics.cache_hits) before and after a
+    call. That counter is bumped by every session, so a long-running vision
+    call in one session could be labelled "cache" because an unrelated session
+    got a keystroke cache hit while it was in flight — a false "no model ran
+    and nothing was sent anywhere" printed over a photograph that had just been
+    base64'd to a hosted vision model.
+
+    Provenance is therefore a per-call fact carried in a ContextVar-scoped
+    object: no other session can reach it, and it is written by the code that
+    actually served the request rather than deduced afterwards.
+
+    ``engine`` names whoever ORIGINALLY produced the bytes (a cache hit still
+    reports e.g. ``hosted:gpt-5.4-nano``); ``from_cache`` says whether anything
+    ran or was sent FOR THIS REQUEST. Metering and the privacy sentence follow
+    ``from_cache``; the displayed engine label follows ``engine``.
+    """
+
+    #: Counted, not a single flag: a document translation is many sub-calls,
+    #: and "nothing was sent for this request" is only true when EVERY one of
+    #: them was served from cache. A boolean set by the last sub-call would
+    #: report a hosted document as cached whenever its final chunk repeated.
+    cache_hits: int = 0
+    engine_runs: int = 0
+    engine: str | None = None
+
+    @property
+    def from_cache(self) -> bool:
+        """True only when this call ran nothing and sent nothing."""
+        return self.cache_hits > 0 and self.engine_runs == 0
+
+    def record_cache_hit(self, engine: str | None) -> None:
+        self.cache_hits += 1
+        if engine and self.engine is None:
+            self.engine = engine
+
+    def record_engine(self, engine: str | None) -> None:
+        self.engine_runs += 1
+        if engine:
+            self.engine = engine
+
+    def record_nothing(self, engine: str | None = "none") -> None:
+        """Empty input: no model ran, but nothing was cached either."""
+        if engine:
+            self.engine = engine
+
+
+#: Provenance sink for the call running in THIS context, or None when nobody
+#: asked (see TranslationBackend.capture_provenance).
+_call_provenance: ContextVar["CallProvenance | None"] = ContextVar(
+    "passage_call_provenance", default=None)
+
+
+def _note_cache_hit(engine: str | None) -> None:
+    sink = _call_provenance.get()
+    if sink is not None:
+        sink.record_cache_hit(engine)
+
+
+def _note_engine(engine: str | None) -> None:
+    sink = _call_provenance.get()
+    if sink is not None:
+        sink.record_engine(engine)
+
+
+@dataclass(frozen=True)
+class TranslationResult:
+    """A translation together with its per-call provenance."""
+
+    text: str
+    engine: str
+    from_cache: bool
+
+
+#: The cache is no longer an unbounded dict: translated user content is held in
+#: memory for the life of the process, so it needs a ceiling. Oldest-first
+#: eviction, count-bounded (entries are chunk-sized strings, so a count bound is
+#: a good enough proxy for a byte bound and is cheap to reason about).
+CACHE_MAX_ENTRIES = max(1, int(os.getenv("PASSAGE_CACHE_MAX_ENTRIES", "512")))
+
+
+@dataclass(frozen=True)
+class CacheEntry:
+    """A cached translation together with the engine that actually produced it.
+
+    The label is stored, not recomputed at read time, so a cache hit can never
+    describe the bytes as coming from an engine that did not produce them.
+    """
+
+    text: str
+    engine: str
+
+
+class BoundedTranslationCache(dict):
+    """Insertion-ordered dict with a hard entry ceiling.
+
+    Subclasses dict so existing equality/inspection (``cache == {}``) keeps
+    working; the only added behaviour is eviction of the oldest entry once the
+    ceiling is passed, and refreshing recency on read.
+    """
+
+    def __init__(self, max_entries: int = CACHE_MAX_ENTRIES) -> None:
+        super().__init__()
+        self.max_entries = max(1, int(max_entries))
+
+    def __setitem__(self, key, value) -> None:
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        while len(self) > self.max_entries:
+            super().__delitem__(next(iter(self)))
+
+    def get(self, key, default=None):
+        if key not in self:
+            return default
+        value = super().__getitem__(key)
+        # Touch: dicts preserve insertion order, so re-inserting makes this the
+        # newest entry and keeps eviction LRU rather than strictly FIFO.
+        super().__delitem__(key)
+        super().__setitem__(key, value)
+        return value
+
+
+def _ambient_cache_scope() -> str | None:
+    """Best-effort per-browser identity, when we are inside a NiceGUI request.
+
+    Read defensively: outside a client/request context NiceGUI raises, and the
+    document path runs on a worker thread with no context at all. Callers that
+    care about isolation on a worker thread capture the scope up-front and
+    re-establish it with ``TranslationBackend.cache_scope``.
+    """
+    try:  # pragma: no cover - exercised only under a live NiceGUI server
+        from nicegui import app as _nicegui_app
+
+        browser_id = _nicegui_app.storage.browser.get("id")
+        if browser_id:
+            return f"browser:{browser_id}"
+    except Exception:
+        # No storage_secret, or no request context (event handlers run outside
+        # one). Fall through rather than give up: falling back to the shared
+        # partition here would quietly undo the isolation.
+        pass
+    try:  # pragma: no cover - exercised only under a live NiceGUI server
+        from nicegui import context as _nicegui_context
+
+        client_id = getattr(_nicegui_context.client, "id", None)
+        if client_id:
+            return f"client:{client_id}"
+    except Exception:
+        pass
+    return None
+
+
+def current_cache_scope() -> str:
+    """The cache partition the caller is allowed to read and write."""
+    explicit = _active_cache_scope.get()
+    if explicit:
+        return explicit
+    return _ambient_cache_scope() or "shared"
+
 JOB_STATE_QUEUED = "queued"
 JOB_STATE_RUNNING = "running"
 JOB_STATE_SUCCEEDED = "succeeded"
 JOB_STATE_FAILED = "failed"
 JOB_STATE_CANCELED = "canceled"
+
+
+def _provider_identity(provider: Any) -> str:
+    """A stable, non-secret-leaking identity for a resolved provider."""
+    base_url = getattr(provider, "base_url", None)
+    model = getattr(provider, "text_model", None) or TEXT_MODEL
+    if not base_url:
+        return f"hosted:{model}"
+    api_key = getattr(getattr(provider, "client", None), "api_key", "") or ""
+    digest = hashlib.sha256(f"{base_url}\x00{api_key}\x00{model}".encode()).hexdigest()[:16]
+    return f"endpoint:{digest}"
 
 
 class BaseTranslationProvider(ABC):
@@ -428,6 +834,11 @@ class ChatCompletionsProvider(BaseTranslationProvider):
             )
 
     def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
+        # The one place every text model call goes out, and therefore the one
+        # place provenance needs to hear about it. Noted before the request,
+        # because the bytes leave the machine whether or not it succeeds, and
+        # whether or not anyone caches the answer.
+        _note_engine(_provider_identity(self))
         limit_kwargs = (
             _completion_limit_kwargs(self.text_model, max_tokens)
             if self.is_openai_hosted
@@ -596,6 +1007,10 @@ class TranslationRunState:
     output_stream: BytesIO | None = None
     pdf_overlay_ocg: Any | None = None
     current_image_bytes: bytes | None = None
+    #: Human-readable notes about fidelity that could NOT be preserved while
+    #: rewriting the document (inline formatting collapsed, links re-flowed,
+    #: ...). The UI surfaces these instead of silently dropping formatting.
+    fidelity_notes: list[dict] = field(default_factory=list)
 
 
 def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> None:
@@ -628,7 +1043,7 @@ class TranslationBackend:
         self._manual_cancel_requested = False
         self._active_run_state = TranslationRunState()
         self._run_states: dict[str, TranslationRunState] = {}
-        self.translation_cache: dict[tuple[str, str, str], str] = {}
+        self.translation_cache: BoundedTranslationCache = BoundedTranslationCache()
         self.metrics = MetricsCollector()
         self.max_openai_attempts = 4
         self.retry_base_delay = 0.5
@@ -638,6 +1053,11 @@ class TranslationBackend:
         # only for the keystroke path. Built lazily so boot never waits on it.
         self._live_provider: BaseTranslationProvider | None = None
         self._live_probe_at: float = 0.0
+        #: Last recorded probe outcomes (see probe_local_llm). Kept so the
+        #: diagnostics surface can say WHY local is unavailable rather than
+        #: only that it is.
+        self.last_live_probe: dict[str, Any] | None = None
+        self.last_local_probe: dict[str, Any] | None = None
         self._profile_providers: dict[tuple, BaseTranslationProvider] = {}
         self._live_reachable: bool = False
         self._jobs_lock = Lock()
@@ -683,6 +1103,110 @@ class TranslationBackend:
             yield
         finally:
             _active_provider.reset(token)
+
+    @contextmanager
+    def cache_scope(self, scope: str | None):
+        """Run the enclosed work in an explicit cache partition.
+
+        Used to carry a request's scope onto a worker thread (ContextVars do
+        not propagate into threads) and by callers that know the session
+        identity better than the ambient NiceGUI lookup does.
+        """
+        token = _active_cache_scope.set(scope or None)
+        try:
+            yield
+        finally:
+            _active_cache_scope.reset(token)
+
+    # ─────────────────────────── CACHE ISOLATION ───────────────────────── #
+    #
+    # The backend is a single process-wide object shared by every connected
+    # client, so its translation cache is shared too. Keyed only on
+    # (text, target, mode) it happily served one user's BYO/private-endpoint
+    # output to a DIFFERENT user, and told that user their own engine produced
+    # it. Two properties are enforced here, in code:
+    #
+    #   1. ENGINE IDENTITY. Every key carries the identity of the engine that
+    #      would answer this request (the hosted default, a local model, or the
+    #      exact base_url+key+model of a BYO endpoint, hashed). A result made by
+    #      one engine can never be served to a request another engine would have
+    #      answered, in either direction.
+    #   2. OWNER SCOPE. Every key also carries the caller's cache scope, so
+    #      translated user content is not shared between sessions at all. That
+    #      is a privacy property, not only a labelling one: the reproduction
+    #      leaked a sentence of one user's document to another user.
+    #
+    # And the stored value carries the producing engine's LABEL, so a cache hit
+    # reports what actually made the bytes rather than an engine the request
+    # merely could have used.
+
+    def _engine_identity(self, profile=None) -> str:
+        """Which engine would answer a request made right now?
+
+        An explicit profile wins (the live path passes one); failing that the
+        per-request provider override, which is how the document path carries a
+        BYO endpoint down through layers that never took a profile argument;
+        failing that, the process default.
+        """
+        if profile is not None and getattr(profile, "kind", None) != pp.KIND_APP:
+            raw = "\x00".join([
+                str(getattr(profile, "kind", "")),
+                str(getattr(profile, "base_url", "") or ""),
+                str(getattr(profile, "api_key", "") or ""),
+                str(getattr(profile, "model", "") or ""),
+            ])
+            return f"endpoint:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
+        override = _active_provider.get()
+        if override is not None:
+            return _provider_identity(override)
+        if self.provider is not None:
+            return _provider_identity(self.provider)
+        return f"hosted:{TEXT_MODEL}"
+
+    @staticmethod
+    @contextmanager
+    def capture_provenance():
+        """Scope a per-call provenance record around ONE translate call.
+
+            with backend.capture_provenance() as prov:
+                text, engine = backend.translate_live(...)
+            prov.from_cache   # nothing ran and nothing was sent for THIS call
+            prov.engine       # who originally produced the bytes
+
+        The record is ContextVar-scoped, so concurrent work in another session
+        (or another asyncio task) can never write into it. `asyncio.to_thread`
+        copies the context, so wrapping an awaited to_thread call works.
+        """
+        record = CallProvenance()
+        token = _call_provenance.set(record)
+        try:
+            yield record
+        finally:
+            _call_provenance.reset(token)
+
+    def _cache_get(self, cache_key) -> "CacheEntry | None":
+        entry = self.translation_cache.get(cache_key)
+        if entry is None:
+            return None
+        # Tolerate an entry planted as a bare string by older code or a test.
+        if isinstance(entry, str):
+            entry = CacheEntry(text=entry, engine=cache_key[1])
+        # The one choke point every cache hit passes through: record the hit as
+        # a fact of THIS call rather than leaving callers to infer it from a
+        # shared counter.
+        _note_cache_hit(entry.engine)
+        return entry
+
+    def _cache_put(self, cache_key, text: str, engine: str) -> None:
+        # Deliberately does NOT note an engine run. Provenance counts model
+        # invocations at the point of the outbound call (see _note_engine's
+        # call sites), because "was anything sent?" is a question about calls,
+        # not about cache writes. Counting stores instead made every model
+        # call that does not cache its result invisible: the image surface's
+        # vision OCR and its batched block translation both bypass the cache,
+        # so a photograph base64'd to a hosted model was booked as a cache hit
+        # and shown as "no model ran and nothing was sent".
+        self.translation_cache[cache_key] = CacheEntry(text=text, engine=engine)
 
     @property
     def segment_map(self) -> dict[str, dict]:
@@ -764,6 +1288,7 @@ class TranslationBackend:
         autofit: bool = False,
         correlation_id: str | None = None,
         profile=None,
+        file_name: str | None = None,
     ) -> str:
         job_id = self.generate_segment_id()
         job = TranslationJob(
@@ -776,16 +1301,22 @@ class TranslationBackend:
                 "target_language": target_language,
                 "processed": processed,
                 "correlation_id": correlation_id,
+                "file_name": file_name,
             },
         )
         with self._jobs_lock:
             self._jobs[job_id] = job
             self._run_states[job_id] = TranslationRunState()
 
+        # Captured HERE, in the request's context: the worker thread has no
+        # NiceGUI context to read an ambient scope from, so a scope resolved
+        # inside the thread would silently collapse to the shared partition.
+        submit_scope = current_cache_scope()
+
         def worker():
             # ContextVars do NOT propagate into a new thread, so the override
             # is established inside the worker rather than assumed.
-            with self.using_profile(profile):
+            with self.cache_scope(submit_scope), self.using_profile(profile):
                 self._run_translation_job(
                     job_id=job_id,
                     input_stream=input_stream,
@@ -795,6 +1326,7 @@ class TranslationBackend:
                     font_size=font_size,
                     autofit=autofit,
                     correlation_id=correlation_id,
+                    file_name=file_name,
                 )
 
         Thread(target=worker, daemon=True).start()
@@ -876,6 +1408,7 @@ class TranslationBackend:
         font_size: int | None,
         autofit: bool,
         correlation_id: str | None,
+        file_name: str | None = None,
     ) -> None:
         self._set_job_state(job_id, state=JOB_STATE_RUNNING, status_message="Starting translation...")
         file_metrics = MetricsCollector()
@@ -892,6 +1425,7 @@ class TranslationBackend:
                 file_metrics=file_metrics,
                 job_id=job_id,
                 run_state=run_state,
+                file_name=file_name,
                 progress_callback=lambda progress, message: self._set_job_state(
                     job_id,
                     progress=progress,
@@ -936,11 +1470,26 @@ class TranslationBackend:
     def generate_segment_id(self) -> str:
         return str(uuid.uuid4())
 
-    def _normalize_cache_key(self, text: str, target_language: str, mode: str) -> tuple[str, str, str]:
+    def _normalize_cache_key(
+        self, text: str, target_language: str, mode: str, profile=None,
+    ) -> tuple[str, str, str, str, str]:
+        """(scope, engine identity, text, target, mode).
+
+        The first two dimensions are the isolation ones -- see the CACHE
+        ISOLATION note above. They are part of the key rather than checked after
+        a lookup, so there is no code path that can read an entry without
+        matching them.
+        """
         normalized_text = " ".join(text.replace("\t", " ").split())
         normalized_target = " ".join(target_language.lower().split())
         normalized_mode = " ".join(mode.lower().split())
-        return normalized_text, normalized_target, normalized_mode
+        return (
+            current_cache_scope(),
+            self._engine_identity(profile),
+            normalized_text,
+            normalized_target,
+            normalized_mode,
+        )
 
     def _is_transient_openai_error(self, error: Exception) -> bool:
         transient_types = tuple(
@@ -1057,7 +1606,7 @@ class TranslationBackend:
             return text
         metrics = file_metrics or self.metrics
         cache_key = self._normalize_cache_key(text, target_language, mode="translate")
-        cached = self.translation_cache.get(cache_key)
+        cached = self._cache_get(cache_key)
         if cached is not None:
             metrics.record_cache_hit()
             logging.info("[Backend] translate_text cache hit for target=%s", target_language)
@@ -1065,9 +1614,10 @@ class TranslationBackend:
                 "translation.cache_hit",
                 correlation_id=correlation_id,
                 source_length=len(text),
-                translated_length=len(cached),
+                translated_length=len(cached.text),
+                engine=cached.engine,
             )
-            return cached
+            return cached.text
         metrics.record_cache_miss()
 
         try:
@@ -1082,7 +1632,7 @@ class TranslationBackend:
             else:
                 result = self._translate_chunk(text, target_language)
                 logging.info("[Backend] Translated len=%d → len=%d", len(text), len(result))
-            self.translation_cache[cache_key] = result
+            self._cache_put(cache_key, result, cache_key[1])
             return result
         except Exception as e:
             # Never echo the source back as a "translation" — surface the failure.
@@ -1142,22 +1692,26 @@ class TranslationBackend:
             return {"ok": False, "error": message[:300]}
 
     def available_local_models(self) -> list[str]:
-        """Model tags on the local Ollama, or [] if it isn't reachable."""
-        try:
-            import urllib.request
-            base = OLLAMA_BASE_URL.rstrip("/").removesuffix("/v1")
-            with urllib.request.urlopen(f"{base}/api/tags", timeout=LIVE_PROBE_TIMEOUT_SECONDS) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            # Embedding models can't translate; offering them would produce
-            # confusing empty rows in a comparison.
-            return [
-                m["name"] for m in payload.get("models", [])
-                if "embed" not in m.get("name", "")
-                and ollama_suits_translation(m.get("name", ""))
-            ]
-        except Exception as error:
-            logging.info("[Backend] local model list unavailable (%s)", error)
+        """Model tags on the local Ollama, or [] if it isn't reachable.
+
+        The probe's outcome is recorded on ``self.last_local_probe`` so a
+        caller can tell "the endpoint refused" from "the endpoint was too slow
+        to answer in time" — an empty list alone cannot.
+        """
+        report = probe_local_llm()
+        self.last_local_probe = report
+        if not report["reachable"]:
+            logging.info(
+                "[Backend] local model list unavailable (%s after %dms; %s)",
+                report["outcome"], report["elapsed_ms"], report["detail"],
+            )
             return []
+        # Embedding models can't translate; offering them would produce
+        # confusing empty rows in a comparison.
+        return [
+            name for name in report["models"]
+            if "embed" not in name and ollama_suits_translation(name)
+        ]
 
     def comparison_candidates(self, profile=None) -> list[dict[str, Any]]:
         """The engines worth comparing right now: Passage's hosted default, the
@@ -1214,9 +1768,20 @@ class TranslationBackend:
         explicit PASSAGE_LIVE_LOCAL_MODEL always wins, because someone who
         names a model means it.
         """
-        if LIVE_LOCAL_MODEL:
-            return LIVE_LOCAL_MODEL
         installed = {m["name"] for m in self.available_local_models_detailed()}
+        if LIVE_LOCAL_MODEL:
+            # Only if it is really installed. Honouring a name the daemon has
+            # already logged as not found is how /engines came to forecast a
+            # local run that could not happen: the forecast said the named
+            # model, the request failed over to hosted, and the same page then
+            # reported 0% of the text stayed on this machine.
+            if not installed or LIVE_LOCAL_MODEL in installed:
+                return LIVE_LOCAL_MODEL
+            logging.info(
+                "[Backend] PASSAGE_LIVE_LOCAL_MODEL=%s is not installed; "
+                "not routing live text locally", LIVE_LOCAL_MODEL,
+            )
+            return None
         for candidate in LIVE_LOCAL_PREFERENCE:
             if candidate in installed:
                 return candidate
@@ -1250,12 +1815,42 @@ class TranslationBackend:
         try:
             import urllib.request
             base = OLLAMA_BASE_URL.rstrip("/")
-            with urllib.request.urlopen(f"{base}/models", timeout=LIVE_PROBE_TIMEOUT_SECONDS):
-                pass
+            endpoint = f"{base}/models"
+            started = time.time()
+            try:
+                with urllib.request.urlopen(endpoint, timeout=LIVE_PROBE_TIMEOUT_SECONDS):
+                    pass
+            except Exception as probe_error:
+                # Record WHY before re-raising into the shared handler: a
+                # timeout ("present but slow — raise the timeout") and a
+                # refusal ("not running — start Ollama") are different facts,
+                # and collapsing them into "unavailable" is exactly how a
+                # working local model reads as a missing one.
+                self.last_live_probe = {
+                    "reachable": False,
+                    "outcome": _refine_timeout_outcome(
+                        classify_probe_error(probe_error), endpoint,
+                        PROBE_REFUSAL_CHECK_SECONDS),
+                    "endpoint": endpoint,
+                    "timeout_seconds": LIVE_PROBE_TIMEOUT_SECONDS,
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                    "detail": str(probe_error)[:300],
+                }
+                raise
+            self.last_live_probe = {
+                "reachable": True,
+                "outcome": PROBE_OK,
+                "endpoint": endpoint,
+                "timeout_seconds": LIVE_PROBE_TIMEOUT_SECONDS,
+                "elapsed_ms": int((time.time() - started) * 1000),
+                "detail": "",
+            }
             if self._live_provider is None:
                 model = self.choose_local_model()
                 if not model:
                     self._live_reachable = False
+                    self.last_live_probe["reachable"] = False
+                    self.last_live_probe["outcome"] = "no_model_installed"
                     return None
                 # Native /api/chat, not the OpenAI shim: the shim flattens
                 # thinking into the answer and loses it entirely for some
@@ -1272,7 +1867,10 @@ class TranslationBackend:
             self._live_reachable = True
         except Exception as error:
             if self._live_reachable or self._live_probe_at == now:
-                logging.info("[Backend] live-local unreachable (%s); using hosted", error)
+                logging.info(
+                    "[Backend] live-local unreachable (%s: %s); falling back to hosted",
+                    (self.last_live_probe or {}).get("outcome", PROBE_ERROR), error,
+                )
             self._live_reachable = False
         return self._live_provider if self._live_reachable else None
 
@@ -1282,7 +1880,7 @@ class TranslationBackend:
         Called from main_page. Doing this lazily on the first translate request
         was useless: the probe, the model load and the user's first keystroke
         all happened at the same instant, so the first response took ~3s and
-        took two more keystrokes to settle. Both the probe (up to 0.6s) and the
+        took two more keystrokes to settle. Both the probe (up to 2.5s) and the
         VRAM load run off the render path here — page render must never wait
         for either.
         """
@@ -1337,13 +1935,24 @@ class TranslationBackend:
         """
         text = text.replace("\t", " ").strip()
         if not text:
+            sink = _call_provenance.get()
+            if sink is not None:
+                sink.record_nothing("none")
             return text, "none"
-        cache_key = self._normalize_cache_key(
-            text, target_language, mode=f"live:{profile.id if profile else 'auto'}")
-        cached = self.translation_cache.get(cache_key)
+        # No profile id in the mode any more: identity is a first-class key
+        # dimension now, and a profile id is not an engine -- two sessions with
+        # different ids but the same endpoint used to be treated as different
+        # engines, while every profile-less session shared one 'auto' bucket.
+        cache_key = self._normalize_cache_key(text, target_language, mode="live", profile=profile)
+        cached = self._cache_get(cache_key)
         if cached is not None:
             self.metrics.record_cache_hit()
-            return cached, "cache"
+            # The stored label, never "cache": the caller shows this to the user
+            # as the engine that produced the text on screen. Whether THIS call
+            # ran or sent anything is a separate fact, carried by
+            # capture_provenance() (see translate_live_detailed) — deriving it
+            # from the label is what billed cache hits as fresh hosted calls.
+            return cached.text, cached.engine
 
         if profile is not None and profile.kind != pp.KIND_APP:
             masked, protected = _mask_protected_spans(text)
@@ -1354,7 +1963,7 @@ class TranslationBackend:
             if not result:
                 raise ValueError("The model returned an empty translation.")
             result = _restore_protected_spans(result, protected)
-            self.translation_cache[cache_key] = result
+            self._cache_put(cache_key, result, profile.describe())
             return result, profile.describe()
 
         provider = self._live_local_provider()
@@ -1368,13 +1977,50 @@ class TranslationBackend:
                 result = (completion.choices[0].message.content or "").strip()
                 if result:
                     result = _restore_protected_spans(result, protected)
-                    self.translation_cache[cache_key] = result
+                    self._cache_put(cache_key, result, f"local:{provider.text_model}")
                     return result, f"local:{provider.text_model}"
                 logging.info("[Backend] live-local returned empty; falling back to hosted")
             except Exception as error:
                 logging.info("[Backend] live-local failed (%s); falling back to hosted", error)
 
-        return self.translate_text(text, target_language), f"hosted:{TEXT_MODEL}"
+        fallback = self.translate_text(text, target_language)
+        # translate_text may itself have been served from cache; only claim a
+        # run when it really ran. Either way the label names the hosted model
+        # that produced these bytes.
+        sink = _call_provenance.get()
+        if sink is not None and sink.engine_runs:
+            sink.engine = f"hosted:{TEXT_MODEL}"
+        return fallback, f"hosted:{TEXT_MODEL}"
+
+    def translate_live_detailed(
+        self, text: str, target_language: str, profile=None
+    ) -> TranslationResult:
+        """`translate_live` plus per-call provenance, as one atomic fact.
+
+        Prefer this over `translate_live` at any call site that meters a run or
+        prints a privacy sentence: `from_cache` is measured inside this call,
+        so concurrent activity in another session cannot change it.
+        """
+        with self.capture_provenance() as prov:
+            translation, engine = self.translate_live(text, target_language, profile=profile)
+        return TranslationResult(
+            text=translation, engine=engine, from_cache=prov.from_cache)
+
+    def translate_text_detailed(
+        self,
+        text: str,
+        target_language: str,
+        correlation_id: str | None = None,
+        file_metrics: TranslationMetrics | None = None,
+    ) -> TranslationResult:
+        """`translate_text` plus per-call provenance. See translate_live_detailed."""
+        with self.capture_provenance() as prov:
+            translation = self.translate_text(
+                text, target_language, correlation_id=correlation_id,
+                file_metrics=file_metrics)
+        engine = prov.engine or ("none" if not translation else self._engine_identity())
+        return TranslationResult(
+            text=translation, engine=engine, from_cache=prov.from_cache)
 
     def translate_text_with_instructions(
         self, original_text: str, target_language: str, instructions: str
@@ -1387,10 +2033,10 @@ class TranslationBackend:
         normalized_instructions = " ".join(instructions.replace("\t", " ").strip().split())
         mode = f"instructions:{normalized_instructions}" if normalized_instructions else "instructions"
         cache_key = self._normalize_cache_key(original_text, target_language, mode=mode)
-        cached = self.translation_cache.get(cache_key)
+        cached = self._cache_get(cache_key)
         if cached is not None:
             logging.info("[Backend] instruction translation cache hit for target=%s", target_language)
-            return cached
+            return cached.text
 
         # Same URL/email protection as _translate_chunk: refining a translated
         # dossier would otherwise re-corrupt the citation trail.
@@ -1414,7 +2060,7 @@ class TranslationBackend:
             if not result:
                 raise ValueError("The model returned an empty refinement.")
             result = _restore_protected_spans(result, protected)
-            self.translation_cache[cache_key] = result
+            self._cache_put(cache_key, result, cache_key[1])
             logging.info("[Backend] Refined translation len=%d", len(result))
             return result
         except Exception as e:
@@ -1530,11 +2176,20 @@ class TranslationBackend:
                 except Exception as error:
                     logging.info("[Backend] local STT failed (%s); using hosted", error)
                     source_text = self._transcribe_hosted(audio_bytes)
+                    # The label stays "hosted" because hosted is what ran — but
+                    # record that local was TRIED, so a broken local model is
+                    # distinguishable from one that was never installed.
+                    meta["stt_fallback"] = str(error)
             else:
                 source_text = self._transcribe_hosted(audio_bytes)
             logging.info("[Backend] Transcription (%s): %s", meta["stt"], source_text[:60] + "…")
 
+            # The MIDDLE step is the one that carries the actual words. It runs
+            # hosted here, and the meta must say so: a page that computed "this
+            # machine" from the STT and TTS labels alone told the user their
+            # recording stayed local while its transcript was being sent out.
             translated_text = self.translate_text(source_text, target_language)
+            meta["translation"] = f"hosted:{TEXT_MODEL}"
 
             if local_voice.tts_available(target_language):
                 try:
@@ -1544,6 +2199,9 @@ class TranslationBackend:
                 except Exception as error:
                     logging.info("[Backend] local TTS failed (%s); using hosted", error)
                     audio_out = self._require_provider().synthesize_speech(text=translated_text)
+                    meta["tts"] = "hosted"
+                    meta["media_type"] = "audio/mpeg"
+                    meta["tts_fallback"] = str(error)
             else:
                 audio_out = self._require_provider().synthesize_speech(text=translated_text)
 
@@ -1568,6 +2226,32 @@ class TranslationBackend:
         if not image_bytes:
             raise ValueError("Image payload is empty.")
 
+        # DECODE BEFORE TRANSMITTING. The extension check above is a claim the
+        # uploader makes; it is not evidence. A text file renamed fake.png used
+        # to be base64'd and shipped to the hosted vision model, which only then
+        # failed downstream with "cannot identify image file" — i.e. a user's
+        # arbitrary file left the machine because of its filename. Pillow is
+        # already here; ask it first. The declared extension must also match
+        # what the bytes actually are, so a PDF named .png does not get
+        # relabelled image/png on its way out.
+        try:
+            with Image.open(BytesIO(image_bytes)) as probe:
+                probe.verify()
+            with Image.open(BytesIO(image_bytes)) as probe:
+                actual_format = (probe.format or "").upper()
+        except Exception:
+            raise ValueError(
+                "That file isn't a readable image. Use a PNG, JPG, JPEG, or WEBP photo."
+            ) from None
+        expected_formats = {
+            "image/png": {"PNG"}, "image/jpeg": {"JPEG", "MPO"}, "image/webp": {"WEBP"},
+        }[mime_type]
+        if actual_format not in expected_formats:
+            raise ValueError(
+                f"This file is a {actual_format or 'unknown'} image but is named "
+                f"'{extension}'. Rename it to match its real format and try again."
+            )
+
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         # bbox is requested in NORMALISED coordinates (0-1) so the answer does
         # not depend on the model knowing the pixel dimensions, and so the same
@@ -1590,7 +2274,12 @@ class TranslationBackend:
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
             ]},
         ]
-        completion = self._require_provider().client.chat.completions.create(
+        vision_provider = self._require_provider()
+        # The photograph is in `messages` as base64 and is about to be sent.
+        # Nothing about this call touches the translation cache, so it is only
+        # visible to provenance because it says so here.
+        _note_engine(_provider_identity(vision_provider))
+        completion = vision_provider.client.chat.completions.create(
             model=VISION_MODEL,
             messages=messages,
             response_format={"type": "json_object"},
@@ -1792,6 +2481,204 @@ class TranslationBackend:
         self.regenerate_output_stream(run_state=state)
 
     # ------------------
+    # DOCX INLINE FIDELITY
+    # ------------------
+    #: Cap so a pathological document cannot grow the note list without bound.
+    MAX_FIDELITY_NOTES = 50
+
+    @staticmethod
+    def add_fidelity_note(state, location: str, message: str) -> None:
+        """Record something the rewrite could NOT preserve. The point is that
+        the user is told, so this is data the UI reads, not just a log line."""
+        if state is None:
+            return
+        if len(state.fidelity_notes) >= TranslationBackend.MAX_FIDELITY_NOTES:
+            return
+        state.fidelity_notes.append({"location": location, "message": message})
+        logging.info(f"[Backend] fidelity: {location}: {message}")
+
+    @staticmethod
+    def _run_format_signature(run) -> tuple:
+        font = run.font
+        return (
+            run.bold,
+            run.italic,
+            run.underline,
+            font.name,
+            font.size,
+            getattr(getattr(font, "color", None), "rgb", None),
+        )
+
+    @staticmethod
+    def _docx_paragraph_pieces(para) -> list:
+        """Ordered ("run"|"hyperlink", element, [Run, ...]) pieces of a paragraph.
+
+        Hyperlinks are their own piece so the w:hyperlink element - and with it
+        the relationship id that IS the link - survives the rewrite.
+        """
+        from docx.oxml.ns import qn
+        from docx.text.run import Run
+
+        pieces = []
+        for child in para._p:
+            if child.tag == qn("w:r"):
+                pieces.append(("run", child, [Run(child, para)]))
+            elif child.tag == qn("w:hyperlink"):
+                runs = [Run(r, para) for r in child.findall(qn("w:r"))]
+                if runs:
+                    pieces.append(("hyperlink", child, runs))
+        return pieces
+
+    @classmethod
+    def _write_runs_preserving_first(cls, runs, new_text: str) -> bool:
+        """Put ``new_text`` in the first run and blank the rest.
+
+        Returns True when inline formatting variation was lost (the runs did not
+        all share one format). The single-run case - the common one - is fully
+        preserved: the run element, and therefore its rPr, is reused.
+        """
+        signatures = {cls._run_format_signature(r) for r in runs if r.text}
+        runs[0].text = new_text
+        for extra in runs[1:]:
+            extra.text = ""
+        return len(signatures) > 1
+
+    def rewrite_docx_paragraph(
+        self,
+        para,
+        target_language,
+        *,
+        location: str,
+        do_translate: bool = True,
+        correlation_id: str | None = None,
+        file_metrics=None,
+        state=None,
+    ) -> str:
+        """Translate a paragraph in place WITHOUT flattening it to plain text.
+
+        ``para.text = ...`` (what this used to do) deletes every run and every
+        hyperlink in the paragraph. Instead:
+          * no hyperlinks -> one translation call for the whole paragraph,
+            written into the first run so its formatting survives;
+          * hyperlinks present -> each link and each contiguous stretch of plain
+            runs is translated as its own unit, so the w:hyperlink elements (and
+            their r:id) are never touched.
+        Whatever still could not be preserved becomes a fidelity note.
+        """
+        pieces = self._docx_paragraph_pieces(para)
+        has_link = any(kind == "hyperlink" for kind, _el, _runs in pieces)
+
+        def translate(text: str) -> str:
+            if not do_translate:
+                return text
+            return self._translate_text_with_context(
+                text,
+                target_language,
+                correlation_id=correlation_id,
+                file_metrics=file_metrics,
+            )
+
+        if not pieces:
+            # No runs at all (rare); nothing to preserve, fall back to a plain set.
+            new_text = translate(para.text.strip())
+            para.text = new_text
+            return new_text
+
+        if not has_link:
+            original = para.text.strip()
+            new_text = translate(original)
+            runs = [r for _kind, _el, rs in pieces for r in rs]
+            if self._write_runs_preserving_first(runs, new_text):
+                self.add_fidelity_note(
+                    state,
+                    location,
+                    "Mixed inline formatting in this paragraph was collapsed into the "
+                    "first run's style: translated wording does not align to the "
+                    "original bold/italic spans.",
+                )
+            return new_text
+
+        # ---- hyperlink path: translate piecewise so the links survive ----
+        units = []  # (kind, runs), with adjacent plain runs grouped together
+        for kind, _el, runs in pieces:
+            if kind == "hyperlink":
+                units.append(("hyperlink", list(runs)))
+            elif units and units[-1][0] == "text":
+                units[-1][1].extend(runs)
+            else:
+                units.append(("text", list(runs)))
+
+        out_parts = []
+        for kind, runs in units:
+            source = "".join(r.text for r in runs)
+            if not source.strip():
+                # Whitespace-only piece: keep it verbatim. Dropping it welded
+                # the neighbouring pieces together in the DOCUMENT.
+                out_parts.append(source)
+                continue
+            # Translate the trimmed text (a trailing space confuses the model)
+            # but write the boundary whitespace BACK, because these pieces sit
+            # either side of a link inside one paragraph. Without this,
+            # "See " + link("the documentation") was written into the runs as
+            # "Ver" + "la documentación" and rendered "Verla documentación" —
+            # the join below only ever fixed the returned string, never the
+            # document the user downloads.
+            leading = source[:len(source) - len(source.lstrip())]
+            trailing = source[len(source.rstrip()):]
+            translated = leading + translate(source.strip()) + trailing
+            if self._write_runs_preserving_first(runs, translated):
+                self.add_fidelity_note(
+                    state,
+                    location,
+                    "Mixed inline formatting was collapsed into the first run's style.",
+                )
+            out_parts.append(translated)
+        link_count = sum(1 for kind, _runs in units if kind == "hyperlink")
+        self.add_fidelity_note(
+            state,
+            location,
+            f"This paragraph contains {link_count} hyperlink(s), so it was translated "
+            "in pieces around the links to keep them clickable. Wording across a link "
+            "boundary may read less naturally than a whole-sentence translation.",
+        )
+        # The pieces now carry their own boundary whitespace, so the returned
+        # plain text is exactly what the document says. Fall back to a single
+        # space only where two adjacent pieces would otherwise collide.
+        rendered = ""
+        for part in out_parts:
+            if rendered and not rendered[-1].isspace() and not part[:1].isspace():
+                rendered += " "
+            rendered += part
+        return rendered.strip()
+
+    def _overwrite_docx_paragraph(self, para, text: str, *, location: str = "", state=None) -> None:
+        """Replace a paragraph's text with a human edit, keeping what can be kept.
+
+        A hand-edited paragraph cannot be mapped back onto the original spans, so
+        the first run's formatting is kept for the whole paragraph, and any
+        hyperlink text it contained is dropped - reported, not hidden.
+        """
+        pieces = self._docx_paragraph_pieces(para)
+        if not pieces:
+            para.text = text
+            return
+        runs = [r for _kind, _el, rs in pieces for r in rs]
+        if self._write_runs_preserving_first(runs, text):
+            self.add_fidelity_note(
+                state,
+                location,
+                "Edited paragraph: mixed inline formatting was collapsed into the "
+                "first run's style.",
+            )
+        if any(kind == "hyperlink" for kind, _el, _rs in pieces):
+            self.add_fidelity_note(
+                state,
+                location,
+                "Edited paragraph: it contained a hyperlink whose text was replaced "
+                "by your edit, so the link is no longer shown.",
+            )
+
+    # ------------------
     # PROCESSING DOCX
     # ------------------
     def process_docx(
@@ -1823,7 +2710,12 @@ class TranslationBackend:
         total_elements = len(doc.paragraphs) + sum(len(t.rows)*len(t.columns) for t in doc.tables)
         processed = 0
         text_accum = ""
+        # Token accounting covers BOTH sides of the translation: the source we
+        # sent and the translation we got back. Counting one side under-reports
+        # what the run actually cost.
+        token_text = ""
         start_time = time.time()
+        state.fidelity_notes.clear()
 
         # Paragraphs
         for idx, para in enumerate(doc.paragraphs):
@@ -1833,16 +2725,22 @@ class TranslationBackend:
             if self._is_cancel_requested(job_id):
                 break
             seg_start = time.time()
-            new_text = (
-                self._translate_text_with_context(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
-                if do_translate else original
+            location = f"docx:paragraph:{idx}"
+            new_text = self.rewrite_docx_paragraph(
+                para,
+                target_language,
+                location=location,
+                do_translate=do_translate,
+                correlation_id=correlation_id,
+                file_metrics=metrics,
+                state=state,
             )
-            para.text = new_text
             text_accum += new_text + "\n"
+            token_text += original + "\n" + new_text + "\n"
             seg_id = self.generate_segment_id()
             state.segment_map[seg_id] = {
                 "type": "paragraph",
-                "location": f"docx:paragraph:{idx}",
+                "location": location,
                 "original": original,
                 "translated": new_text,
                 "metadata": {"format": "docx", "index": idx},
@@ -1876,21 +2774,24 @@ class TranslationBackend:
                         if self._is_cancel_requested(job_id):
                             break
                         seg_start = time.time()
-                        new_text = (
-                            self._translate_text_with_context(
-                                original,
-                                target_language,
-                                correlation_id=correlation_id,
-                                file_metrics=metrics,
-                            )
-                            if do_translate else original
+                        cell_location = (
+                            f"docx:table:{t_idx}:row:{r_idx}:col:{c_idx}:para:{p_idx}"
                         )
-                        para.text = new_text
+                        new_text = self.rewrite_docx_paragraph(
+                            para,
+                            target_language,
+                            location=cell_location,
+                            do_translate=do_translate,
+                            correlation_id=correlation_id,
+                            file_metrics=metrics,
+                            state=state,
+                        )
                         text_accum += new_text + "\n"
+                        token_text += original + "\n" + new_text + "\n"
                         seg_id = self.generate_segment_id()
                         state.segment_map[seg_id] = {
                             "type": "table_cell",
-                            "location": f"docx:table:{t_idx}:row:{r_idx}:col:{c_idx}:para:{p_idx}",
+                            "location": cell_location,
                             "original": original,
                             "translated": new_text,
                             "metadata": {"format": "docx", "table_index": t_idx, "row": r_idx, "col": c_idx},
@@ -1911,7 +2812,7 @@ class TranslationBackend:
         doc.save(out_stream)
         out_stream.seek(0)
         state.output_stream = out_stream
-        tokens = self.calculate_tokens(text_accum)
+        tokens = self.calculate_tokens(token_text)
         metrics.finish_file(
             file_type="docx",
             segment_count=processed,
@@ -1952,6 +2853,7 @@ class TranslationBackend:
         total_elements = sum(len(slide.shapes) for slide in prs.slides)
         processed = 0
         text_accum = ""
+        token_text = ""
         start_time = time.time()
 
         for s_idx, slide in enumerate(prs.slides):
@@ -1987,6 +2889,7 @@ class TranslationBackend:
                 }
 
                 text_accum += new_text + "\n"
+                token_text += original_text + "\n" + new_text + "\n"
                 processed += 1
                 self.update_progress(
                     processed,
@@ -2002,7 +2905,7 @@ class TranslationBackend:
         prs.save(out_stream)
         out_stream.seek(0)
         state.output_stream = out_stream
-        tokens = self.calculate_tokens(text_accum)
+        tokens = self.calculate_tokens(token_text)
         metrics.finish_file(
             file_type="pptx",
             segment_count=processed,
@@ -2227,6 +3130,9 @@ class TranslationBackend:
         # 2) Prepare for translation overlays
         processed = 0
         start_time = time.time()
+        # Both sides of every block, so the reported token count is the real one
+        # instead of the hardcoded zero this used to show.
+        token_text = ""
         state.pdf_overlay_ocg = doc.add_ocg("Translated", on=True)
 
         # 3) Translate & redraw each block
@@ -2259,6 +3165,7 @@ class TranslationBackend:
                     )
                 )
                 state.segment_map[seg_id]["translated"] = new_text
+                token_text += original + "\n" + new_text + "\n"
 
                 last_css = self._render_pdf_block(page, bbox, new_text, run_state=state)
                 state.segment_map[seg_id]["last_css"] = last_css
@@ -2283,7 +3190,7 @@ class TranslationBackend:
         out_stream.seek(0)
         state.output_stream = out_stream
 
-        tokens = self.calculate_tokens("")  # or track actual text if desired
+        tokens = self.calculate_tokens(token_text)
         logging.info(f"[PDF] Done – {processed}/{total_blocks} blocks processed, tokens={tokens}")
         metrics.finish_file(
             file_type="pdf",
@@ -2346,7 +3253,11 @@ class TranslationBackend:
         seg_type = seg["type"]
         if seg_type in ["paragraph", "table_cell"]:
             if "object" in seg:
-                seg["object"].text = updated
+                # Same reason as process_docx: assigning .text wipes every run
+                # (and every hyperlink) in the paragraph.
+                self._overwrite_docx_paragraph(
+                    seg["object"], updated, location=seg.get("location", ""), state=state
+                )
         elif seg_type == "pptx_shape":
             if "object" in seg and hasattr(seg["object"], "text_frame") and seg["object"].text_frame:
                 seg["object"].text_frame.text = updated
@@ -2361,6 +3272,125 @@ class TranslationBackend:
         if regenerate:
             self.regenerate_output_stream(run_state=state)
         return updated
+
+    # ------------------
+    # UPLOAD VALIDATION
+    # ------------------
+    #: First bytes -> the format they actually indicate.
+    _CONTENT_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+        (b"%PDF", "pdf"),
+        (b"PK\x03\x04", "zip"),
+        (b"PK\x05\x06", "zip"),
+        (b"PK\x07\x08", "zip"),
+        (b"\x89PNG\r\n\x1a\n", "png"),
+        (b"\xff\xd8\xff", "jpg"),
+        (b"GIF87a", "gif"),
+        (b"GIF89a", "gif"),
+        (b"{\\rtf", "rtf"),
+        (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "legacy Office (.doc/.xls/.ppt)"),
+    )
+
+    #: Extension -> the content family it must have.
+    _EXPECTED_CONTENT = {
+        "docx": "zip",
+        "pptx": "zip",
+        "pdf": "pdf",
+        "png": "png",
+        "jpg": "jpg",
+        "jpeg": "jpg",
+        "webp": "webp",
+    }
+
+    _FRIENDLY_CONTENT = {
+        "pdf": "a PDF",
+        "zip": "a ZIP archive",
+        "png": "a PNG image",
+        "jpg": "a JPEG image",
+        "gif": "a GIF image",
+        "webp": "a WebP image",
+        "rtf": "an RTF document",
+    }
+
+    @classmethod
+    def _sniff_content(cls, head: bytes) -> str | None:
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "webp"
+        for signature, name in cls._CONTENT_SIGNATURES:
+            if head.startswith(signature):
+                return name
+        return None
+
+    @classmethod
+    def validate_upload(cls, input_stream, file_extension: str, file_name: str | None = None) -> None:
+        """Raise a ValueError that names the file AND the real problem.
+
+        Covers the two cases that used to be indistinguishable to a user:
+        a 0-byte file, and a file whose contents do not match its extension.
+        """
+        import zipfile
+
+        ext = (file_extension or "").lower().lstrip(".")
+        label = f'"{file_name}"' if file_name else "This file"
+
+        if not hasattr(input_stream, "read") or not hasattr(input_stream, "seek"):
+            return
+        position = input_stream.tell()
+        try:
+            input_stream.seek(0, 2)
+            size = input_stream.tell()
+            input_stream.seek(0)
+            head = input_stream.read(16)
+            if size == 0:
+                raise ValueError(
+                    f"{label} is empty (0 bytes), so there is nothing to translate. "
+                    "It was probably not saved or not fully uploaded. Re-export it and try again."
+                )
+
+            expected = cls._EXPECTED_CONTENT.get(ext)
+            if expected is None:
+                return
+            actual = cls._sniff_content(head)
+            if actual != expected:
+                described = cls._FRIENDLY_CONTENT.get(actual, actual and f"a {actual} file")
+                if described:
+                    raise ValueError(
+                        f"{label} is named .{ext}, but its contents are {described}. "
+                        f"Rename it to the correct extension, or upload the real .{ext} file."
+                    )
+                raise ValueError(
+                    f"{label} is named .{ext}, but its contents are not a valid .{ext} file "
+                    "(the header is unrecognised). It may be corrupted or only partly uploaded."
+                )
+
+            if ext in {"docx", "pptx"}:
+                input_stream.seek(0)
+                markers = {"docx": "word/document.xml", "pptx": "ppt/presentation.xml"}
+                try:
+                    names = set(zipfile.ZipFile(input_stream).namelist())
+                except zipfile.BadZipFile:
+                    raise ValueError(
+                        f"{label} is a damaged .{ext} file: the Office package inside it "
+                        "could not be opened. Re-save it from Word/PowerPoint and try again."
+                    ) from None
+                if markers[ext] not in names:
+                    other = next(
+                        (o for o, m in markers.items() if o != ext and m in names), None
+                    )
+                    if other:
+                        raise ValueError(
+                            f"{label} is named .{ext}, but it is actually a .{other} file. "
+                            f"Rename it to .{other} and upload it again."
+                        )
+                    raise ValueError(
+                        f"{label} is a ZIP archive, but not a .{ext} document "
+                        "(it has no Office content inside). Upload the document itself, "
+                        "not a zipped folder."
+                    )
+        finally:
+            try:
+                input_stream.seek(position)
+            except Exception:  # pragma: no cover - non-seekable exotic streams
+                pass
 
     # ------------------
     # ROUTING
@@ -2380,13 +3410,19 @@ class TranslationBackend:
         job_id: str | None = None,
         run_state: TranslationRunState | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
+        file_name: str | None = None,
     ):
         self.reset_cancel(job_id)
+        # Dispatching on the extension alone let an empty file and a mislabeled
+        # file surface the same raw python-docx "File is not a zip file". Sniff
+        # first so each problem gets its own, specific message.
+        self.validate_upload(input_stream, file_extension, file_name=file_name)
         state = self._resolve_run_state(job_id=job_id, run_state=run_state)
         if job_id is None and run_state is None:
             state = TranslationRunState()
         # Per-run state must not leak across sequential requests.
         state.segment_map.clear()
+        state.fidelity_notes.clear()
         state.current_document = None
         state.current_presentation = None
         state.current_pdf = None

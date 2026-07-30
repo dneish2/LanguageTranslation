@@ -34,13 +34,53 @@ import wave
 from functools import lru_cache
 from pathlib import Path
 
-#: Off unless asked for: this pulls in a speech stack and model weights, and
-#: silently changing where someone's audio is processed is not a default worth
-#: assuming either way.
-ENABLED = os.getenv("PASSAGE_LOCAL_VOICE", "0") == "1"
+#: ``PASSAGE_LOCAL_VOICE`` is TRI-STATE (DECISIONS.md §2):
+#:
+#:   unset -> **auto**: on when the models are actually present. Local voice is
+#:            both faster (1.51s vs 7.62s end to end) and more private, so
+#:            defaulting off penalised the better option. The old argument for
+#:            off was "don't silently move where audio is processed" — but
+#:            installing a speech stack and downloading ~63MB of voice weights
+#:            is already an explicit act. Nobody does that by accident.
+#:   truthy -> force on. If the models are missing this reports that honestly
+#:            instead of pretending; a forced flag cannot conjure a model.
+#:   falsey -> force off, even when everything is installed.
+#:
+#: "Truthy"/"falsey" are the obvious spellings, case- and whitespace-insensitive
+#: (see _TRUTHY/_FALSEY). This used to accept ONLY "1"/"0" and treat every other
+#: value as auto, which meant PASSAGE_LOCAL_VOICE=false on a machine with the
+#: models installed turned local voice ON — a config value silently doing the
+#: opposite of what it says. Anything still unrecognised is a typo, not a mode:
+#: it warns, it is surfaced by status()/describe() as not understood, and the
+#: resolved behaviour falls back to auto rather than guessing an intent.
+#:
+#: Resolved by CALL, not frozen at import: /engines and the tests must be able
+#: to re-probe after a voice is downloaded, and an import-time constant would
+#: make the page's answer stale the moment the fetch-on-demand helper ran.
+_AUTO, _ON, _OFF = "auto", "on", "off"
+
+_TRUTHY = frozenset({"1", "true", "yes", "y", "on", "t"})
+_FALSEY = frozenset({"0", "false", "no", "n", "off", "f"})
+
+#: Values already warned about, so a probe called on every page render doesn't
+#: reprint the same warning forever. Keyed by the raw value, so CHANGING the
+#: variable to a second bad spelling still warns.
+_warned_settings: set[str] = set()
 
 #: "base" is the smallest model that transcribes cleanly in testing; tiny
 #: garbles proper nouns badly enough to poison the translation downstream.
+#:
+#: THE ONE LINE. This is the only place a Whisper size is named anywhere in the
+#: app — the STT path reads it here and the engine label reported to the user
+#: (`meta["stt"] == f"local:{WHISPER_MODEL}"`) is derived from it, so setting
+#: PASSAGE_WHISPER_MODEL=small (or editing this default) changes the model and
+#: the label together, with nothing else to keep in sync.
+#:
+#: CAVEAT, and it is a real one: base-vs-small has NEVER been measured on real
+#: speech. Every number behind this default came from a synthetic TTS fixture,
+#: which is unrealistically clean — exactly the audio that flatters a small
+#: model. See RESEARCH.md §4a for why, and for the half-hour experiment that
+#: would settle it. Do not switch to "small" on a hunch; measure first.
 WHISPER_MODEL = os.getenv("PASSAGE_WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("PASSAGE_WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("PASSAGE_WHISPER_COMPUTE", "int8")
@@ -66,8 +106,26 @@ VOICE_PREFIXES = {
 }
 
 
+#: ISO code (and Piper locale tag) -> language NAME, derived from the table
+#: above rather than typed twice. The app spells the target language BOTH ways:
+#: the /voice JS default is `lang || 'es'` and the server defaults an empty
+#: language box to 'es', while the language picker offers "Spanish". Only the
+#: NAME used to resolve, so the DEFAULT spelling reported no local voice with
+#: es_ES-davefx-medium sitting installed on disk, and every default-language
+#: request sent its translated text out for hosted synthesis.
+_CODE_TO_NAME = {}
+for _name, _prefix in VOICE_PREFIXES.items():
+    _CODE_TO_NAME[_prefix.split("_")[0].lower()] = _name   # "es"
+    _CODE_TO_NAME[_prefix.lower()] = _name                 # "es_es"
+
+
 def _lang_key(language: str | None) -> str:
-    return (language or "").strip().lower().split("(")[0].strip()
+    """Normalise a language NAME or CODE to the table's key.
+
+    Accepts "Spanish", "spanish (latin america)", "es", "es-ES", "es_ES".
+    """
+    key = (language or "").strip().lower().split("(")[0].strip()
+    return _CODE_TO_NAME.get(key.replace("-", "_"), key)
 
 
 def iso_code(language: str | None) -> str | None:
@@ -84,9 +142,50 @@ def iso_code(language: str | None) -> str | None:
     return prefix.split("_")[0] if prefix else None
 
 
-def stt_available() -> bool:
-    if not ENABLED:
-        return False
+def raw_setting() -> str:
+    """The env var exactly as set, trimmed. "" when unset."""
+    return (os.getenv("PASSAGE_LOCAL_VOICE") or "").strip()
+
+
+def unrecognised_setting() -> str | None:
+    """The raw value if it is set but means nothing, else None.
+
+    A setting nobody can parse must not be swallowed. It is warned once per
+    distinct value and reported by status()/describe(), because the failure
+    mode it replaces was invisible: PASSAGE_LOCAL_VOICE=false read as auto,
+    turned local voice on, and describe() said "on (detected automatically)".
+    """
+    raw = raw_setting()
+    if not raw or raw.casefold() in _TRUTHY or raw.casefold() in _FALSEY:
+        return None
+    if raw not in _warned_settings:
+        _warned_settings.add(raw)
+        logging.warning(
+            "[LocalVoice] PASSAGE_LOCAL_VOICE=%r is not understood; expected one of "
+            "%s (on) or %s (off), or unset for automatic. Falling back to automatic.",
+            raw, "/".join(sorted(_TRUTHY)), "/".join(sorted(_FALSEY)),
+        )
+    return raw
+
+
+def mode() -> str:
+    """The tri-state, read fresh each call: "auto", "on" or "off"."""
+    raw = raw_setting().casefold()
+    if raw in _TRUTHY:
+        return _ON
+    if raw in _FALSEY:
+        return _OFF
+    unrecognised_setting()   # warns once if it is set-but-meaningless
+    return _AUTO
+
+
+def whisper_installed() -> bool:
+    """Is the recogniser importable at all? Independent of the env flag.
+
+    Deliberately uncached: a cached "no" would survive an install for the life
+    of the process, and this is the probe /engines uses to tell the user what
+    the app can do right now. ``import`` is itself cached by ``sys.modules``.
+    """
     try:
         import faster_whisper  # noqa: F401
     except Exception:
@@ -94,22 +193,234 @@ def stt_available() -> bool:
     return True
 
 
+def whisper_repo_id() -> str:
+    """The Hugging Face repo the configured size resolves to.
+
+    faster-whisper maps a bare size name onto Systran's converted CTranslate2
+    repos; anything containing a "/" is already a repo id and is passed through
+    untouched. The size itself is never named here — it comes from the one line
+    above, so the probe and the reported label can never disagree.
+    """
+    name = (WHISPER_MODEL or "").strip()
+    return name if "/" in name else f"Systran/faster-whisper-{name}"
+
+
+def _hf_cache_roots() -> list[Path]:
+    """Where Hugging Face may have put the weights, most specific first.
+
+    This MIRRORS huggingface_hub/constants.py exactly — HF_HUB_CACHE, then the
+    legacy HUGGINGFACE_HUB_CACHE, else <HF_HOME>/hub where HF_HOME itself
+    defaults to $XDG_CACHE_HOME/huggingface (and only then ~/.cache/huggingface),
+    with expanduser AND expandvars applied the way HF applies them.
+
+    The earlier version re-derived a SUBSET of that chain and got three things
+    wrong: XDG_CACHE_HOME ignored, legacy HUGGINGFACE_HUB_CACHE ignored, and no
+    expansion, so ``HF_HOME=~/hfcache`` sent this probe to a literal directory
+    named "~". Each divergence has the same consequence, and it is the bad one:
+    faster-whisper loads the weights fine from the real cache, but this probe
+    never sees them, so `whisper_weights_present()` stays False, `stt_state()`
+    stays "not_downloaded", `enabled()`/`stt_available()` stay False, and every
+    recording goes HOSTED forever while /engines explains it is waiting for a
+    download that already happened. A misread cache path is a privacy
+    regression, not a cosmetic one.
+
+    Deliberately NOT `from huggingface_hub import constants`: those constants are
+    frozen at ITS import, so a process (or a test) that sets the variables later
+    would get a stale answer — and on this machine that stale answer is the real
+    cache, which would silently un-simulate every fresh-machine test. The test
+    suite instead reloads hf's own constants under each layout and asserts this
+    function agrees, so the duplication cannot drift again.
+
+    Read per call, not at import, for the same reason: /engines must re-probe
+    after a download rather than answer from a frozen constant.
+    """
+    roots: list[Path] = []
+
+    def add(raw: str | os.PathLike[str] | None) -> None:
+        if not raw:
+            return
+        path = Path(os.path.expandvars(os.path.expanduser(str(raw))))
+        if path not in roots:
+            roots.append(path)
+
+    default_home = os.path.join(os.path.expanduser("~"), ".cache")
+    hf_home = os.path.expandvars(os.path.expanduser(os.getenv(
+        "HF_HOME",
+        os.path.join(os.getenv("XDG_CACHE_HOME", default_home), "huggingface"),
+    )))
+    legacy = os.getenv("HUGGINGFACE_HUB_CACHE")
+    default_cache = os.path.join(hf_home, "hub")
+
+    # 1. exactly what huggingface_hub resolves HF_HUB_CACHE to.
+    add(os.getenv("HF_HUB_CACHE") or legacy or default_cache)
+    # 2. tolerant extras: a machine can carry weights fetched under an earlier
+    #    layout, and reading one directory too many can only ever find weights
+    #    that are genuinely on disk — it cannot invent readiness.
+    add(legacy)
+    add(default_cache)
+    return roots
+
+
+def whisper_weights_present() -> bool:
+    """Are the Whisper WEIGHTS actually on disk for the configured model?
+
+    Importability is not readiness. `_whisper()` constructs `WhisperModel(...)`,
+    which fetches ~140MB from Hugging Face the first time — on the request path,
+    during somebody's first recording. Reporting "ready" on the strength of an
+    `import faster_whisper` meant /engines and /diagnostics promised "recordings
+    are transcribed on this machine" while the real first recording either
+    stalled on a download or fell back to the hosted model. The user's voice
+    left the machine after being told it would not; that is a privacy
+    overclaim, not a performance nit.
+
+    So this asks the same question `voice_file_for` asks of Piper: is the file
+    there? A CTranslate2 model directory is identified by `model.bin` inside a
+    snapshot, which is what `WhisperModel` loads. If the answer cannot be
+    established, callers report the distinct "installed but not downloaded"
+    state rather than guessing "ready".
+    """
+    direct = Path(WHISPER_MODEL) if WHISPER_MODEL else None
+    if direct is not None and direct.is_dir():
+        return (direct / "model.bin").is_file()
+
+    folder = "models--" + whisper_repo_id().replace("/", "--")
+    for root in _hf_cache_roots():
+        snapshots = root / folder / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        for snapshot in snapshots.iterdir():
+            if (snapshot / "model.bin").is_file():
+                return True
+    return False
+
+
+#: The three honest answers about local recognition. "not_downloaded" exists
+#: because collapsing it into either neighbour lies: into "ready" it promises
+#: local transcription that will not happen, into "not_installed" it hides a
+#: stack that is one prefetch away from working.
+STT_OFF, STT_NOT_INSTALLED, STT_NOT_DOWNLOADED, STT_READY = (
+    "off", "not_installed", "not_downloaded", "ready",
+)
+
+#: How each state reads on /engines. Labels live with the states so a new state
+#: cannot be added without deciding what the user is told.
+STT_LABELS = {
+    STT_OFF: "off",
+    STT_NOT_INSTALLED: "not installed",
+    STT_NOT_DOWNLOADED: "installed, model not downloaded yet — recordings use the hosted model",
+    STT_READY: "ready",
+}
+
+
+def stt_state() -> str:
+    """Which of the three (plus off) states local recognition is really in."""
+    if mode() == _OFF:
+        return STT_OFF
+    if not whisper_installed():
+        return STT_NOT_INSTALLED
+    if not whisper_weights_present():
+        return STT_NOT_DOWNLOADED
+    return STT_READY if enabled() else STT_OFF
+
+
+def piper_installed() -> bool:
+    try:
+        import piper  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _is_complete(onnx: Path) -> bool:
+    """A voice is its WEIGHTS PLUS its config. One file is not a voice.
+
+    Piper loads `<stem>.onnx` together with `<stem>.onnx.json` (phoneme map,
+    sample rate) and cannot load without the second. So "installed" is defined
+    here, once, and every probe below is derived from it.
+    """
+    return onnx.is_file() and Path(str(onnx) + ".json").is_file()
+
+
+def installed_voices() -> list[str]:
+    """Stems of the COMPLETE voices on disk.
+
+    Incomplete .onnx files are ignored rather than listed: an interrupted
+    `piper.download_voices` (the install path requirements-local-voice.txt
+    documents) leaves weights with no config, and calling that a voice made
+    /engines claim a capability that fails at synthesis time.
+    """
+    if not VOICE_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in VOICE_DIR.glob("*.onnx") if _is_complete(p))
+
+
+def enabled() -> bool:
+    """Whether local voice should be USED, after resolving the tri-state.
+
+    "on" here means "permitted and at least one local capability is really
+    present" — never "the flag was set". A flag cannot make a model exist, and
+    reporting otherwise is exactly the lie /engines is supposed to prevent.
+
+    There is deliberately no ``ENABLED`` constant to override any more. The
+    whole point of the tri-state is that enablement is re-resolved per call, so
+    a stored boolean anyone can pin would reintroduce exactly the staleness
+    this replaced — and a pinned "off" is indistinguishable from a genuine
+    absence of models.
+    """
+    current = mode()
+    if current == _OFF:
+        return False
+    if current == _ON:
+        # Forced on: honour the intent for the capabilities that exist, and let
+        # describe() say plainly when the answer is "none of them".
+        return True
+    # Weights, not imports: an importable faster_whisper with nothing on disk is
+    # not a local capability, it is a 140MB download waiting to happen on the
+    # request path. Same standard the Piper side has always been held to.
+    return (whisper_installed() and whisper_weights_present()) or (
+        piper_installed() and bool(installed_voices()))
+
+
+def stt_available() -> bool:
+    """Will a recording ACTUALLY be transcribed here? Nothing weaker.
+
+    Everything user-visible about voice privacy hangs off this one answer —
+    `policy.voice_stays_local`, `describe_voice_privacy`, the engine ledger,
+    /diagnostics — so it must mean the transcription will happen locally, not
+    that the module imported.
+    """
+    return stt_state() == STT_READY
+
+
 def voice_file_for(language: str | None) -> Path | None:
-    """The Piper voice for this language, or None if we don't have one."""
+    """A COMPLETE Piper voice for this language, or None if we don't have one.
+
+    Selects the first complete pair, not the first sorted `.onnx`. That
+    distinction is the whole bug: this used to return the alphabetically first
+    match and `voice_installed` then asked whether THAT file had a config. A
+    single stale `es_ES-carlfm-x_low.onnx` — left by a Ctrl-C'd
+    `piper.download_voices`, the install path we document — sorts before
+    `es_ES-davefx-medium` and therefore answered for it forever. The strict
+    probe never became True even after a perfect 63MB download, so the
+    pre-fetch re-downloaded on every page load, and the loose probe handed
+    `synthesize()` the broken file, so local TTS failed on every request.
+
+    There is deliberately no loose/strict split any more: that seam is what let
+    two probes disagree about the same directory.
+    """
     prefix = VOICE_PREFIXES.get(_lang_key(language))
     if not prefix or not VOICE_DIR.is_dir():
         return None
     for candidate in sorted(VOICE_DIR.glob(f"{prefix}-*.onnx")):
-        return candidate
+        if _is_complete(candidate):
+            return candidate
     return None
 
 
 def tts_available(language: str | None) -> bool:
-    if not ENABLED:
+    if not enabled():
         return False
-    try:
-        import piper  # noqa: F401
-    except Exception:
+    if not piper_installed():
         return False
     return voice_file_for(language) is not None
 
@@ -157,12 +468,281 @@ def synthesize(text: str, *, language: str) -> bytes:
     return buffer.getvalue()
 
 
+def status() -> dict:
+    """The RESOLVED state, structured, for /engines and for tests.
+
+    /engines once printed "hosted — metered" directly above "100% stayed on
+    this machine", because the two lines were derived from different things.
+    Everything that describes voice now derives from this one probe, so the
+    page cannot contradict what actually ran.
+    """
+    current = mode()
+    state = stt_state()
+    stt = state == STT_READY
+    voices = installed_voices()
+    return {
+        "mode": current,                      # what was asked for
+        "setting": raw_setting(),             # verbatim, so the UI can quote it
+        # Set-but-meaningless. Never None-and-fine: a value we couldn't parse
+        # has to reach the surface, or it configures the app by accident.
+        "unrecognised_setting": unrecognised_setting(),
+        "enabled": enabled(),                 # what was resolved
+        "stt_ready": stt,
+        # The three-state answer alongside the boolean, because "not ready"
+        # covers two situations a user can act on differently.
+        "stt_state": state,
+        "stt_engine": f"local:{WHISPER_MODEL}" if stt else "hosted",
+        "piper_ready": enabled() and piper_installed() and bool(voices),
+        "voices": voices,
+        # Forced on with nothing installed is the one case that must not be
+        # allowed to read as success.
+        "forced_but_missing": current == _ON and not (stt or (piper_installed() and voices)),
+    }
+
+
 def describe() -> str:
     """What's actually available, for the engines page."""
-    if not ENABLED:
-        return "off (set PASSAGE_LOCAL_VOICE=1)"
-    parts = []
-    parts.append(f"speech recognition: {'ready' if stt_available() else 'not installed'}")
-    voices = sorted(p.stem for p in VOICE_DIR.glob("*.onnx")) if VOICE_DIR.is_dir() else []
-    parts.append(f"voices: {', '.join(voices) if voices else 'none installed'}")
-    return " · ".join(parts)
+    state = status()
+    if state["mode"] == _OFF:
+        return (f"off (PASSAGE_LOCAL_VOICE={state['setting']}) — "
+                "recordings use the hosted models")
+    detail = " · ".join((
+        # Three states, three sentences. "not installed" used to cover the
+        # not-yet-downloaded case too, and "ready" covered it before that.
+        f"speech recognition: {STT_LABELS.get(state['stt_state'], 'not installed')}",
+        f"voices: {', '.join(state['voices']) if state['voices'] else 'none installed'}",
+    ))
+    if state["forced_but_missing"]:
+        return (f"PASSAGE_LOCAL_VOICE={state['setting']} but nothing local is installed — "
+                f"falling back to hosted ({detail})")
+    # A value we could not parse is reported before anything else it affected:
+    # it silently chose this behaviour, so the page must not present the result
+    # as if it had been asked for.
+    bad = state["unrecognised_setting"]
+    prefix = (f"PASSAGE_LOCAL_VOICE={bad} is not understood (expected 1/0, true/false, "
+              "yes/no or on/off) — using automatic detection · ") if bad else ""
+    if not state["enabled"] or not (state["stt_ready"] or state["piper_ready"]):
+        return f"{prefix}off — nothing local detected ({detail})"
+    how = "forced on" if state["mode"] == _ON else "on (detected automatically)"
+    return f"{prefix}{how} · {detail}"
+
+
+# --------------------- VOICE DOWNLOAD (fetch on demand) ---------------------
+#
+# Each Piper voice is ~63MB. Bundling several bloats the image; pure on-demand
+# means the first use of a language is slow AND needs the network - the worst
+# possible failure for a feature whose entire selling point is not needing the
+# network. So: fetch on demand, and pre-fetch the current target language in
+# the background as soon as the real target language is known (see
+# TranslationUI.request_voice_prefetch, called from the "To" input's change
+# handler on both the workspace and /voice).
+#
+# Nothing here is ever on the critical path of a translation. `ensure_voice`
+# raises nothing and returns None on any failure; the caller then uses hosted
+# TTS and says so via meta["tts"].
+
+#: Where voices are fetched from. Piper's published voices live in the
+#: rhasspy/piper-voices repo on Hugging Face; overridable for mirrors, and for
+#: tests, which must never pull 63MB.
+VOICE_DOWNLOAD_BASE = os.getenv(
+    "PASSAGE_PIPER_VOICE_URL",
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main",
+)
+
+#: Voice-file prefix -> (repo path under the base URL, voice file stem).
+#: Explicit rather than derived: the repo layout is lang/locale/speaker/quality
+#: and the speaker name cannot be computed from the locale.
+VOICE_ASSETS = {
+    "en_US": ("en/en_US/lessac/medium", "en_US-lessac-medium"),
+    "es_ES": ("es/es_ES/davefx/medium", "es_ES-davefx-medium"),
+    "fr_FR": ("fr/fr_FR/siwis/medium", "fr_FR-siwis-medium"),
+    "de_DE": ("de/de_DE/thorsten/medium", "de_DE-thorsten-medium"),
+    "it_IT": ("it/it_IT/riccardo/x_low", "it_IT-riccardo-x_low"),
+    "pt_BR": ("pt/pt_BR/faber/medium", "pt_BR-faber-medium"),
+    "nl_NL": ("nl/nl_NL/mls/medium", "nl_NL-mls-medium"),
+    "pl_PL": ("pl/pl_PL/darkman/medium", "pl_PL-darkman-medium"),
+}
+
+#: A voice download is ~63MB; a stalled socket must not pin a thread forever.
+DOWNLOAD_TIMEOUT = float(os.getenv("PASSAGE_PIPER_DOWNLOAD_TIMEOUT", "60"))
+
+#: Guards two page loads racing to fetch the same voice. Per-process only - a
+#: second process would redo the work, which is wasteful but still correct,
+#: because publication is an atomic rename either way.
+_download_locks: dict = {}
+
+
+def voice_installed(language: str | None) -> bool:
+    """Is a COMPLETE voice on disk for this language?
+
+    Now exactly `voice_file_for(...) is not None` — the same question, asked
+    once. It used to be the "strict" half of a two-probe split (glob for the
+    .onnx here, check the .json there) and the two could disagree about the
+    same directory; see `voice_file_for`. Kept as a name because it reads
+    better at the call sites that are asking about state rather than a path.
+    """
+    return voice_file_for(language) is not None
+
+
+def _fetch_url(url: str, destination: Path, *, timeout: float) -> None:
+    """Stream one URL to a path. Isolated so tests can replace the network."""
+    from urllib.request import urlopen
+    with urlopen(url, timeout=timeout) as response:  # noqa: S310 - fixed base URL
+        with open(destination, "wb") as handle:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                handle.write(chunk)
+
+
+def ensure_voice(language: str | None, *, timeout: float | None = None) -> Path | None:
+    """Return a usable voice path for `language`, downloading it if missing.
+
+    Never raises, and never partially shadows a good voice:
+
+    * both files stream into dot-prefixed `.part` temporaries first, so a
+      killed download leaves nothing that `voice_file_for`'s `*.onnx` glob can
+      mistake for an installed voice;
+    * the .onnx.json is renamed into place BEFORE the .onnx, because the .onnx
+      is what the probe looks for - publishing it last means the voice becomes
+      visible only once it is complete;
+    * an already-complete voice short-circuits, so a re-fetch can never replace
+      a working file with a truncated one.
+
+    This is slow by nature (~63MB) and must only be called off the request
+    path, from the background pre-fetch. A translation that finds no voice uses
+    hosted TTS and reports it rather than waiting for this.
+    """
+    if voice_installed(language):
+        return voice_file_for(language)
+
+    prefix = VOICE_PREFIXES.get(_lang_key(language))
+    asset = VOICE_ASSETS.get(prefix or "")
+    if asset is None:
+        logging.info("[LocalVoice] no downloadable voice for %s", language)
+        return None
+    repo_path, stem = asset
+
+    import threading
+    lock = _download_locks.setdefault(stem, threading.Lock())
+    with lock:
+        # Another thread may have finished while this one waited for the lock.
+        if voice_installed(language):
+            return voice_file_for(language)
+
+        target_dir = VOICE_DIR
+        onnx = target_dir / (stem + ".onnx")
+        config = target_dir / (stem + ".onnx.json")
+        # Dot-prefixed and NOT ending in .onnx: invisible to the install probe.
+        temp_onnx = target_dir / ("." + stem + ".onnx.part")
+        temp_config = target_dir / ("." + stem + ".onnx.json.part")
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            wait = DOWNLOAD_TIMEOUT if timeout is None else timeout
+            logging.info("[LocalVoice] fetching voice %s (~63MB)", stem)
+            _fetch_url(VOICE_DOWNLOAD_BASE + "/" + repo_path + "/" + stem + ".onnx.json",
+                       temp_config, timeout=wait)
+            _fetch_url(VOICE_DOWNLOAD_BASE + "/" + repo_path + "/" + stem + ".onnx",
+                       temp_onnx, timeout=wait)
+            if temp_onnx.stat().st_size == 0 or temp_config.stat().st_size == 0:
+                raise RuntimeError("empty voice download")
+            os.replace(temp_config, config)   # config first...
+            os.replace(temp_onnx, onnx)       # ...weights last: now it is installed
+            logging.info("[LocalVoice] voice ready: %s", stem)
+            return onnx if voice_installed(language) else None
+        except Exception as error:
+            logging.info("[LocalVoice] voice fetch failed for %s (%s)", language, error)
+            for leftover in (temp_onnx, temp_config):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            return None
+
+
+def prefetch_voice(language: str | None) -> None:
+    """Kick off a voice download in the background. Fire-and-forget.
+
+    Same shape as `TranslationBackend.prewarm_live`: off the render path, in a
+    daemon thread, failures swallowed and logged, never awaited by the UI. If
+    it finishes in time the next translation speaks locally; if it does not,
+    that translation goes hosted and says so. Nothing blocks on this.
+    """
+    # Downloads follow the same switch synthesis does — `enabled()`, the
+    # tri-state above — so we can never fetch for a feature that is off. That
+    # guard comes FIRST. It briefly did not: `prefetch_whisper()` was called
+    # above this line and its own guards only checked mode()=="off", so a user
+    # with faster_whisper importable, no voices, no weights and the flag unset —
+    # `enabled()` False, every recording hosted — still started a 142MB download
+    # on page render. That quietly turned DECISIONS.md §2 from "on when the
+    # models are present" into "download them to make them present".
+    if not enabled():
+        return
+    # Recognition is language-independent, so it is fetched from the same hook
+    # rather than waiting for a language the user may never pick. Its own guards
+    # make this a no-op whenever the weights are already there.
+    prefetch_whisper()
+    if voice_installed(language):
+        return
+    if VOICE_PREFIXES.get(_lang_key(language)) is None:
+        return
+
+    def fetch() -> None:
+        try:
+            ensure_voice(language)
+        except Exception as error:  # ensure_voice swallows already; belt and braces
+            logging.info("[LocalVoice] background prefetch skipped (%s)", error)
+
+    import threading
+    threading.Thread(target=fetch, daemon=True).start()
+
+
+#: Single-flight guard for the recogniser download, so a burst of page loads
+#: starts one fetch rather than one per render. Per process, like the voice
+#: locks: a second process redoing the work is wasteful, never incorrect.
+_whisper_prefetch_lock = None
+_whisper_prefetch_started = False
+
+
+def prefetch_whisper() -> None:
+    """Pull the Whisper weights in the background. Fire-and-forget.
+
+    The asymmetry this closes: the 63MB Piper download was deliberately moved
+    off the request path by `prefetch_voice`, while the ~140MB recogniser
+    download stayed ON it, inside the first `transcribe()`. Same shape as
+    `prefetch_voice` and `TranslationBackend.prewarm_live` — daemon thread,
+    failures swallowed and logged, never awaited, nothing blocks on it.
+
+    It cannot make the app claim more than it has: readiness is still decided by
+    `whisper_weights_present()` reading the disk, so /engines only says "ready"
+    once this has actually finished.
+    """
+    global _whisper_prefetch_lock, _whisper_prefetch_started
+    # `enabled()`, not `mode() != "off"`: the switch that decides whether audio
+    # is processed locally is the same switch that decides whether we may spend
+    # 142MB of someone's bandwidth preparing for it. Enforced HERE, at the
+    # download site, so no future caller can reach the fetch by forgetting a
+    # guard of its own. Under "auto" this means we only pull the recogniser for
+    # a machine where local voice is already a real capability; forced-on
+    # (PASSAGE_LOCAL_VOICE=1) is the explicit opt-in that bootstraps it.
+    if not enabled() or not whisper_installed() or whisper_weights_present():
+        return
+
+    import threading
+    if _whisper_prefetch_lock is None:
+        _whisper_prefetch_lock = threading.Lock()
+    with _whisper_prefetch_lock:
+        if _whisper_prefetch_started:
+            return
+        _whisper_prefetch_started = True
+
+    def fetch() -> None:
+        try:
+            # Constructing the model IS the download; doing it here means the
+            # first recording finds a warm cache instead of a 140MB stall.
+            _whisper()
+        except Exception as error:
+            logging.info("[LocalVoice] whisper prefetch skipped (%s)", error)
+
+    threading.Thread(target=fetch, daemon=True).start()

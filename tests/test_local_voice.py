@@ -1,4 +1,10 @@
-"""Local speech: availability gating, language codes, and hosted fallback."""
+"""Local speech: availability gating, language codes, and hosted fallback.
+
+These use the PASSAGE_LOCAL_VOICE env var rather than pinning the old
+module-level ENABLED constant: the flag is tri-state and resolved per call now
+(see test_local_voice_default.py), so a frozen boolean is no longer the thing
+under test.
+"""
 import sys
 from pathlib import Path
 
@@ -28,7 +34,7 @@ def test_iso_codes_come_from_the_voice_table_not_a_name_slice():
 def test_everything_is_off_when_the_feature_is_disabled(monkeypatch):
     """Local speech pulls in a model stack; it must be opt-in, and disabled
     must mean disabled even when the libraries happen to be installed."""
-    monkeypatch.setattr(local_voice, "ENABLED", False)
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "0")
 
     assert local_voice.stt_available() is False
     assert local_voice.tts_available("Spanish") is False
@@ -38,7 +44,7 @@ def test_everything_is_off_when_the_feature_is_disabled(monkeypatch):
 def test_transcribe_raises_rather_than_silently_doing_nothing(monkeypatch):
     """Callers fall back to hosted on the exception. Returning "" would look
     like a successful transcription of silence."""
-    monkeypatch.setattr(local_voice, "ENABLED", False)
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "0")
     try:
         local_voice.transcribe(b"\x00\x01")
         assert False, "expected RuntimeError"
@@ -49,9 +55,12 @@ def test_transcribe_raises_rather_than_silently_doing_nothing(monkeypatch):
 def test_synthesis_needs_a_voice_for_that_language(monkeypatch, tmp_path):
     """A missing voice falls back to hosted rather than speaking one language
     with another's phonemes."""
-    monkeypatch.setattr(local_voice, "ENABLED", True)
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "1")
     monkeypatch.setattr(local_voice, "VOICE_DIR", tmp_path)
     (tmp_path / "es_ES-davefx-medium.onnx").write_bytes(b"stub")
+    # Weights alone are not a voice: discovery requires the .onnx.json Piper
+    # loads alongside them.
+    (tmp_path / "es_ES-davefx-medium.onnx.json").write_text("{}", encoding="utf-8")
 
     assert local_voice.voice_file_for("Spanish") is not None
     assert local_voice.voice_file_for("Japanese") is None
@@ -63,7 +72,7 @@ def test_synthesis_needs_a_voice_for_that_language(monkeypatch, tmp_path):
 
 
 def test_missing_voice_directory_is_not_an_error(monkeypatch, tmp_path):
-    monkeypatch.setattr(local_voice, "ENABLED", True)
+    monkeypatch.setenv("PASSAGE_LOCAL_VOICE", "1")
     monkeypatch.setattr(local_voice, "VOICE_DIR", tmp_path / "nope")
 
     assert local_voice.voice_file_for("Spanish") is None

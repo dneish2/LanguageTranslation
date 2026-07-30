@@ -29,6 +29,64 @@ def test_a_failing_engine_does_not_void_the_comparison():
     assert "refused" in results[1].error
 
 
+def test_a_failure_after_delivery_is_told_apart_from_a_connection_that_never_opened():
+    """`ok` is false for both, and only one of them is about where text went.
+
+    Everything a provider does AFTER taking the sentence — 429, 500, a timeout
+    waiting for the answer, an empty reply — leaves the bytes on someone else's
+    machine and has to be disclosed. A refused or unresolvable connection sent
+    nothing, and disclosing it prints "sent out" to an offline user. /engines
+    booked a row on `not is_local` alone and told exactly that user their text
+    had left while the provider's own call counter sat at zero.
+    """
+    def refused_underneath():
+        # How the openai SDK arrives: its own error wrapping the transport's,
+        # chained with `raise ... from`.
+        try:
+            raise ConnectionRefusedError(10061, "No connection could be made")
+        except ConnectionRefusedError as cause:
+            raise RuntimeError("Connection error.") from cause
+
+    failures = {
+        "refused": ConnectionRefusedError(10061, "No connection could be made"),
+        "dns": OSError("[Errno 11001] getaddrinfo failed"),
+        "flattened": RuntimeError("Connection error: could not reach api.openai.com"),
+        "rate_limited": RuntimeError("Error code: 429 - rate limit exceeded"),
+        "server_error": RuntimeError("Error code: 500 - internal server error"),
+        "timed_out": TimeoutError("Request timed out."),
+    }
+
+    def translate(candidate):
+        if candidate["label"] == "wrapped":
+            refused_underneath()
+        if candidate["label"] in failures:
+            raise failures[candidate["label"]]
+        if candidate["label"] == "empty":
+            return "   "
+        return "Hola mundo"
+
+    def run(*labels):
+        # Two batches because MAX_CANDIDATES is 6 and the cap is real.
+        return {r.label: r for r in compare.run_comparison(
+            _candidates(*[(label, False) for label in labels]), translate)}
+
+    # Nothing left this machine: not a disclosure.
+    never_sent = run("refused", "dns", "flattened", "wrapped", "fine")
+    for label in ("refused", "dns", "flattened", "wrapped"):
+        assert never_sent[label].ok is False, never_sent[label]
+        assert never_sent[label].reached is False, never_sent[label].error
+
+    # The bytes are already gone; only the answer is missing.
+    delivered = run("rate_limited", "server_error", "timed_out", "empty", "fine")
+    for label in ("rate_limited", "server_error", "timed_out", "empty"):
+        assert delivered[label].ok is False, delivered[label]
+        assert delivered[label].reached is True, delivered[label].error
+
+    # A leg that worked is reached and ok, in both batches.
+    for batch in (never_sent, delivered):
+        assert (batch["fine"].ok, batch["fine"].reached) == (True, True), batch["fine"]
+
+
 def test_empty_output_is_reported_as_a_failure():
     """Two real local models (qwen3:30b, qwen3-vl:8b) returned nothing under a
     terse translation prompt. A blank row that looks successful would be worse
