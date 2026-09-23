@@ -345,6 +345,51 @@ complete-pair voice probe are all covered by tests that assert which path ran, b
 carries a before/after latency number. They are correctness changes, and claiming a performance
 result for them would be inventing one.
 
+## 4c. Production probe, 2026-09-23: what prod actually does
+
+A read-only look at the live service (revision 00052, deployed 2026-07-30) and its logs, before
+changing anything. Each item is either measured or stated as unmeasured.
+
+**Data never survived in the cloud.** `record_feedback` has appended approved segments to
+`./trl_finetune_data.jsonl` since 2025, and `traces.py` writes document traces to
+`data/traces/`. Both paths are on the Cloud Run container disk, so every approval and edit made in
+prod was lost at the next restart. The project has one bucket, and it belongs to Cloud Build. There
+has never been a per-user or aggregate store. Locally, both files persist, which is why it looked as
+if data was being kept. This is the input to the storage decision in `DECISIONS.md` §10.
+
+**The overlay font was a bitmap in prod.** `/api/health` reported `font.bitmap_fallback: true`: the
+slim image had no TTF fonts, so translated photos rendered accented text as tofu. It never showed up
+locally because Windows resolves Arial. Fixed by installing `fonts-dejavu-core`; a podman build now
+resolves `DejaVuSans.ttf`.
+
+**Cold starts are slow, but not because of the app.** Prod logs show 15 to 80 s from "Starting new
+instance" to ready, and on 2026-09-01 thirteen consecutive starts missed the 240 s startup probe.
+Locally at Cloud Run's limits (1 CPU, 512 MB), the same image is ready in ~1.5 s (N=5, both before
+and after this round's image changes; 398 MB before, 405 MB after). The gap is the platform: image
+pull and gVisor. My first hypothesis was that the untracked 103 MB `design-system/node_modules` was
+bloating the image. That was wrong: CI builds from a clean checkout, which has 509 KB of it.
+
+**min-instances is 1, set outside `deploy.yml`.** The service carries `run.googleapis.com/minScale: 1`
+at service level, so one instance bills continuously. That contradicts `DECISIONS.md` §7, which
+records the flag as deliberately *not* set. It is left as it is, for David to decide.
+
+**A stable session secret would not have kept sessions.** The plan was to stop regenerating
+`storage_secret` on each process start. It turns out that `app.storage.user` lives in `.nicegui/*.json`
+on the same container disk, so a restart loses the data whatever the cookie says. That change was
+dropped, and the durable answer is the storage decision, not the secret.
+
+**Offline test suite:** with no tokenizer cache and the network blocked, 27 failed and 562 passed
+(106 s) before the fix; after it, 590 passed (35 s). The tokenizer is now resolved once per process,
+and the image bakes the file in.
+
+**Found while browser-checking:** a DOCX with no URL in it came back from local `qwen2.5:7b` with
+`[[PSG:0]]` appended. The prompt described placeholders to a model whose input contained none, and
+the restore step skipped its debris scrub when nothing had been masked. Both are fixed, and a re-run
+shows no debris.
+
+**Concurrency:** with the switch interval forced to 1 µs, the shared translation cache raised
+"dictionary changed size during iteration" in 3 of 3 runs without a lock, and 0 of 3 with one.
+
 ## 5. Prompt for the next session
 
 Paste this to continue. It assumes nothing beyond the repo.
