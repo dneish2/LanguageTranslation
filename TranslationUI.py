@@ -915,7 +915,11 @@ class TranslationUI(VoicePageMixin):
                     with run_row:
                         ui.spinner(size="sm")
                         ui.label("Running every engine…").classes(theme.DATA)
-                    candidates = self.backend.comparison_candidates(self.active_profile)
+                    # Discovery probes local Ollama (up to its 2.5 s timeout on
+                    # a cache miss), so it runs off the loop like the fan-out
+                    # below; a sync probe here froze every client's socket.
+                    candidates = await asyncio.to_thread(
+                        self.backend.comparison_candidates, self.active_profile)
                     # Bound here, on the request context, for the same reason
                     # the cache scope is: the recording happens after a worker
                     # thread call and app.storage.user is not reachable from
