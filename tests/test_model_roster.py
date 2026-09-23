@@ -57,6 +57,25 @@ def test_calculate_tokens_survives_model_names_unknown_to_tiktoken(monkeypatch):
     assert backend.calculate_tokens("hello world") > 0
 
 
+
+def test_calculate_tokens_estimates_instead_of_fetching_when_offline(monkeypatch):
+    """No cached encoding and no network must not fail a document; the tokenizer is
+    tried once per process, not once per document."""
+    calls = []
+
+    def unreachable(*_a, **_k):
+        calls.append(1)
+        raise ConnectionError("blocked")
+
+    monkeypatch.setattr(tb, "_token_encoding_cache", tb._TOKEN_ENCODING_UNSET)
+    monkeypatch.setattr(tb.tiktoken, "encoding_for_model", unreachable)
+    monkeypatch.setattr(tb.tiktoken, "get_encoding", unreachable)
+    backend = tb.TranslationBackend()
+
+    assert backend.calculate_tokens("a" * 10) == 3
+    assert backend.calculate_tokens("") == 0
+    assert len(calls) == 1
+
 def _wav_bytes(rate=24000, channels=1, frames=b"\x01\x00\x02\x00\x03\x00\x04\x00"):
     import wave
     from io import BytesIO

@@ -1020,6 +1020,40 @@ def _log_event(event: str, correlation_id: str | None = None, **fields: Any) -> 
     LOGGER.info(json.dumps(payload, default=str))
 
 
+_TOKEN_ENCODING_UNSET = object()
+_token_encoding_cache = _TOKEN_ENCODING_UNSET
+_token_encoding_lock = Lock()
+
+
+def _token_encoding():
+    """Resolve the tokenizer once per process, and never let it reach the network twice.
+
+    tiktoken does not know the gpt-5.x names ("gpt-5." is not its "gpt-5-" prefix), so
+    encoding_for_model raises and the o200k_base fallback is fetched from a public blob
+    the first time it is needed. On Cloud Run that fetch happened on the first document
+    per instance, and in an offline sandbox it failed 27 tests. The Docker image now
+    bakes the file into TIKTOKEN_CACHE_DIR, so the fetch never happens there. Anywhere
+    it still can't be loaded, this returns None once and the caller estimates;
+    retrying the download on every document would put a network timeout on the
+    request path for a display number.
+    """
+    global _token_encoding_cache
+    if _token_encoding_cache is not _TOKEN_ENCODING_UNSET:
+        return _token_encoding_cache
+    with _token_encoding_lock:
+        if _token_encoding_cache is _TOKEN_ENCODING_UNSET:
+            try:
+                try:
+                    enc = tiktoken.encoding_for_model(TEXT_MODEL)
+                except KeyError:
+                    enc = tiktoken.get_encoding("o200k_base")
+            except Exception as exc:  # network, missing cache, corrupt file
+                LOGGER.warning("token encoding unavailable, estimating instead: %s", exc)
+                enc = None
+            _token_encoding_cache = enc
+    return _token_encoding_cache
+
+
 class TranslationBackend:
     """Handles GPT-based text/document translation and experimental voice I/O."""
 
@@ -2368,10 +2402,10 @@ class TranslationBackend:
 
     # ─────────────────────────── TOKEN COUNTS ─────────────────────────── #
     def calculate_tokens(self, total_text: str) -> int:
-        try:
-            encoding = tiktoken.encoding_for_model(TEXT_MODEL)
-        except KeyError:  # tiktoken doesn't know newest model names
-            encoding = tiktoken.get_encoding("o200k_base")
+        encoding = _token_encoding()
+        if encoding is None:
+            # No encoding available offline: an estimate, not a count.
+            return -(-len(total_text) // 4)
         return len(encoding.encode(total_text))
 
     # ──────────────────────── SMALL PDF HELPER ────────────────────────── #
