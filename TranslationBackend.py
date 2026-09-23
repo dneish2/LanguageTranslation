@@ -839,7 +839,7 @@ class ChatCompletionsProvider(BaseTranslationProvider):
 
     def __init__(
         self, *, api_key: str, base_url: str | None = None, text_model: str | None = None,
-        max_input_chars: int | None = None,
+        max_input_chars: int | None = None, vision_model: str | None = None,
     ) -> None:
         # Resolved inside __init__, not as a keyword default, so it reads
         # TEXT_MODEL at construction time — a mutable-global default would
@@ -851,10 +851,26 @@ class ChatCompletionsProvider(BaseTranslationProvider):
         # document segment never overflows it in practice). Small local
         # models need one — see OLLAMA_MAX_INPUT_CHARS.
         self.max_input_chars = max_input_chars
+        self._vision_model = vision_model
         client_kwargs: dict[str, Any] = {"api_key": api_key or "not-needed"}
         if base_url:
             client_kwargs["base_url"] = base_url
         self.client = openai.OpenAI(**client_kwargs)
+
+    @property
+    def vision_model(self) -> str:
+        """The model an image (OCR) call names on THIS provider's endpoint.
+
+        VISION_MODEL is Passage's hosted model and means nothing to anyone
+        else's server: sending it to a BYO base_url either fails ("model not
+        found") or runs whatever that server maps the name to. An explicit
+        model (a profile's) wins; otherwise hosted gets VISION_MODEL and any
+        other endpoint gets the model it was configured with. Read lazily so
+        VISION_MODEL is its value at call time.
+        """
+        if self._vision_model:
+            return self._vision_model
+        return VISION_MODEL if self.is_openai_hosted else self.text_model
 
     def _require_openai_hosted(self, capability: str) -> None:
         if not self.is_openai_hosted:
@@ -1753,6 +1769,9 @@ class TranslationBackend:
             base_url=profile.base_url or None,
             text_model=profile.model or TEXT_MODEL,
             max_input_chars=OLLAMA_MAX_INPUT_CHARS if profile.uses_local_inference else None,
+            # The profile names one model, the only one the user has told us
+            # their endpoint serves, so image calls use it too.
+            vision_model=profile.model or None,
         )
         self._profile_providers[fingerprint] = provider
         return provider
@@ -2371,11 +2390,21 @@ class TranslationBackend:
         # Nothing about this call touches the translation cache, so it is only
         # visible to provenance because it says so here.
         _note_engine(_provider_identity(vision_provider))
+        # The model is the PROVIDER's, not the VISION_MODEL constant. Naming
+        # the constant here sent "gpt-5.4-mini" to a BYO user's own base_url:
+        # a profile swaps the provider, but this line never asked it. A
+        # provider with no vision_model (a test double) is the hosted default.
+        vision_model = getattr(vision_provider, "vision_model", None) or VISION_MODEL
+        limit_kwargs = (
+            _completion_limit_kwargs(vision_model, 1200)
+            if getattr(vision_provider, "is_openai_hosted", True)
+            else {"max_tokens": 1200}
+        )
         completion = vision_provider.client.chat.completions.create(
-            model=VISION_MODEL,
+            model=vision_model,
             messages=messages,
             response_format={"type": "json_object"},
-            **_completion_limit_kwargs(VISION_MODEL, 1200),
+            **limit_kwargs,
         )
         raw = completion.choices[0].message.content.strip()
         payload = json.loads(raw)
