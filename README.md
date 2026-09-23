@@ -8,13 +8,12 @@ model otherwise — and then names, per request, which of those actually answere
 about model behaviour was measured against the running app rather than read off a model card;
 `passage/model_bench.py` reproduces it.
 
-**Origin.** This started as an internal tool for people doing real translation work, and it was
-paid for. It is no longer that, and this repository is the rebuild: same problem, rewritten around
-a question the original never asked — *where did this text actually go?*
-
-> **`TODO(david)`** — replace the sentence above with the specifics: what the internal tool was
-> for, roughly who used it, and what it replaced. That detail is the difference between "side
-> project" and "shipped system with users", and it is the one claim here nobody but you can write.
+**Origin.** This started as an internal tool: a Python web app that translated PowerPoint decks,
+documents and PDFs for teams who were paying an agency to do the same work. It cut turnaround by
+about 95% with an error rate under 5%, at a fraction of the agency cost, and it had real users
+doing real translation work under deadline. This repository is not that tool. It is the rebuild:
+same problem, rewritten around a question the original never asked — *where did this text actually
+go?*
 
 ---
 

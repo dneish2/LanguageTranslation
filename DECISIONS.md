@@ -259,7 +259,36 @@ as delivered.
 
 ---
 
+## 10. Where data lives: two modes, and an opt-in way to contribute from the cloud
+
+**Resolution (David, 2026-09-23): adopt the two deployment modes in `INFERENCE_ADAPTER_PLAN.md`,
+and keep fine-tuning data. Not yet implemented; this is roadmap milestone R3.**
+
+The probe in `RESEARCH.md` §4c found that nothing written in prod has ever survived a restart,
+including the approved segments that were meant as fine-tuning data. David wants that data, so
+"no durable storage" cannot stay absolute. The design keeps the auth cut in place:
+
+- **One segment store.** `traces.py` becomes the only writer: machine output, the human's edit or
+  approval, the engine, the language pair and the receipt. `record_feedback`'s separate file goes
+  away, along with its language bug: it read the target language from shared backend state, so
+  under concurrent use it recorded another session's language.
+- **Local mode:** durable on disk under one data directory. This is the owner's corpus.
+- **Cloud mode:** session-only unless the user turns on "contribute corrections". When it is on,
+  segment pairs (never original files, per `policy.py`) are appended to a private bucket, keyed by
+  the anonymous browser id. The user can download their own session's data; David queries the bucket
+  in aggregate. Accounts stay behind the unwired `passage/auth`.
+- **Export:** SFT pairs from approvals, DPO pairs from edits (model output rejected, human edit
+  chosen), and TMX for translation-memory tools. Pairs a human edited are the defensible core for
+  training; OpenAI's terms restrict using raw outputs to build competing models.
+
+Creating the bucket is an infrastructure change and needs David's approval when R3 lands.
+
+---
+
 ## NEEDS DAVID — genuinely blocked
+
+- **min-instances.** Prod has `minScale: 1` at service level, set outside `deploy.yml`, so it
+  bills continuously. §7 says it was deliberately not set. Keep it or remove it (`RESEARCH.md` §4c).
 
 - **Supabase URL + anon key.** Auth verification is ported and live-tested against a throwaway
   project; the sign-in UI and any durable per-user storage need the real values. Both are designed

@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import time
 from io import BytesIO
@@ -398,7 +399,7 @@ def test_retranslate_segment_callback_reads_its_own_document_run_state(monkeypat
     import TranslationUI as translation_ui_module
     monkeypatch.setattr(translation_ui_module.ui, "notify", lambda msg, **k: notified.append(msg))
 
-    ui_a.retranslate_segment_callback("seg-a", textarea)
+    asyncio.run(ui_a.retranslate_segment_callback("seg-a", textarea))
 
     assert textarea.value == "Hola"
     assert not any("not found" in str(m).lower() for m in notified)

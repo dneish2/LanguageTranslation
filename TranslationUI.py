@@ -915,7 +915,11 @@ class TranslationUI(VoicePageMixin):
                     with run_row:
                         ui.spinner(size="sm")
                         ui.label("Running every engine…").classes(theme.DATA)
-                    candidates = self.backend.comparison_candidates(self.active_profile)
+                    # Discovery probes local Ollama (up to its 2.5 s timeout on
+                    # a cache miss), so it runs off the loop like the fan-out
+                    # below; a sync probe here froze every client's socket.
+                    candidates = await asyncio.to_thread(
+                        self.backend.comparison_candidates, self.active_profile)
                     # Bound here, on the request context, for the same reason
                     # the cache scope is: the recording happens after a worker
                     # thread call and app.storage.user is not reachable from
@@ -1960,14 +1964,18 @@ class TranslationUI(VoicePageMixin):
 
     # ──────────────────────────────────── SEGMENT ACTIONS ────────────────────────────────────
 
-    def update_segment_callback(self, seg_id, textarea, refine_input):
+    async def update_segment_callback(self, seg_id, textarea, refine_input):
         try:
             instructions = refine_input.value or None
             # Captured before the call: this is the machine's output, and the
             # difference between it and what the human settles on is the only
             # ground truth this app ever gets.
             machine_output = self.translated_segments_map.get(seg_id, "")
-            updated = self.backend.update_segment(
+            # With instructions this is a model call; off the event loop, or
+            # every connected client's websocket heartbeat stalls behind it
+            # (DECISIONS.md §7, cause one).
+            updated = await asyncio.to_thread(
+                self.backend.update_segment,
                 seg_id, textarea.value, self.current_target_language, instructions,
                 run_state=self.document_run_state,
             )
@@ -1983,30 +1991,37 @@ class TranslationUI(VoicePageMixin):
             logging.error(f"[UI] Error updating segment {seg_id}: {ex}", exc_info=True)
             ui.notify(f"Update failed: {ex}", type="negative")
 
-    def retranslate_segment_callback(self, seg_id, textarea):
+    async def retranslate_segment_callback(self, seg_id, textarea):
         try:
             seg_info = self.document_run_state.segment_map.get(seg_id)
             if not seg_info:
                 ui.notify("Segment not found", type="negative")
                 return
-            ui.notify("Re-­translating...", type="info")
+            ui.notify("Re-translating...", type="info")
             original = seg_info["original"]
             # A segment re-translation is the same credential decision as the
             # document it belongs to: the job honoured the session's endpoint,
             # so this must too, and must be booked under whatever it honoured
             # rather than a hosted literal.
             profile = self.active_profile
-            with self.backend.cache_scope(self.session_cache_scope), \
-                    self.backend.using_profile(profile):
-                new_trans = self._run_recorded(
-                    self._engine_recorder(), self.backend.translate_text,
-                    (original, self.current_target_language),
-                    surface=policy.Surface.DOCUMENT,
-                    engine=self._text_engine_label(profile),
-                    chars=len(original or ""))
-            self.backend.update_segment(
-                seg_id, new_trans, self.current_target_language, run_state=self.document_run_state,
-            )
+            # Everything that reads session storage is captured here, on the
+            # request context; the model call then runs off the event loop so
+            # it cannot stall every other client's websocket heartbeat.
+            record = self._engine_recorder()
+            scope, target = self.session_cache_scope, self.current_target_language
+            engine = self._text_engine_label(profile)
+            run_state = self.document_run_state
+
+            def work():
+                with self.backend.cache_scope(scope), self.backend.using_profile(profile):
+                    translated = self._run_recorded(
+                        record, self.backend.translate_text, (original, target),
+                        surface=policy.Surface.DOCUMENT, engine=engine,
+                        chars=len(original or ""))
+                self.backend.update_segment(seg_id, translated, target, run_state=run_state)
+                return translated
+
+            new_trans = await asyncio.to_thread(work)
             textarea.value = new_trans
             self.translated_segments_map[seg_id] = new_trans
             ui.notify("Re-translation complete!", type="positive")
@@ -2109,7 +2124,7 @@ class TranslationUI(VoicePageMixin):
                 ui.label(f"- {message}").classes("text-sm")
                 ui.label(shown).classes(f"{theme.DATA} text-xs mb-2")
 
-    def save_all_edits(self):
+    async def save_all_edits(self):
         """Apply every segment editor's CURRENT contents to the document.
 
         This used to call regenerate_output_stream() and nothing else, which
@@ -2141,7 +2156,8 @@ class TranslationUI(VoicePageMixin):
                 if current.strip() == (machine_output or "").strip():
                     continue
                 try:
-                    updated = self.backend.update_segment(
+                    updated = await asyncio.to_thread(
+                        self.backend.update_segment,
                         seg_id,
                         current,
                         self.current_target_language,
@@ -2165,7 +2181,8 @@ class TranslationUI(VoicePageMixin):
                 changed.append(seg_id)
 
             # Rebuild the download stream once, after the edits are in the doc.
-            self.backend.regenerate_output_stream(run_state=self.document_run_state)
+            await asyncio.to_thread(
+                self.backend.regenerate_output_stream, run_state=self.document_run_state)
 
             if failed and not changed:
                 ui.notify(
