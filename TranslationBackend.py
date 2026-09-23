@@ -711,23 +711,31 @@ class BoundedTranslationCache(dict):
     def __init__(self, max_entries: int = CACHE_MAX_ENTRIES) -> None:
         super().__init__()
         self.max_entries = max(1, int(max_entries))
+        # Document jobs, live typing and /compare write from different threads.
+        # Unlocked, eviction's next(iter(self)) races another thread's
+        # delete-and-reinsert and raises "dictionary changed size during
+        # iteration" out of a cache write, failing a translation that had
+        # already succeeded (reproduced 3/3 with a 1us switch interval).
+        self._lock = Lock()
 
     def __setitem__(self, key, value) -> None:
-        if key in self:
-            super().__delitem__(key)
-        super().__setitem__(key, value)
-        while len(self) > self.max_entries:
-            super().__delitem__(next(iter(self)))
+        with self._lock:
+            if key in self:
+                super().__delitem__(key)
+            super().__setitem__(key, value)
+            while len(self) > self.max_entries:
+                super().__delitem__(next(iter(self)))
 
     def get(self, key, default=None):
-        if key not in self:
-            return default
-        value = super().__getitem__(key)
-        # Touch: dicts preserve insertion order, so re-inserting makes this the
-        # newest entry and keeps eviction LRU rather than strictly FIFO.
-        super().__delitem__(key)
-        super().__setitem__(key, value)
-        return value
+        with self._lock:
+            if key not in self:
+                return default
+            value = super().__getitem__(key)
+            # Touch: dicts preserve insertion order, so re-inserting makes this the
+            # newest entry and keeps eviction LRU rather than strictly FIFO.
+            super().__delitem__(key)
+            super().__setitem__(key, value)
+            return value
 
 
 def _ambient_cache_scope() -> str | None:
@@ -1339,6 +1347,7 @@ class TranslationBackend:
             },
         )
         with self._jobs_lock:
+            self._prune_finished_jobs_locked(time.time())
             self._jobs[job_id] = job
             self._run_states[job_id] = TranslationRunState()
 
@@ -1365,6 +1374,38 @@ class TranslationBackend:
 
         Thread(target=worker, daemon=True).start()
         return job_id
+
+    #: A finished job's document, output stream and segments stay reachable for
+    #: this long after it ends. The page that submitted it collects the result
+    #: within one 0.2s poll and keeps its own reference to the run state, so
+    #: this only has to outlive a slow poll, not the editing session.
+    FINISHED_JOB_TTL_SECONDS = 15 * 60
+
+    def _prune_finished_jobs_locked(self, now: float) -> None:
+        """Drop jobs that ended more than FINISHED_JOB_TTL_SECONDS ago.
+
+        Nothing evicted these before. Each one pins a whole document (source,
+        rewritten output, segment map) in a process that Cloud Run caps at
+        512Mi, so a long-lived instance grew by one document per translation
+        with no ceiling (min-instances=1 keeps one alive for days). Called with
+        _jobs_lock held, on job submit:
+        memory is only reclaimed when new work arrives, which is also when it
+        is needed.
+        """
+        terminal = {JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELED}
+        expired = [
+            job_id for job_id, job in self._jobs.items()
+            if job.state in terminal and now - job.updated_at > self.FINISHED_JOB_TTL_SECONDS
+        ]
+        if not expired:
+            return
+        gone = set(expired)
+        for job_id in expired:
+            self._jobs.pop(job_id, None)
+            self._run_states.pop(job_id, None)
+        for handle in [h for h, j in self._result_handle_to_job_id.items() if j in gone]:
+            self._result_handle_to_job_id.pop(handle, None)
+            self._job_results.pop(handle, None)
 
     def get_job(self, job_id: str) -> TranslationJob | None:
         with self._jobs_lock:

@@ -129,3 +129,55 @@ def test_translate_text_raises_after_max_attempts(monkeypatch):
         backend.translate_text("Fallback text", "Italian")
 
     assert stub.calls == backend.max_openai_attempts
+
+
+def test_finished_jobs_are_evicted_after_their_ttl_but_running_ones_are_not():
+    import time as _time
+    import TranslationBackend as tb
+
+    backend = tb.TranslationBackend()
+    old = _time.time() - backend.FINISHED_JOB_TTL_SECONDS - 1
+    for job_id, state in [("done", tb.JOB_STATE_SUCCEEDED), ("busy", tb.JOB_STATE_RUNNING)]:
+        backend._jobs[job_id] = tb.TranslationJob(job_id=job_id, state=state, updated_at=old)
+        backend._run_states[job_id] = tb.TranslationRunState()
+    backend._result_handle_to_job_id["h"] = "done"
+    backend._job_results["h"] = {"output_stream": object()}
+
+    with backend._jobs_lock:
+        backend._prune_finished_jobs_locked(_time.time())
+
+    assert "done" not in backend._jobs and "done" not in backend._run_states
+    assert "h" not in backend._job_results and "h" not in backend._result_handle_to_job_id
+    assert "busy" in backend._jobs and "busy" in backend._run_states
+
+
+def test_cache_reads_survive_concurrent_eviction():
+    """Hammer a tiny cache from several threads: a read must never raise."""
+    import threading
+    import TranslationBackend as tb
+
+    import sys
+
+    cache = tb.BoundedTranslationCache(max_entries=4)
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads between nearly every bytecode
+    errors = []
+
+    def churn(offset):
+        try:
+            for i in range(20000):
+                key = (offset + i) % 9
+                cache[key] = i
+                cache.get((key + 1) % 9)
+        except Exception as exc:  # pragma: no cover - the failure being guarded
+            errors.append(exc)
+
+    threads = [threading.Thread(target=churn, args=(n,)) for n in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    sys.setswitchinterval(previous)
+
+    assert errors == []
+    assert len(cache) <= 4
