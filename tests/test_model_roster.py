@@ -743,3 +743,17 @@ def test_document_jobs_carry_the_profile(monkeypatch):
     source = inspect.getsource(tb.TranslationBackend.start_translation_job)
     assert "profile=None" in source
     assert "using_profile(profile)" in source
+
+
+def test_a_placeholder_invented_for_unmasked_text_never_reaches_the_user():
+    """Nothing was masked, the model emitted one anyway. Seen live on a plain
+    DOCX with qwen2.5:7b, because the restore returned early on no spans."""
+    restored = tb._restore_protected_spans("El meeting comienza a las nueve.\n[[PSG:0]]", [])
+
+    assert tb.detect_placeholder_debris(restored) == []
+    assert restored.strip() == "El meeting comienza a las nueve."
+
+
+def test_the_prompt_only_mentions_placeholders_when_there_are_some():
+    assert tb._placeholder_instruction([]) == ""
+    assert "[[PSG:0]]" in tb._placeholder_instruction(["https://a.example"])
