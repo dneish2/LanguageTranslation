@@ -13,3 +13,4 @@ data/traces
 *.md
 workflow.png
 .env
+.claude
