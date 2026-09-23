@@ -6,6 +6,7 @@ Every assertion here opens the produced artefact and looks inside it. A test
 that only proved "the call returned" would pass even if the edit never reached
 the document, which is exactly the bug D4 describes.
 """
+import asyncio
 import json
 import sys
 import zipfile
@@ -416,7 +417,7 @@ def test_save_all_edits_puts_the_edit_in_the_downloaded_document(monkeypatch, tm
     machine_output = ui_app.translated_segments_map[seg_id]
 
     ui_app.segment_editors = {seg_id: _FakeTextarea("Frase corregida a mano.")}
-    ui_app.save_all_edits()
+    asyncio.run(ui_app.save_all_edits())
 
     downloaded = ui_app.get_fresh_download_stream()
     text = Document(downloaded).paragraphs[0].text
@@ -433,7 +434,7 @@ def test_save_all_edits_records_a_trace_score_row(monkeypatch, tmp_path):
     machine_output = ui_app.translated_segments_map[seg_id]
 
     ui_app.segment_editors = {seg_id: _FakeTextarea("Frase corregida a mano.")}
-    ui_app.save_all_edits()
+    asyncio.run(ui_app.save_all_edits())
 
     rows = [
         json.loads(line)
@@ -454,7 +455,7 @@ def test_save_all_edits_does_not_claim_success_when_there_is_nothing_to_save(mon
     ui_app, _seg_id = _prepared_ui(monkeypatch, tmp_path, notifications)
     ui_app.segment_editors = {}
 
-    ui_app.save_all_edits()
+    asyncio.run(ui_app.save_all_edits())
 
     assert notifications, "the user must be told something happened"
     message, kind = notifications[-1]
@@ -468,7 +469,7 @@ def test_save_all_edits_leaves_untouched_segments_alone(monkeypatch, tmp_path):
     unchanged = ui_app.translated_segments_map[seg_id]
 
     ui_app.segment_editors = {seg_id: _FakeTextarea(unchanged)}
-    ui_app.save_all_edits()
+    asyncio.run(ui_app.save_all_edits())
 
     assert Document(ui_app.get_fresh_download_stream()).paragraphs[0].text == unchanged
     assert not list(tmp_path.glob("traces-*.jsonl")), "a non-edit must not inflate the dataset"
