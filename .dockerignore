@@ -1,0 +1,15 @@
+# Only what the running app reads belongs in the image. data/model_bench.jsonl
+# is read by /compare at runtime, so data/ stays; everything below does not.
+.git
+.github
+.venv
+**/__pycache__
+.pytest_cache
+.nicegui
+tests
+design-system
+models
+data/traces
+*.md
+workflow.png
+.env
