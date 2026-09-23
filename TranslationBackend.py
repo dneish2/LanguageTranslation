@@ -608,6 +608,8 @@ def _split_into_chunks(text: str, max_chars: int) -> list[str]:
 #: The extensions translate_file() can actually dispatch on. Kept next to the
 #: dispatch it mirrors so the upload widget and the backend cannot drift —
 #: CSV/XLSX are Problems.md roadmap item 8 and deliberately not here yet.
+#: Image extensions are the photo path's (translate_image_text_blocks);
+#: translate_file refuses them by name rather than as "unsupported".
 SUPPORTED_DOCUMENT_EXTENSIONS = frozenset({"docx", "pptx", "pdf"})
 SUPPORTED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp"})
 
@@ -1105,7 +1107,6 @@ class TranslationBackend:
         self._active_run_state = TranslationRunState()
         self._run_states: dict[str, TranslationRunState] = {}
         self.translation_cache: BoundedTranslationCache = BoundedTranslationCache()
-        self.metrics = MetricsCollector()
         self.max_openai_attempts = 4
         self.retry_base_delay = 0.5
         self.retry_max_delay = 8.0
@@ -3115,6 +3116,13 @@ class TranslationBackend:
         job_id: str | None = None,
         run_state: TranslationRunState | None = None,
     ):
+        """Translate a photo into the run state and compose a styled overlay.
+
+        The only caller is TranslationUI.refresh_image_overlay, whose button
+        renders only for an image uploaded in Document mode, and that upload
+        refuses images. Kept working rather than deleted so that button cannot
+        become an AttributeError if the upload filter ever changes.
+        """
         state = self._resolve_run_state(job_id=job_id, run_state=run_state)
         metrics = file_metrics or self.metrics
         metrics.start_file(file_type="image", correlation_id=correlation_id)
@@ -3127,25 +3135,42 @@ class TranslationBackend:
         state.current_image_bytes = image_bytes
         state.segment_map.clear()
 
-        ocr_blocks = self.extract_image_text_regions(image_bytes)
+        # OCR and translation go through the one real image path. This used to
+        # call a stub OCR (one hardcoded region, empty text) that nothing ever
+        # replaced, so every region was skipped and the "overlay" was the
+        # original photo re-encoded. translate_image_text_blocks wants a
+        # filename only to pick a MIME type, and it re-checks the bytes
+        # against that claim, so name the bytes by what Pillow says they are.
         start = time.time()
+        try:
+            with Image.open(BytesIO(image_bytes)) as probe:
+                detected = (probe.format or "").upper()
+        except Exception:
+            detected = ""
+        extension = {"PNG": ".png", "JPEG": ".jpg", "MPO": ".jpg", "WEBP": ".webp"}.get(detected)
+        if extension is None:
+            raise ValueError("Unsupported image format. Use PNG, JPG, JPEG, or WEBP.")
+        result = self.translate_image_text_blocks(image_bytes, f"upload{extension}", target_language)
+
         processed = 0
-        for block in ocr_blocks:
-            original = block.get("text", "").strip()
-            if not original:
-                continue
+        for block in result["translated_blocks"]:
+            if not block.get("bbox"):
+                continue  # nothing to position an overlay with
             seg_id = self.generate_segment_id()
-            translated = self._translate_text_with_context(original, target_language, correlation_id=correlation_id, file_metrics=metrics)
             state.segment_map[seg_id] = {
                 "type": "image_region",
-                "bbox": block.get("bbox"),
-                "direction": block.get("direction", "ltr"),
-                "original": original,
-                "translated": translated,
+                "bbox": block["bbox"],
+                "direction": "ltr",
+                "original": block["source_text"],
+                "translated": block["translated_text"],
                 "location": f"image:region:{processed}",
             }
             processed += 1
 
+        # Recomposed rather than reusing result["overlay_png"]: the caller's
+        # overlay settings (font, size, show-original) are the point of this
+        # entry point, and regenerate_output_stream rebuilds from segment_map
+        # the same way after an edit.
         compositor = ImageCompositor(OverlayStyle(font_size=font_size, font_family=font_family))
         regions = list(state.segment_map.values())
         composed = compositor.compose(image_bytes, regions, show_original=show_original)
@@ -3154,12 +3179,6 @@ class TranslationBackend:
         state.output_stream = out_stream
         metrics.finish_file(file_type="image", segment_count=processed, duration_seconds=time.time() - start)
         return out_stream, processed, self.calculate_tokens(""), "", state.segment_map
-
-    def extract_image_text_regions(self, image_bytes: bytes) -> list[dict[str, Any]]:
-        """Fallback OCR region extractor. Override/monkeypatch with real OCR output in production."""
-        with Image.open(BytesIO(image_bytes)) as img:
-            w, h = img.size
-        return [{"bbox": [int(w*0.1), int(h*0.1), int(w*0.9), int(h*0.25)], "text": "", "direction": "ltr"}]
 
     # ------------------
     # PROCESSING PDF
@@ -3504,6 +3523,17 @@ class TranslationBackend:
         file_name: str | None = None,
     ):
         self.reset_cancel(job_id)
+        ext = (file_extension or "").lower().lstrip(".")
+        if ext in SUPPORTED_IMAGE_EXTENSIONS:
+            # Not a document. The Document upload refuses images before they
+            # get here, and no route sends one, so the image branch that used
+            # to live below only ever ran a stub OCR and returned the photo
+            # untranslated. Refused before validate_upload so a photo gets
+            # this answer, not a complaint about its header.
+            raise ValueError(
+                f"translate_file handles documents ({', '.join(sorted(SUPPORTED_DOCUMENT_EXTENSIONS))}), "
+                f"not .{ext} images. Translate a photo with translate_image_text_blocks."
+            )
         # Dispatching on the extension alone let an empty file and a mislabeled
         # file surface the same raw python-docx "File is not a zip file". Sniff
         # first so each problem gets its own, specific message.
@@ -3527,7 +3557,6 @@ class TranslationBackend:
             processed=processed,
             target_language=target_language,
         )
-        ext = file_extension.lower()
         if ext == "docx":
             result = self.process_docx(
                 input_stream,
@@ -3568,16 +3597,6 @@ class TranslationBackend:
                 job_id=job_id,
                 run_state=state,
                 progress_callback=progress_callback,
-            )
-        elif ext in SUPPORTED_IMAGE_EXTENSIONS:
-            result = self.process_image(
-                input_stream,
-                target_language,
-                font_size=font_size or 24,
-                correlation_id=correlation_id,
-                file_metrics=metrics,
-                job_id=job_id,
-                run_state=state,
             )
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
