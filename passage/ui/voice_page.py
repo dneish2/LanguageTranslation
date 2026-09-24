@@ -34,10 +34,9 @@ def voice_engine_label(meta: dict, translation_label: str) -> str:
       * otherwise the row names the endpoint the WORDS went to, which is the
         step a user cares about most.
 
-    `translation_label` is derived from the profile that was actually applied
-    (see TranslationUI._text_engine_label), not from meta: the backend fills
-    meta["translation"] with a hosted literal because it has never been told
-    about profiles.
+    `translation_label` is what the backend reports ANSWERED the translation
+    leg (meta["translation"]), which follows the router: a chosen profile,
+    local-first on a Local deployment, or hosted.
     """
     steps = [meta.get("stt") or "hosted", translation_label, meta.get("tts") or "hosted"]
     hosted = [s for s in steps if _is_passage_hosted(s)]
@@ -705,7 +704,7 @@ class VoicePageMixin:
         the sentence the page prints and the row the ledger stores are built
         from the same fact.
         """
-        translation_label = self._text_engine_label(profile)
+        expected_label = self._text_engine_label(profile)
         with self.backend.using_profile(profile), \
                 self.backend.capture_provenance() as provenance:
             started = time.perf_counter()
@@ -714,6 +713,10 @@ class VoicePageMixin:
             latency_ms = int((time.perf_counter() - started) * 1000)
 
         meta = dict(meta or {})
+        # The backend now reports the engine that ANSWERED the translation leg
+        # (local-first routing can put it on this machine, or fall back); the
+        # profile-derived label is only a fallback for a meta that lacks it.
+        translation_label = meta.get("translation") or expected_label
         meta["translation"] = translation_label
         chars = len(source_text or "")
         label, origin = voice_engine_label(meta, translation_label), None
