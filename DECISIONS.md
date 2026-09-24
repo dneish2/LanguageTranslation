@@ -156,6 +156,10 @@ Act on it, in this order:
    bundle because the third one bills. `--min-instances=1` is deliberately NOT set — it bills
    continuously for an app with no users, and scale-to-zero taking idle sessions with it is the
    acceptable half of that trade. Revisit it the day someone other than David is mid-document.
+   **Resolved 2026-09-24:** the service-level `minScale: 1` that had been set outside `deploy.yml`
+   was removed (`gcloud run services update translation-app --min=0`), so prod now matches this
+   section and scales to zero. Service-level minimum is `--min`; `--min-instances` sets the
+   revision-level one and would not have cleared it.
    `--concurrency` is still untuned against the per-client memory cost. Cloud Run session affinity
    is *best-effort*, so this reduces state loss rather than eliminating it. **Unverified** —
    reasoned from documented behaviour, not observed on the real service. The honest test is to
@@ -286,9 +290,6 @@ Creating the bucket is an infrastructure change and needs David's approval when 
 ---
 
 ## NEEDS DAVID — genuinely blocked
-
-- **min-instances.** Prod has `minScale: 1` at service level, set outside `deploy.yml`, so it
-  bills continuously. §7 says it was deliberately not set. Keep it or remove it (`RESEARCH.md` §4c).
 
 - **Supabase URL + anon key.** Auth verification is ported and live-tested against a throwaway
   project; the sign-in UI and any durable per-user storage need the real values. Both are designed
