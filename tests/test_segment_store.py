@@ -158,3 +158,83 @@ def test_corrections_contributed_after_translating_still_export():
     assert len(export.to_dpo(segs)) == 1
     assert len(export.to_sft(segs)) == 2
     assert all("Spanish" in r["messages"][0]["content"] for r in export.to_sft(segs))
+
+
+# ── Review fixes (PR #45) ────────────────────────────────────────────────
+
+
+@pytest.fixture
+def real_queue(monkeypatch):
+    """The real enqueue and worker, with a fresh queue and a recording uploader."""
+    import queue
+    import threading
+
+    uploaded = []
+    monkeypatch.setattr(contribute, "BUCKET", "passage-contrib-test")
+    monkeypatch.setattr(contribute, "uploader", lambda name, body: uploaded.append((name, body)))
+    monkeypatch.setattr(contribute, "_queue", queue.Queue())
+    monkeypatch.setattr(contribute, "_stopping", threading.Event(), raising=False)
+    monkeypatch.setattr(contribute, "_worker", None)
+    return uploaded
+
+
+def test_only_correction_rows_ever_reach_the_bucket(real_queue, monkeypatch, tmp_path):
+    """The switch promises approved and edited pairs. Opting in BEFORE
+    translating used to queue every generation row (each segment, reviewed or
+    not) and the trace row, which carries the uploaded file's name."""
+    monkeypatch.setattr(contribute, "_ensure_worker", lambda: None)
+    with traces.writing(traces.Destination(disk=False, contribute=True, session="s")):
+        trace_id = traces.record_trace(traces.Trace(
+            name="salaries-2026.docx", target_language="Spanish", engine="e", segment_count=2))
+        traces.record_generation(trace_id=trace_id, segment_id="a", source="Private",
+                                 output="Privado", engine="e")
+        traces.record_judgement(trace_id=trace_id, segment_id="b", source="Hello",
+                                output="Hola", approved=True, target_language="Spanish")
+
+    queued = []
+    while not contribute._queue.empty():
+        queued.append(contribute._queue.get_nowait())
+    assert [r["type"] for r in queued] == ["judgement"]
+    assert "salaries" not in json.dumps(queued) and "Private" not in json.dumps(queued)
+
+
+def test_rows_queued_at_shutdown_are_uploaded_not_lost(real_queue, monkeypatch):
+    """Prod scales to zero; the approval clicked just before the tab closes
+    sits in the flush window when SIGTERM arrives."""
+    monkeypatch.setattr(contribute, "FLUSH_SECONDS", 60.0)
+    contribute.enqueue({"type": "judgement", "session": "s", "n": 1})
+
+    contribute.drain(timeout=5)
+
+    assert len(real_queue) == 1
+    assert json.loads(real_queue[0][1].decode())["n"] == 1
+
+
+def test_approve_records_the_text_on_screen_not_the_machine_text(bucket, tmp_path, monkeypatch):
+    """Typing a fix and pressing Approve used to approve the MACHINE output:
+    the correction vanished from SFT and the DPO pair never existed."""
+    from types import SimpleNamespace
+
+    queued, _ = bucket
+    page = _page(monkeypatch, tmp_path, opted_in=True)
+    page.segment_editors = {"s1": SimpleNamespace(value="Buenos días")}
+
+    page.approve_segment_callback("s1")
+
+    assert [r["type"] for r in queued] == ["score", "judgement"]
+    assert queued[1]["output"] == "Buenos días"
+    assert page.translated_segments_map["s1"] == "Buenos días"
+    dpo = export.to_dpo(export.segments(queued))
+    assert [(d["rejected"], d["chosen"]) for d in dpo] == [("Buenos dias", "Buenos días")]
+
+
+def test_approve_without_an_edit_records_one_judgement(bucket, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    queued, _ = bucket
+    page = _page(monkeypatch, tmp_path, opted_in=True)
+    page.segment_editors = {"s1": SimpleNamespace(value="Buenos dias")}
+
+    page.approve_all_segments()
+
+    assert [r["type"] for r in queued] == ["judgement"]

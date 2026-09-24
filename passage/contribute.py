@@ -18,6 +18,7 @@ a translation.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -43,6 +44,14 @@ _queue: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=10_000)
 _worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
 _token: dict[str, Any] = {"value": None, "expires": 0.0}
+_stopping = threading.Event()
+
+#: The only row types that leave the machine. The switch promises "approved and
+#: edited segment pairs", so a generation row (every segment, reviewed or not)
+#: or a trace row (it carries the uploaded file's name) must never be queued,
+#: whatever a caller routes here. Correction rows carry their own source text
+#: and language (traces.record_edit), so export needs nothing else.
+CONTRIBUTED_TYPES = frozenset({"score", "judgement"})
 
 
 def available() -> bool:
@@ -52,7 +61,7 @@ def available() -> bool:
 
 
 def enqueue(row: dict[str, Any]) -> None:
-    if not available():
+    if not available() or row.get("type") not in CONTRIBUTED_TYPES:
         return
     try:
         _queue.put_nowait(row)
@@ -71,19 +80,45 @@ def _ensure_worker() -> None:
 
 
 def _run() -> None:
-    while True:
-        first = _queue.get()
+    while not (_stopping.is_set() and _queue.empty()):
+        try:
+            first = _queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
         batch = [first]
         deadline = time.time() + FLUSH_SECONDS
-        while True:
+        while not _stopping.is_set():
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             try:
-                batch.append(_queue.get(timeout=remaining))
+                batch.append(_queue.get(timeout=min(remaining, 0.5)))
             except queue.Empty:
-                break
+                continue
+        if _stopping.is_set():
+            while True:
+                try:
+                    batch.append(_queue.get_nowait())
+                except queue.Empty:
+                    break
         flush(batch)
+
+
+def drain(timeout: float = 8.0) -> None:
+    """Flush whatever is queued before the process exits.
+
+    Prod scales to zero: once the last tab closes, the instance is stopped
+    with SIGTERM and a daemon thread dies mid-window, taking the last few
+    seconds of corrections with it (the approval a visitor clicks right before
+    closing the tab is exactly that row). Cloud Run allows 10 s after SIGTERM.
+    """
+    _stopping.set()
+    worker = _worker
+    if worker is not None and worker.is_alive():
+        worker.join(timeout)
+
+
+atexit.register(drain)
 
 
 def flush(rows: list[dict[str, Any]]) -> list[str]:

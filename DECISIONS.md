@@ -273,7 +273,13 @@ As built:
   after the document was translated, and the bucket then never sees the generation rows.
 - `passage/contribute.py` uploads to `gs://$PASSAGE_CONTRIBUTION_BUCKET/contributions/<date>/<session>/`
   with the Cloud Run token from the metadata server. It needs no client library, runs in the
-  background, and a failed upload is dropped rather than raised.
+  background, and a failed upload is dropped rather than raised. Only `score` and `judgement`
+  rows are ever queued (enforced in `contribute.enqueue`, not by callers): the first version
+  also sent every generation row and the trace row, so opting in before translating uploaded
+  unreviewed segments and the file name, which the switch never promised. The queue is
+  drained at exit, because a scale-to-zero instance otherwise loses the last flush window.
+- Approve records the text on screen. It used to judge the last *saved* text, so typing a fix
+  and pressing Approve stored the machine output as the approved answer and lost the pair.
 - `python -m passage.export --format sft|dpo|tmx --in <dir> [--in <dir>]` reads local traces,
   a bucket dump, or both. "Download my corrections" on the page gives the same SFT rows for
   this page only.

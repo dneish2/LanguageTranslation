@@ -1950,7 +1950,7 @@ class TranslationUI(VoicePageMixin):
                                         ui.tooltip("Approve this translation")
                                     with ui.button(icon="close", on_click=lambda _, s=seg_id: self.decline_segment_callback(s))\
                                             .props("size=sm no-caps").classes(theme.BTN_SECONDARY_SM):
-                                        ui.tooltip("Reject — restore the machine translation")
+                                        ui.tooltip("Mark this translation as wrong")
                                     with ui.button(icon="delete_outline", on_click=lambda _, s=seg_id: self.delete_segment_callback(s))\
                                             .props("size=sm no-caps").classes(theme.BTN_DANGER_SM):
                                         ui.tooltip("Remove this segment from the document")
@@ -2146,15 +2146,46 @@ class TranslationUI(VoicePageMixin):
             confirm_label="Start Over"
         )
 
+    def _commit_visible_edit(self, seg_id) -> str:
+        """Make the segment's on-screen text the recorded one, and return it.
+
+        Approve used to judge `translated_segments_map`, which only Update and
+        Save All Edits ever write. Typing a fix into the box and pressing
+        Approve therefore recorded the MACHINE text as the approved answer and
+        lost the correction: the SFT row was wrong and the DPO pair never
+        existed. The human approves what they can see, so that is what is
+        committed (to the document, cheaply: download regenerates) and, when
+        it differs, recorded as an edit first.
+        """
+        machine_output = self.translated_segments_map.get(seg_id, "")
+        editor = self.segment_editors.get(seg_id)
+        current = (editor.value if editor is not None else None) or ""
+        if editor is None or current.strip() == (machine_output or "").strip():
+            return machine_output
+        if seg_id in self.document_run_state.segment_map:
+            current = self.backend.update_segment(
+                seg_id, current, self.current_target_language,
+                regenerate=False, run_state=self.document_run_state)
+        self.translated_segments_map[seg_id] = current
+        traces.record_edit(
+            trace_id=self.document_trace_id, segment_id=seg_id,
+            before=machine_output, after=current,
+            source=self.original_segments_map.get(seg_id, ""),
+            target_language=self.current_target_language,
+        )
+        return current
+
+    def _judge(self, seg_id, *, approved: bool) -> None:
+        with traces.writing(self._trace_destination()):
+            shown = self._commit_visible_edit(seg_id) if approved else                 self.translated_segments_map.get(seg_id, "")
+            traces.record_judgement(
+                trace_id=self.document_trace_id, segment_id=seg_id,
+                source=self.original_segments_map.get(seg_id, ""), output=shown,
+                approved=approved, target_language=self.current_target_language)
+
     def approve_segment_callback(self, seg_id):
         try:
-            orig = self.original_segments_map.get(seg_id, "")
-            trans = self.translated_segments_map.get(seg_id, "")
-            with traces.writing(self._trace_destination()):
-                traces.record_judgement(
-                    trace_id=self.document_trace_id, segment_id=seg_id,
-                    source=orig, output=trans, approved=True,
-                    target_language=self.current_target_language)
+            self._judge(seg_id, approved=True)
             ui.notify("Segment approved ✓", type="positive")
         except Exception as ex:
             logging.error(f"[UI] Error approving segment {seg_id}: {ex}", exc_info=True)
@@ -2162,13 +2193,7 @@ class TranslationUI(VoicePageMixin):
 
     def decline_segment_callback(self, seg_id):
         try:
-            orig = self.original_segments_map.get(seg_id, "")
-            trans = self.translated_segments_map.get(seg_id, "")
-            with traces.writing(self._trace_destination()):
-                traces.record_judgement(
-                    trace_id=self.document_trace_id, segment_id=seg_id,
-                    source=orig, output=trans, approved=False,
-                    target_language=self.current_target_language)
+            self._judge(seg_id, approved=False)
             ui.notify("Segment declined ✗", type="warning")
         except Exception as ex:
             logging.error(f"[UI] Error declining segment {seg_id}: {ex}", exc_info=True)
@@ -2177,14 +2202,8 @@ class TranslationUI(VoicePageMixin):
     def approve_all_segments(self):
         try:
             count = 0
-            for seg_id in self.original_segments_map.keys():
-                orig = self.original_segments_map[seg_id]
-                trans = self.translated_segments_map[seg_id]
-                with traces.writing(self._trace_destination()):
-                    traces.record_judgement(
-                        trace_id=self.document_trace_id, segment_id=seg_id,
-                        source=orig, output=trans, approved=True,
-                    target_language=self.current_target_language)
+            for seg_id in list(self.original_segments_map.keys()):
+                self._judge(seg_id, approved=True)
                 count += 1
             ui.notify(f"Approved {count} segments ✓", type="positive")
         except Exception as ex:
