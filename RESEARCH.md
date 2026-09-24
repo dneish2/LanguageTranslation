@@ -371,7 +371,8 @@ bloating the image. That was wrong: CI builds from a clean checkout, which has 5
 
 **min-instances is 1, set outside `deploy.yml`.** The service carries `run.googleapis.com/minScale: 1`
 at service level, so one instance bills continuously. That contradicts `DECISIONS.md` §7, which
-records the flag as deliberately *not* set. It is left as it is, for David to decide.
+records the flag as deliberately *not* set. **Resolved 2026-09-24:** David chose scale to zero and the
+service-level setting was removed, so a cold start is now the first visit's cost after a quiet stretch.
 
 **A stable session secret would not have kept sessions.** The plan was to stop regenerating
 `storage_secret` on each process start. It turns out that `app.storage.user` lives in `.nicegui/*.json`
