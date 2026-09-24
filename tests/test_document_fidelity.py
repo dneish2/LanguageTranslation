@@ -428,6 +428,7 @@ def test_save_all_edits_puts_the_edit_in_the_downloaded_document(monkeypatch, tm
     assert any(kind == "positive" for _msg, kind in notifications)
 
 
+@pytest.mark.local_deployment
 def test_save_all_edits_records_a_trace_score_row(monkeypatch, tmp_path):
     notifications = []
     ui_app, seg_id = _prepared_ui(monkeypatch, tmp_path, notifications)

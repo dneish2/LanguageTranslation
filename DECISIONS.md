@@ -266,7 +266,32 @@ as delivered.
 ## 10. Where data lives: two modes, and an opt-in way to contribute from the cloud
 
 **Resolution (David, 2026-09-23): adopt the two deployment modes in `INFERENCE_ADAPTER_PLAN.md`,
-and keep fine-tuning data. Not yet implemented; this is roadmap milestone R3.**
+and keep fine-tuning data. — IMPLEMENTED (R3); the cloud half is live once the bucket exists.**
+
+As built:
+- `passage/traces.py` is the only writer, and each request picks a `Destination`. Local mode
+  appends to `PASSAGE_TRACE_DIR`. Cloud mode writes nothing to disk, and queues rows for the
+  bucket only when this visitor turned the switch on. Approvals and declines are `judgement`
+  rows; the old `record_feedback` writer and its `trl_finetune_data.jsonl` are gone.
+- Correction rows carry their own source text and language, because a visitor usually opts in
+  after the document was translated, and the bucket then never sees the generation rows.
+- `passage/contribute.py` uploads to `gs://$PASSAGE_CONTRIBUTION_BUCKET/contributions/<date>/<session>/`
+  with the Cloud Run token from the metadata server. It needs no client library, runs in the
+  background, and a failed upload is dropped rather than raised. Only `score` and `judgement`
+  rows are ever queued (enforced in `contribute.enqueue`, not by callers): the first version
+  also sent every generation row and the trace row, so opting in before translating uploaded
+  unreviewed segments and the file name, which the switch never promised. The queue is
+  drained at exit, because a scale-to-zero instance otherwise loses the last flush window.
+- Approve records the text on screen. It used to judge the last *saved* text, so typing a fix
+  and pressing Approve stored the machine output as the approved answer and lost the pair.
+- `python -m passage.export --format sft|dpo|tmx --in <dir> [--in <dir>]` reads local traces,
+  a bucket dump, or both. "Download my corrections" on the page gives the same SFT rows for
+  this page only.
+- **Infra, run by David** (the agent was not permitted to grant IAM):
+  `gcloud storage buckets create gs://passage-contributions-452812 --location us-central1
+  --uniform-bucket-level-access --public-access-prevention`, then give the Cloud Run service
+  account `roles/storage.objectCreator` on it (write-only, so the service cannot read the data
+  back), then set the repository variable `PASSAGE_CONTRIBUTION_BUCKET`.
 
 The probe in `RESEARCH.md` §4c found that nothing written in prod has ever survived a restart,
 including the approved segments that were meant as fine-tuning data. David wants that data, so
