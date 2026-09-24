@@ -3566,8 +3566,12 @@ class TranslationBackend:
         else:
             updated = new_text
 
+        # Only the translation changes. This also used to set
+        # seg["original"] = new_text, so after any edit the segment's SOURCE
+        # was its translation: Re-translate then translated the Spanish into
+        # Spanish, and every edit recorded afterwards paired the translation
+        # with itself.
         seg["translated"] = updated
-        seg["original"] = new_text
         seg_type = seg["type"]
         if seg_type in ["paragraph", "table_cell"]:
             if "object" in seg:

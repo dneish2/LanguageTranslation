@@ -259,6 +259,24 @@ def test_editing_a_segment_also_preserves_formatting(backend, monkeypatch):
     assert [r for r in para.runs if r.text][0].bold is True
 
 
+def test_editing_a_segment_keeps_its_source_text(backend, monkeypatch):
+    """update_segment used to overwrite the segment's `original` with the new
+    translation, so Re-translate afterwards translated the translation."""
+    _install_fake_translator(backend, monkeypatch)
+    from TranslationBackend import TranslationRunState
+
+    state = TranslationRunState()
+    backend.process_docx(
+        BytesIO(_docx_bytes(lambda doc: doc.add_paragraph("Quarterly results"))),
+        target_language="Spanish", do_translate=True, run_state=state,
+    )
+    seg_id = next(iter(state.segment_map))
+    backend.update_segment(seg_id, "Resultados trimestrales", "Spanish", run_state=state)
+
+    assert state.segment_map[seg_id]["original"] == "Quarterly results"
+    assert state.segment_map[seg_id]["translated"] == "Resultados trimestrales"
+
+
 # ───────────────────────── D6: malformed upload messages ─────────────────────
 
 def _message(backend, data: bytes, ext: str, name: str) -> str:
