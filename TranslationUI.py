@@ -2,6 +2,7 @@ import asyncio
 import base64
 import logging
 import os
+import hashlib
 import json
 import time
 import secrets
@@ -41,6 +42,7 @@ from passage import engine_ledger
 from passage import local_voice
 from passage import policy
 from passage import traces
+from passage import contribute
 from passage import usage
 from passage import provider_profiles
 from passage.auth.jwt_verify import identity_from_auth_header
@@ -376,6 +378,76 @@ class TranslationUI(VoicePageMixin):
         # ── USAGE STATS ─────────────────────────────────────────────────
         self.current_count = 0
         self.current_tokens = 0
+        #: Every trace row this page recorded, whatever the sinks were, so
+        #: "Download my corrections" hands back exactly this page's data.
+        self.session_trace_rows: list = []
+
+    # ── WHERE CORRECTIONS GO (DECISIONS.md §10) ─────────────────────────
+    @property
+    def contribute_enabled(self) -> bool:
+        """This visitor's opt-in to contributing corrections. Off by default."""
+        try:
+            return bool(app.storage.user.get("contribute_corrections", False))
+        except RuntimeError:
+            return False
+
+    def set_contribute(self, enabled: bool) -> None:
+        try:
+            app.storage.user["contribute_corrections"] = bool(enabled)
+        except RuntimeError:
+            return
+        ui.notify("Your corrections will be contributed to improve Passage."
+                  if enabled else "Contributing is off. Nothing from this session is kept.",
+                  type="info")
+
+    def _trace_destination(self) -> "traces.Destination":
+        """Where this session's trace rows go, decided per request.
+
+        Local deployment: the owner's disk, as before. Cloud: the container
+        disk is wiped on restart, so nothing is written there; rows reach the
+        private bucket only if this visitor opted in.
+        """
+        import TranslationBackend as backend_module
+
+        local = backend_module.DEPLOYMENT_MODE == "local"
+        return traces.Destination(
+            disk=local,
+            contribute=(not local) and self.contribute_enabled and contribute.available(),
+            session=hashlib.sha256(self.session_cache_scope.encode()).hexdigest()[:16],
+            mirror=self.session_trace_rows,
+        )
+
+    def _render_corrections_notice(self) -> None:
+        """One line saying where this session's approvals and edits go, with
+        the one control that changes it. Stated, never implied."""
+        import TranslationBackend as backend_module
+
+        with ui.row().classes("w-full items-center gap-3 mb-4 flex-wrap"):
+            if backend_module.DEPLOYMENT_MODE == "local":
+                ui.label("Your approvals and edits are saved on this machine, "
+                         "ready to export for fine-tuning.").classes("text-sm p-muted-text")
+            elif contribute.available():
+                ui.switch("Contribute my corrections to improve Passage",
+                          value=self.contribute_enabled,
+                          on_change=lambda e: self.set_contribute(bool(e.value)))
+                ui.label("Off: nothing from this session is kept. On: approved and edited "
+                         "segment pairs are stored privately. Never the file itself."
+                         ).classes("text-sm p-muted-text")
+            else:
+                ui.label("Nothing from this session is kept.").classes("text-sm p-muted-text")
+            ui.button("Download my corrections", on_click=self.download_my_corrections)\
+              .props("flat no-caps size=sm")
+
+    def download_my_corrections(self) -> None:
+        from passage import export
+
+        segs = export.segments(self.session_trace_rows)
+        records = export.to_sft(segs)
+        if not records:
+            ui.notify("Nothing to download yet: approve or edit a segment first.", type="warning")
+            return
+        body = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+        ui.download(body.encode("utf-8"), "passage-corrections.jsonl")
 
     def _inject_theme(self) -> None:
         ui.add_head_html(theme.HEAD_HTML)
@@ -1742,20 +1814,21 @@ class TranslationUI(VoicePageMixin):
                 # name who made the cached words.
                 expected = profile.describe() if profile else f"hosted:{TEXT_MODEL}"
                 engine = result.get("engine") or expected
-                self.document_trace_id = traces.record_trace(traces.Trace(
-                    name=self.uploaded_file_name or "document",
-                    target_language=target_language,
-                    engine=engine,
-                    segment_count=len(seg_map),
-                    metadata={"extension": self.uploaded_file_extension},
-                ))
-                for seg_id, seg_info in seg_map.items():
-                    traces.record_generation(
-                        trace_id=self.document_trace_id, segment_id=seg_id,
-                        source=seg_info.get("original", ""),
-                        output=seg_info.get("translated", ""),
+                with traces.writing(self._trace_destination()):
+                    self.document_trace_id = traces.record_trace(traces.Trace(
+                        name=self.uploaded_file_name or "document",
+                        target_language=target_language,
                         engine=engine,
-                    )
+                        segment_count=len(seg_map),
+                        metadata={"extension": self.uploaded_file_extension},
+                    ))
+                    for seg_id, seg_info in seg_map.items():
+                        traces.record_generation(
+                            trace_id=self.document_trace_id, segment_id=seg_id,
+                            source=seg_info.get("original", ""),
+                            output=seg_info.get("translated", ""),
+                            engine=engine,
+                        )
                 # The surface engine_ledger.summarise was written for ("one
                 # document is one entry but a lot of text") and the one it
                 # never saw: /engines said "Nothing translated yet" after a
@@ -1852,6 +1925,7 @@ class TranslationUI(VoicePageMixin):
                     ui.separator().classes("my-4")
                     ui.label("Segment review").classes("p-display text-xl mb-2")
                     ui.label(f"{len(self.original_segments_map)} segments").classes(f"{theme.DATA} mb-4")
+                    self._render_corrections_notice()
 
                     # bulk actions
                     with ui.row().classes("space-x-2 mb-4"):
@@ -1991,10 +2065,13 @@ class TranslationUI(VoicePageMixin):
             textarea.value = updated
             self.translated_segments_map[seg_id] = updated
             refine_input.value = ""
-            traces.record_edit(
-                trace_id=self.document_trace_id, segment_id=seg_id,
-                before=machine_output, after=updated,
-            )
+            with traces.writing(self._trace_destination()):
+                traces.record_edit(
+                    trace_id=self.document_trace_id, segment_id=seg_id,
+                    before=machine_output, after=updated,
+                    source=self.original_segments_map.get(seg_id, ""),
+                    target_language=self.current_target_language,
+                )
             ui.notify("Segment updated successfully!", type="positive")
         except Exception as ex:
             logging.error(f"[UI] Error updating segment {seg_id}: {ex}", exc_info=True)
@@ -2073,11 +2150,11 @@ class TranslationUI(VoicePageMixin):
         try:
             orig = self.original_segments_map.get(seg_id, "")
             trans = self.translated_segments_map.get(seg_id, "")
-            self.backend.record_feedback(
-                approved=True,
-                original=orig,
-                translated=trans,
-            )
+            with traces.writing(self._trace_destination()):
+                traces.record_judgement(
+                    trace_id=self.document_trace_id, segment_id=seg_id,
+                    source=orig, output=trans, approved=True,
+                    target_language=self.current_target_language)
             ui.notify("Segment approved ✓", type="positive")
         except Exception as ex:
             logging.error(f"[UI] Error approving segment {seg_id}: {ex}", exc_info=True)
@@ -2087,11 +2164,11 @@ class TranslationUI(VoicePageMixin):
         try:
             orig = self.original_segments_map.get(seg_id, "")
             trans = self.translated_segments_map.get(seg_id, "")
-            self.backend.record_feedback(
-                approved=False,
-                original=orig,
-                translated=trans,
-            )
+            with traces.writing(self._trace_destination()):
+                traces.record_judgement(
+                    trace_id=self.document_trace_id, segment_id=seg_id,
+                    source=orig, output=trans, approved=False,
+                    target_language=self.current_target_language)
             ui.notify("Segment declined ✗", type="warning")
         except Exception as ex:
             logging.error(f"[UI] Error declining segment {seg_id}: {ex}", exc_info=True)
@@ -2103,7 +2180,11 @@ class TranslationUI(VoicePageMixin):
             for seg_id in self.original_segments_map.keys():
                 orig = self.original_segments_map[seg_id]
                 trans = self.translated_segments_map[seg_id]
-                self.backend.record_feedback(approved=True, original=orig, translated=trans)
+                with traces.writing(self._trace_destination()):
+                    traces.record_judgement(
+                        trace_id=self.document_trace_id, segment_id=seg_id,
+                        source=orig, output=trans, approved=True,
+                    target_language=self.current_target_language)
                 count += 1
             ui.notify(f"Approved {count} segments ✓", type="positive")
         except Exception as ex:
@@ -2181,12 +2262,15 @@ class TranslationUI(VoicePageMixin):
                     continue
                 textarea.value = updated
                 self.translated_segments_map[seg_id] = updated
-                traces.record_edit(
-                    trace_id=self.document_trace_id,
-                    segment_id=seg_id,
-                    before=machine_output,
-                    after=updated,
-                )
+                with traces.writing(self._trace_destination()):
+                    traces.record_edit(
+                        trace_id=self.document_trace_id,
+                        segment_id=seg_id,
+                        before=machine_output,
+                        after=updated,
+                        source=self.original_segments_map.get(seg_id, ""),
+                        target_language=self.current_target_language,
+                    )
                 changed.append(seg_id)
 
             # Rebuild the download stream once, after the edits are in the doc.

@@ -73,5 +73,9 @@ jobs:
           # behaviour. The honest test is to deploy, open a session and watch
           # when it drops.
           flags: --timeout=3600 --session-affinity
+          # PASSAGE_CONTRIBUTION_BUCKET comes from a repository VARIABLE. While
+          # it is unset, the switch to contribute corrections is not offered and
+          # the page says nothing is kept (DECISIONS.md §10).
           env_vars: |
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            PASSAGE_CONTRIBUTION_BUCKET=${{ vars.PASSAGE_CONTRIBUTION_BUCKET }}

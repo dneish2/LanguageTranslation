@@ -31,6 +31,8 @@ import logging
 import os
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from threading import Lock
@@ -68,6 +70,43 @@ class Trace:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class Destination:
+    """Where this request's rows go. Decided by the page, per request.
+
+    - ``disk``: append to TRACE_DIR. True on a Local deployment, where the
+      files are the owner's corpus. False on Cloud, where the container disk
+      is wiped on restart: writing there kept nothing and implied otherwise.
+    - ``contribute``: also queue the row for the private contribution bucket
+      (passage.contribute). Only ever True because this session opted in.
+    - ``session``: an opaque, hashed session id stamped on each row so the
+      bucket can be read per session and in aggregate. Never the raw cookie.
+    - ``mirror``: a list the page keeps, so "download my corrections" can
+      hand back exactly what this page recorded, whatever the sinks were.
+    """
+
+    disk: bool = True
+    contribute: bool = False
+    session: str | None = None
+    mirror: list | None = None
+
+
+#: The default keeps the historical behaviour (disk, nothing else) for any
+#: caller that never says otherwise, such as tests and scripts.
+_destination: ContextVar[Destination] = ContextVar(
+    "passage_trace_destination", default=Destination())
+
+
+@contextmanager
+def writing(destination: Destination):
+    """Route every record_* call in this block to `destination`."""
+    token = _destination.set(destination)
+    try:
+        yield destination
+    finally:
+        _destination.reset(token)
+
+
 def _path_for(when: float | None = None) -> Path:
     stamp = time.strftime("%Y-%m-%d", time.localtime(when or time.time()))
     return TRACE_DIR / f"traces-{stamp}.jsonl"
@@ -77,6 +116,19 @@ def _append(row: dict[str, Any]) -> None:
     """Best effort. A trace that fails to write must never surface to the user
     or fail the translation it is describing — the record is a by-product, not
     the product."""
+    destination = _destination.get()
+    if destination.session:
+        row = {**row, "session": destination.session}
+    if destination.mirror is not None:
+        destination.mirror.append(row)
+    if destination.contribute:
+        try:
+            from passage import contribute
+            contribute.enqueue(row)
+        except Exception as error:
+            logging.info("[Traces] contribution not queued (%s)", error)
+    if not destination.disk:
+        return
     try:
         TRACE_DIR.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row, ensure_ascii=False)
@@ -132,9 +184,15 @@ def record_generation(
 
 def record_edit(
     *, trace_id: str | None, segment_id: str, before: str, after: str,
+    source: str = "", target_language: str = "",
     surface=policy.Surface.DOCUMENT,
 ) -> None:
     """A human changing a machine translation — the only ground truth here.
+
+    Carries its own source and language: a visitor usually opts in to
+    contributing AFTER the document was translated, so the bucket receives
+    corrections without the generation rows that preceded them. A correction
+    row that cannot stand alone would be silently dropped at export.
 
     `edit_ratio` is stored alongside the text so the common question ("which
     segments did people rewrite, not just tweak?") is answerable without
@@ -151,10 +209,38 @@ def record_edit(
         "type": "score",
         "trace_id": trace_id,
         "segment_id": segment_id,
+        "source": _clip(source),
+        "target_language": target_language,
         "before": _clip(before),
         "after": _clip(after),
         "edit_ratio": round(ratio, 3),
         "rewritten": ratio < 0.6,
+        "at": time.time(),
+    })
+
+
+def record_judgement(
+    *, trace_id: str | None, segment_id: str, source: str, output: str,
+    approved: bool, target_language: str = "", surface=policy.Surface.DOCUMENT,
+) -> None:
+    """A human approving or declining a machine translation as it stands.
+
+    Replaces the old trl_finetune_data.jsonl writer, which lived outside
+    policy, wrote to the working directory (on Cloud Run: a disk wiped at
+    every restart) and stamped the target language from state shared across
+    sessions. An approval is an SFT pair; a decline is a negative with no
+    correction yet.
+    """
+    if not trace_id or not _allowed(surface):
+        return
+    _append({
+        "type": "judgement",
+        "trace_id": trace_id,
+        "segment_id": segment_id,
+        "source": _clip(source),
+        "output": _clip(output),
+        "target_language": target_language,
+        "approved": bool(approved),
         "at": time.time(),
     })
 

@@ -3756,7 +3756,6 @@ class TranslationBackend:
         state.current_presentation = None
         state.current_pdf = None
         state.pdf_overlay_ocg = None
-        self.current_target_language = target_language
         metrics = file_metrics or self.metrics
         _log_event(
             "translation.file_started",
@@ -3815,41 +3814,3 @@ class TranslationBackend:
             metrics=metrics.snapshot(),
         )
         return result
-
-    def record_feedback(self, *, approved: bool, original: str, translated: str) -> bool:
-        """
-        Append a JSONL record for approved segments,
-        using the language the user originally picked.
-        """
-        if not isinstance(approved, bool):
-            raise TypeError("approved must be a bool.")
-        if not isinstance(original, str):
-            raise TypeError("original must be a string.")
-        if not isinstance(translated, str):
-            raise TypeError("translated must be a string.")
-
-        original = original.strip()
-        translated = translated.strip()
-
-        if approved and (not original or not translated):
-            raise ValueError("original and translated must be non-empty when approved is True.")
-
-        if not approved:
-            return False
-
-        # Grab the language the user requested at the start of translate_file
-        lang = getattr(self, "current_target_language", "unknown")
-
-        record = {
-            "language":   lang,
-            "prompt":     f"Translate to {lang}:\n\n{original}",
-            "completion": f" {translated}"
-        }
-
-        out_dir = os.getenv("FEEDBACK_DIR", ".")
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, "trl_finetune_data.jsonl")
-
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        return True
