@@ -132,6 +132,7 @@ def test_no_ollama_live_translate_is_served_by_hosted_and_the_label_says_hosted(
     assert not engine.startswith("local")
 
 
+@pytest.mark.local_deployment
 def test_positive_control_reachable_ollama_produces_a_local_label(monkeypatch):
     """Proves the test above could have failed.
 
