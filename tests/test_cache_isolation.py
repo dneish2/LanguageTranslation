@@ -251,6 +251,7 @@ def _install_live_local(backend, endpoints, url="http://127.0.0.1:11434/v1", mod
     return url
 
 
+@pytest.mark.local_deployment
 def test_live_no_profile_sessions_do_not_share_the_auto_bucket(backend, endpoints, monkeypatch):
     """Every profile-less session used to share one ``live:auto`` key."""
     monkeypatch.setattr(tb, "LIVE_LOCAL_ENABLED", True, raising=False)
@@ -269,6 +270,7 @@ def test_live_no_profile_sessions_do_not_share_the_auto_bucket(backend, endpoint
     assert endpoints.count(url) == 2
 
 
+@pytest.mark.local_deployment
 def test_live_cache_hit_reports_the_engine_that_produced_the_bytes(backend, endpoints, monkeypatch):
     """The live path used to label every cache hit ``"cache"`` -- and in the
     live reproduction user B saw engine ``"cache"`` for user A's local output.
@@ -286,6 +288,7 @@ def test_live_cache_hit_reports_the_engine_that_produced_the_bytes(backend, endp
     assert second_engine != "cache"
 
 
+@pytest.mark.local_deployment
 def test_live_byo_output_is_not_served_to_a_local_session(backend, endpoints, monkeypatch):
     """The live half of the P0: A on a private endpoint, B on the local model.
 

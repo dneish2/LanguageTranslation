@@ -202,6 +202,14 @@ _PLACEHOLDER_RE = re.compile(r"\[\[\s*PSG\s*:\s*(\d+)\s*\]\]")
 #: single best place to prefer a local model. Opt out with PASSAGE_LIVE_LOCAL=0.
 LIVE_LOCAL_ENABLED = os.getenv("PASSAGE_LIVE_LOCAL", "1") != "0"
 
+#: Where Passage runs (INFERENCE_ADAPTER_PLAN.md): "cloud" is the hosted
+#: service, which never routes to a local model; "local" is someone's own
+#: machine. Cloud Run sets K_SERVICE, so prod is Cloud without configuration.
+DEPLOYMENT_MODE = (
+    os.getenv("PASSAGE_DEPLOYMENT")
+    or ("cloud" if os.getenv("K_SERVICE") else "local")
+).strip().lower()
+
 #: Preference order for the local model, best first, chosen by measurement
 #: rather than by size. Benchmarked on this machine over a fixed suite
 #: (passage/model_bench.py, results in data/model_bench.jsonl):
@@ -653,6 +661,7 @@ class CallProvenance:
     cache_hits: int = 0
     engine_runs: int = 0
     engine: str | None = None
+    engines: list[str] = field(default_factory=list)
 
     @property
     def from_cache(self) -> bool:
@@ -668,6 +677,20 @@ class CallProvenance:
         self.engine_runs += 1
         if engine:
             self.engine = engine
+            self.engines.append(engine)
+
+    @property
+    def most_exposed(self) -> str | None:
+        """The engine that ran which says the most about where text went.
+
+        Anything that is not knowably local (hosted, a BYO endpoint, an
+        unrecognised label) outranks local: a disclosure must not be downgraded
+        because a later call in the same request happened to run on this machine.
+        """
+        for engine in self.engines:
+            if not engine.lower().startswith("local:"):
+                return engine
+        return self.engines[0] if self.engines else self.engine
 
     def record_nothing(self, engine: str | None = "none") -> None:
         """Empty input: no model ran, but nothing was cached either."""
@@ -687,7 +710,26 @@ def _note_cache_hit(engine: str | None) -> None:
         sink.record_cache_hit(engine)
 
 
+#: The engine that most recently ran in THIS context, whether or not anyone
+#: is capturing provenance. translate_text reads it to label what it caches:
+#: under local-first routing the engine is only known once the call has run
+#: (a local failure falls back to hosted), so labelling a cache entry with the
+#: engine the request was EXPECTED to use would later report hosted-made bytes
+#: as local ones -- a privacy claim in the wrong direction.
+_last_served_engine: ContextVar["str | None"] = ContextVar(
+    "passage_last_served_engine", default=None)
+
+
+#: Who produced the bytes translate_text just returned in this context: the
+#: engine that ran, or the one recorded on the cache entry it served. Callers
+#: that must LABEL a step (voice's translation leg) read this instead of
+#: assuming hosted.
+_last_result_engine: ContextVar["str | None"] = ContextVar(
+    "passage_last_result_engine", default=None)
+
+
 def _note_engine(engine: str | None) -> None:
+    _last_served_engine.set(engine)
     sink = _call_provenance.get()
     if sink is not None:
         sink.record_engine(engine)
@@ -805,6 +847,10 @@ JOB_STATE_CANCELED = "canceled"
 
 def _provider_identity(provider: Any) -> str:
     """A stable, non-secret-leaking identity for a resolved provider."""
+    if isinstance(provider, LocalFirstProvider):
+        # Keyed by the local model it will try first. What actually answered
+        # is recorded on the cached value (see _last_served_engine).
+        return provider.label
     base_url = getattr(provider, "base_url", None)
     model = getattr(provider, "text_model", None) or TEXT_MODEL
     if not base_url:
@@ -840,6 +886,7 @@ class ChatCompletionsProvider(BaseTranslationProvider):
     def __init__(
         self, *, api_key: str, base_url: str | None = None, text_model: str | None = None,
         max_input_chars: int | None = None, vision_model: str | None = None,
+        label: str | None = None,
     ) -> None:
         # Resolved inside __init__, not as a keyword default, so it reads
         # TEXT_MODEL at construction time — a mutable-global default would
@@ -852,10 +899,20 @@ class ChatCompletionsProvider(BaseTranslationProvider):
         # models need one — see OLLAMA_MAX_INPUT_CHARS.
         self.max_input_chars = max_input_chars
         self._vision_model = vision_model
+        #: What the user is shown as the engine (policy.classify_run reads it):
+        #: "hosted:<model>", or a profile's describe(). Distinct from
+        #: _provider_identity, which is a cache key and may be an opaque hash.
+        self.label = label
         client_kwargs: dict[str, Any] = {"api_key": api_key or "not-needed"}
         if base_url:
             client_kwargs["base_url"] = base_url
         self.client = openai.OpenAI(**client_kwargs)
+
+    @property
+    def display_label(self) -> str:
+        if self.label:
+            return self.label
+        return _provider_identity(self)
 
     @property
     def vision_model(self) -> str:
@@ -883,7 +940,7 @@ class ChatCompletionsProvider(BaseTranslationProvider):
         # place provenance needs to hear about it. Noted before the request,
         # because the bytes leave the machine whether or not it succeeds, and
         # whether or not anyone caches the answer.
-        _note_engine(_provider_identity(self))
+        _note_engine(self.display_label)
         limit_kwargs = (
             _completion_limit_kwargs(self.text_model, max_tokens)
             if self.is_openai_hosted
@@ -1029,6 +1086,72 @@ def build_translation_provider(provider_name: str, api_key: str) -> BaseTranslat
     raise ValueError(f"Unsupported translation provider: {provider_name}")
 
 
+class LocalFirstProvider(BaseTranslationProvider):
+    """Run text on the local model; fall back to hosted per call, and say which.
+
+    This is the router's one mechanism. Every text surface (documents, segment
+    edits, the streaming endpoint, voice's translation step, image text) reaches
+    the model through ``_require_provider()``. Setting this as the per-request
+    provider is therefore enough to route all of them the same way, instead of
+    each surface re-deciding (live typing was local-first while documents and
+    voice went hosted on the same machine).
+
+    Provenance is noted per call with the engine that ACTUALLY answered: the
+    local label on success, and on failure the hosted provider notes itself.
+    Metering and the privacy sentence follow that, never the expectation.
+
+    Only text runs locally. Vision, transcription and speech are hosted-only
+    capabilities here, so they go straight to the hosted provider; sending a
+    photograph to a text-only local model would be a failure dressed as a route.
+    """
+
+    def __init__(self, local, hosted: BaseTranslationProvider | None) -> None:
+        self.local = local
+        self.hosted = hosted
+        self.text_model = local.text_model
+        self.base_url = local.base_url
+        self.max_input_chars = getattr(local, "max_input_chars", None)
+        self.label = f"local:{local.text_model}"
+
+    @property
+    def display_label(self) -> str:
+        return self.label
+
+    def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
+        try:
+            completion = self.local.create_chat_completion(messages=messages, max_tokens=max_tokens)
+            if (completion.choices[0].message.content or "").strip():
+                _note_engine(self.label)
+                return completion
+            reason = "empty reply"
+        except Exception as error:  # a flaky local model must never break the work
+            reason = f"{type(error).__name__}: {error}"
+        if self.hosted is None:
+            raise RuntimeError(f"Local model {self.text_model} failed ({reason}) and no hosted "
+                               "provider is configured to fall back to.")
+        logging.info("[Backend] local %s failed (%s); falling back to hosted", self.text_model, reason)
+        return self.hosted.create_chat_completion(messages=messages, max_tokens=max_tokens)
+
+    def _hosted_only(self, capability: str) -> BaseTranslationProvider:
+        if self.hosted is None:
+            raise RuntimeError(f"{capability} needs a hosted provider; none is configured.")
+        return self.hosted
+
+    def transcribe_audio(self, *, audio_file: BytesIO) -> str:
+        return self._hosted_only("Transcription").transcribe_audio(audio_file=audio_file)
+
+    def synthesize_speech(self, *, text: str) -> bytes:
+        return self._hosted_only("Speech").synthesize_speech(text=text)
+
+
+def _for_capability(provider, capability: str):
+    """The provider a non-text capability should use: a local-first router
+    hands vision/voice to its hosted side; anything else is used as-is."""
+    if isinstance(provider, LocalFirstProvider):
+        return provider._hosted_only(capability)
+    return provider
+
+
 @dataclass
 class TranslationJob:
     job_id: str
@@ -1130,6 +1253,7 @@ class TranslationBackend:
         # Live (Text-mode) routing: a separate, optional local provider used
         # only for the keystroke path. Built lazily so boot never waits on it.
         self._live_provider: BaseTranslationProvider | None = None
+        self._local_first: "LocalFirstProvider | None" = None
         self._live_probe_at: float = 0.0
         #: Last recorded probe outcomes (see probe_local_llm). Kept so the
         #: diagnostics surface can say WHY local is unavailable rather than
@@ -1172,9 +1296,27 @@ class TranslationBackend:
 
     @contextmanager
     def using_profile(self, profile):
-        """Run the enclosed work on `profile`'s endpoint."""
+        """Route the enclosed work: the one runtime decision every surface shares.
+
+        - A chosen profile (BYO or a named local endpoint) is honoured as-is.
+        - Otherwise, on a Local deployment with a reachable local model, text
+          runs local-first with per-call hosted fallback (LocalFirstProvider).
+        - Otherwise the process default (hosted).
+
+        Before this, only live typing was local-first; documents, segment
+        edits, the streaming endpoint and voice's translation step went hosted
+        on the same machine, and the receipts said so because it was true.
+        """
         if profile is None or getattr(profile, "kind", None) == pp.KIND_APP:
-            yield
+            local = self._local_first_provider() if profile is None else None
+            if local is None:
+                yield
+                return
+            token = _active_provider.set(local)
+            try:
+                yield
+            finally:
+                _active_provider.reset(token)
             return
         token = _active_provider.set(self.provider_for_profile(profile))
         try:
@@ -1525,24 +1667,29 @@ class TranslationBackend:
         file_metrics = MetricsCollector()
         try:
             run_state = self._resolve_run_state(job_id=job_id)
-            out_stream, count, tokens, text_accum, seg_map = self.translate_file(
-                input_stream=input_stream,
-                file_extension=file_extension,
-                target_language=target_language,
-                processed=processed,
-                font_size=font_size,
-                autofit=autofit,
-                correlation_id=correlation_id,
-                file_metrics=file_metrics,
-                job_id=job_id,
-                run_state=run_state,
-                file_name=file_name,
-                progress_callback=lambda progress, message: self._set_job_state(
-                    job_id,
-                    progress=progress,
-                    status_message=message,
-                ),
-            )
+            # Captured here, INSIDE the worker thread, because a ContextVar set
+            # by the submitting request does not cross into it. This is what
+            # lets the page book the engine that actually ran rather than the
+            # one it expected; under local-first routing those can differ.
+            with self.capture_provenance() as provenance:
+                out_stream, count, tokens, text_accum, seg_map = self.translate_file(
+                    input_stream=input_stream,
+                    file_extension=file_extension,
+                    target_language=target_language,
+                    processed=processed,
+                    font_size=font_size,
+                    autofit=autofit,
+                    correlation_id=correlation_id,
+                    file_metrics=file_metrics,
+                    job_id=job_id,
+                    run_state=run_state,
+                    file_name=file_name,
+                    progress_callback=lambda progress, message: self._set_job_state(
+                        job_id,
+                        progress=progress,
+                        status_message=message,
+                    ),
+                )
             if self._is_cancel_requested(job_id):
                 self._set_job_state(
                     job_id,
@@ -1562,6 +1709,10 @@ class TranslationBackend:
                     "segment_map": seg_map,
                     "metrics": file_metrics.snapshot(),
                     "job_id": job_id,
+                    # The most exposed engine that answered any segment (one
+                    # hosted fallback means text left the machine), or None
+                    # when nothing ran (all cache, or nothing to translate).
+                    "engine": provenance.most_exposed,
                 }
             self._set_job_state(
                 job_id,
@@ -1718,6 +1869,7 @@ class TranslationBackend:
         cached = self._cache_get(cache_key)
         if cached is not None:
             metrics.record_cache_hit()
+            _last_result_engine.set(cached.engine)
             logging.info("[Backend] translate_text cache hit for target=%s", target_language)
             _log_event(
                 "translation.cache_hit",
@@ -1729,6 +1881,7 @@ class TranslationBackend:
             return cached.text
         metrics.record_cache_miss()
 
+        _last_served_engine.set(None)
         try:
             max_chars = getattr(self._require_provider(), "max_input_chars", None)
             if max_chars and len(text) > max_chars:
@@ -1741,7 +1894,13 @@ class TranslationBackend:
             else:
                 result = self._translate_chunk(text, target_language)
                 logging.info("[Backend] Translated len=%d → len=%d", len(text), len(result))
-            self._cache_put(cache_key, result, cache_key[1])
+            # Labelled with what ANSWERED, not the key's expected engine: under
+            # local-first a local failure is served by hosted, and a later hit
+            # on this entry must say hosted made these bytes. (A multi-chunk
+            # text that mixed engines carries the last chunk's.)
+            produced_by = _last_served_engine.get() or cache_key[1]
+            _last_result_engine.set(produced_by)
+            self._cache_put(cache_key, result, produced_by)
             return result
         except Exception as e:
             # Never echo the source back as a "translation" — surface the failure.
@@ -1772,6 +1931,7 @@ class TranslationBackend:
             # The profile names one model, the only one the user has told us
             # their endpoint serves, so image calls use it too.
             vision_model=profile.model or None,
+            label=profile.describe(),
         )
         self._profile_providers[fingerprint] = provider
         return provider
@@ -1918,7 +2078,7 @@ class TranslationBackend:
         keystroke path, and probing a dead endpoint on every pause would add a
         connect timeout to every keystroke — worse than just using hosted.
         """
-        if not LIVE_LOCAL_ENABLED:
+        if not LIVE_LOCAL_ENABLED or DEPLOYMENT_MODE != "local":
             return None
         now = time.time()
         if now - self._live_probe_at < LIVE_PROBE_TTL_SECONDS:
@@ -1985,6 +2145,21 @@ class TranslationBackend:
                 )
             self._live_reachable = False
         return self._live_provider if self._live_reachable else None
+
+    def _local_first_provider(self) -> "LocalFirstProvider | None":
+        """The local-first router for this request, or None to stay hosted.
+
+        None on a Cloud deployment: the hosted service never reaches for a
+        visitor's localhost (INFERENCE_ADAPTER_PLAN.md), and skipping the probe
+        there saves a refused connection per request.
+        """
+        local = self._live_local_provider()
+        if local is None:
+            return None
+        cached = self._local_first
+        if cached is None or cached.local is not local or cached.hosted is not self.provider:
+            cached = self._local_first = LocalFirstProvider(local, self.provider)
+        return cached
 
     def prewarm_live(self) -> None:
         """Probe and warm the local live model in the background, at page load.
@@ -2299,8 +2474,9 @@ class TranslationBackend:
             # hosted here, and the meta must say so: a page that computed "this
             # machine" from the STT and TTS labels alone told the user their
             # recording stayed local while its transcript was being sent out.
+            _last_result_engine.set(None)
             translated_text = self.translate_text(source_text, target_language)
-            meta["translation"] = f"hosted:{TEXT_MODEL}"
+            meta["translation"] = _last_result_engine.get() or f"hosted:{TEXT_MODEL}"
 
             if local_voice.tts_available(target_language):
                 try:
@@ -2385,11 +2561,14 @@ class TranslationBackend:
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
             ]},
         ]
-        vision_provider = self._require_provider()
+        vision_provider = _for_capability(self._require_provider(), "Reading a photo")
         # The photograph is in `messages` as base64 and is about to be sent.
         # Nothing about this call touches the translation cache, so it is only
         # visible to provenance because it says so here.
-        _note_engine(_provider_identity(vision_provider))
+        _note_engine(
+            f"hosted:{vision_provider.vision_model}"
+            if getattr(vision_provider, "is_openai_hosted", False)
+            else getattr(vision_provider, "display_label", None) or _provider_identity(vision_provider))
         # The model is the PROVIDER's, not the VISION_MODEL constant. Naming
         # the constant here sent "gpt-5.4-mini" to a BYO user's own base_url:
         # a profile swaps the provider, but this line never asked it. A

@@ -166,6 +166,7 @@ def test_available_local_models_records_a_timeout_distinctly(monkeypatch, black_
     assert backend.last_local_probe["outcome"] != tb.PROBE_REFUSED
 
 
+@pytest.mark.local_deployment
 def test_live_local_fallback_to_hosted_is_recorded_as_refusal(monkeypatch):
     """The hosted fallback fired — and said why. Production path, no bypass."""
     monkeypatch.setattr(tb, "LIVE_LOCAL_ENABLED", True)
@@ -177,6 +178,7 @@ def test_live_local_fallback_to_hosted_is_recorded_as_refusal(monkeypatch):
     assert backend.last_live_probe["reachable"] is False
 
 
+@pytest.mark.local_deployment
 def test_live_local_fallback_records_timeout_distinctly(monkeypatch, black_hole_port):
     monkeypatch.setattr(tb, "LIVE_LOCAL_ENABLED", True)
     monkeypatch.setattr(tb, "OLLAMA_BASE_URL", f"http://127.0.0.1:{black_hole_port}")

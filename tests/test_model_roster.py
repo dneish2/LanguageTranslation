@@ -1,6 +1,7 @@
 """The model roster: GPT-5-family models need max_completion_tokens (not
 max_tokens) and get reasoning_effort pinned to "none" for latency; legacy
 models keep max_tokens so PASSAGE_TEXT_MODEL can roll back without code."""
+import pytest
 import json
 import sys
 from pathlib import Path
@@ -556,6 +557,7 @@ def _live_backend(monkeypatch, *, reachable=True):
     return backend
 
 
+@pytest.mark.local_deployment
 def test_live_path_prefers_local_and_reports_the_engine(monkeypatch):
     """Local qwen2.5:7b measured 163ms p50 against hosted gpt-5.4-nano's 616ms
     on this machine, and costs nothing — so the keystroke path, which reruns
@@ -614,6 +616,7 @@ def test_live_prompt_drops_the_document_hardening_preamble(monkeypatch):
     assert "Spanish" in joined
 
 
+@pytest.mark.local_deployment
 def test_live_path_still_protects_urls(monkeypatch):
     """The slim prompt must not lose the URL guarantee."""
     backend = _live_backend(monkeypatch)

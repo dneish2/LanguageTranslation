@@ -275,6 +275,11 @@ def collect_diagnostics(snapshot: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _engine_kind(label: str | None) -> str:
+    """"local" / "hosted" / "byo" / ... from an engine label."""
+    return (label or "").split(":", 1)[0].lower()
+
+
 class TranslationUI(VoicePageMixin):
     def __init__(self, *, backend: TranslationBackend | None = None, api_guard: ApiGuard | None = None):
         # ── CORE BACKEND ─────────────────────────────────────────────────
@@ -1732,7 +1737,11 @@ class TranslationUI(VoicePageMixin):
             # decides whether these are written at all (documents: yes).
             if not processed:
                 profile = self.active_profile
-                engine = profile.describe() if profile else f"hosted:{TEXT_MODEL}"
+                # What answered, reported by the job itself. The expectation
+                # below is only used when nothing ran (an all-cache rerun), to
+                # name who made the cached words.
+                expected = profile.describe() if profile else f"hosted:{TEXT_MODEL}"
+                engine = result.get("engine") or expected
                 self.document_trace_id = traces.record_trace(traces.Trace(
                     name=self.uploaded_file_name or "document",
                     target_language=target_language,
@@ -2484,7 +2493,21 @@ class TranslationUI(VoicePageMixin):
         #     "endpoint:<sha256 prefix>", where the document path says
         #     "byo:private-a". Two surfaces naming the same endpoint differently
         #     is how a user loses the ability to check where their data went.
-        produced_by = reported or engine or provenance.engine
+        # The caller's label is formed BEFORE the call. Under local-first
+        # routing the router decides per call and may fall back, so where the
+        # kind of engine that ran (local / hosted / byo) disagrees with the
+        # expectation, what provenance saw wins, and it offers the MOST exposed
+        # engine that ran: one hosted fallback inside a local document means
+        # text left this machine. Where the kinds agree the caller's label is
+        # kept, because it is the more specific name (a photo is booked under
+        # the vision model, not the text model that translated what it read).
+        observed = provenance.most_exposed
+        if reported:
+            produced_by = reported
+        elif observed and engine and _engine_kind(observed) != _engine_kind(engine):
+            produced_by = observed
+        else:
+            produced_by = engine or observed
         origin = None
         if not chars:
             label = "none"
