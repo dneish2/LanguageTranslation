@@ -15,3 +15,6 @@ _*.py
 
 # Trace records contain user content
 data/traces/
+
+# live_bench server logs
+data/live_bench_*.log

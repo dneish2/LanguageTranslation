@@ -31,6 +31,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from passage import streaming
+
 DEFAULT_TIMEOUT_SECONDS = 600.0
 
 #: Extra generation budget handed to thinking models. `num_predict` caps the
@@ -119,8 +121,50 @@ class NativeOllamaProvider:
 
     def create_chat_completion(self, *, messages: list[dict[str, Any]], max_tokens: int = 1000,
                                images: list[str] | None = None, **_ignored: Any) -> _Completion:
+        sink = streaming.current()
+        if sink is not None and not images:
+            return _Completion(choices=[_Choice(message=_Message(
+                content=self._stream(messages, max_tokens, sink).strip()))])
         message = self.chat(messages, max_tokens=max_tokens, images=images)
         return _Completion(choices=[_Choice(message=message)])
+
+    def _stream(self, messages: list[dict[str, Any]], max_tokens: int, sink) -> str:
+        """Native `stream: true`, piece by piece into `sink`.
+
+        Thinking deltas are dropped for the reason `chat` keeps them apart.
+        Returning from inside the `with` closes the response, and Ollama stops
+        generating when its client goes away, so a cancelled keystroke stops
+        costing GPU time mid-sentence.
+        """
+        budget = max_tokens + (THINKING_RESERVE_TOKENS if is_thinking_model(self.text_model) else 0)
+        payload = {"model": self.text_model, "messages": [dict(m) for m in messages],
+                   "stream": True, "options": {"num_predict": budget}}
+        request = urllib.request.Request(
+            f"{self.host}/api/chat", data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        sink.begin_call()
+        try:
+            response = urllib.request.urlopen(request, timeout=self.timeout)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:200]
+            raise RuntimeError(f"Ollama returned {error.code}: {detail}") from None
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Ollama unreachable at {self.host}: {error.reason}") from None
+        text = ""
+        with response:
+            for line in response:
+                sink.check()
+                if not line.strip():
+                    continue
+                chunk = json.loads(line)
+                if chunk.get("error"):
+                    raise RuntimeError(f"Ollama error: {chunk['error']}")
+                piece = (chunk.get("message") or {}).get("content") or ""
+                text += piece
+                sink.feed(piece)
+                if chunk.get("done"):
+                    break
+        return text
 
     # ---- the native call --------------------------------------------------
 
