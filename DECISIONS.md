@@ -314,6 +314,37 @@ Creating the bucket is an infrastructure change and needs David's approval when 
 
 ---
 
+## 11. Hosted models: stay on gpt-5.4-nano (text) and gpt-5.4-mini (vision)
+
+**Resolution (David, 2026-09-24): choose hosted models from published prices and evals, with
+gpt-5.4-nano as the floor. Nothing changes.** The account can call newer models (the gpt-5.6
+family, gpt-5.5), so this was checked on 2026-09-24 rather than assumed.
+
+| Model | Input / output, USD per 1M tokens | Source |
+|---|---|---|
+| gpt-5.4-nano (text, current) | $0.20 / $1.25 | OpenAI model page |
+| gpt-5.6-luna | $0.20 / $1.20 | OpenAI model page |
+| gpt-5.4-mini (vision, current) | $0.75 / $4.50 | OpenAI pricing page |
+
+- **Text: luna is the same price.** Input is identical, and output is 4% cheaper. A translated
+  sentence is ~40 output tokens, so the saving is about $0.002 per 1,000 sentences. OpenAI
+  positions luna as the nano tier of the 5.6 family, and marks 5.4-nano as current generation
+  with no replacement recommended. Artificial Analysis scores them 22 and 21 on its intelligence
+  index, at different reasoning settings, so that is not a real gap. A swap would change model
+  behaviour for no measurable saving. (A pricing-page summary first read luna's output as $0.75;
+  the model page's own table says $1.20.)
+- **Vision is the only place a swap could save real money:** gpt-5.4-nano also takes images, at
+  about a quarter of mini's input price. It stays on mini because the photo overlay's
+  one-correction-per-page fit (RESEARCH.md §2) was calibrated on mini's bounding boxes, which sat
+  ~35 px low. A different model moves the boxes, and no published benchmark covers that. The test
+  is one photographed menu through `PASSAGE_VISION_MODEL=gpt-5.4-nano`, checking that captions still
+  land on their lines. It costs cents, and needs the hosted key.
+- **Swapping later is configuration, not code:** `PASSAGE_TEXT_MODEL` / `PASSAGE_VISION_MODEL`.
+  One trap: `_completion_limit_kwargs` sends `reasoning_effort="none"` to every `gpt-5*` model.
+  The 5.4 and 5.6 families accept that; the August 2025 gpt-5 models spelled it `"minimal"`.
+- Prices are not hardcoded anywhere (`passage/compare.py` reads `PASSAGE_RATE_<MODEL>`), so
+  nothing in the app goes stale when they change.
+
 ## NEEDS DAVID — genuinely blocked
 
 - **Supabase URL + anon key.** Auth verification is ported and live-tested against a throwaway
