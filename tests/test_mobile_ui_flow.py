@@ -526,11 +526,14 @@ def test_workspace_text_mode_js_has_debounce_and_auto_translation_trigger():
     source = Path("TranslationUI.py").read_text(encoding="utf-8")
 
     assert "const DEBOUNCE_MS = 350;" in source
+    assert "const MID_WORD_MS = 900;" in source
     # Bindings are delegated on `document` so they survive workspace re-renders.
     assert "document.addEventListener('input', (e) => {" in source
     assert "scheduleDebouncedTranslation();" in source
-    assert "window.setTimeout(requestTranslation, DEBOUNCE_MS);" in source
-    assert "fetch('/api/text_translate'" in source
+    assert "endsAWord(value) ? DEBOUNCE_MS : MID_WORD_MS" in source
+    # Streams, and aborts the request it supersedes.
+    assert "fetch('/api/text_translate_live'" in source
+    assert "if (inflight) inflight.abort();" in source
 
 
 def test_workspace_text_js_is_injected_once_at_page_build_not_on_rerender():

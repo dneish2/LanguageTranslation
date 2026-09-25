@@ -34,8 +34,13 @@ from pptx.util import Pt
 from passage import compare
 from passage import local_voice
 from passage import text_rows
+from passage import streaming
+from passage.streaming import StreamCancelled
 from passage.ollama_native import (
     NativeOllamaProvider,
+    _Choice,
+    _Completion,
+    _Message,
     suits_translation as ollama_suits_translation,
 )
 from passage import provider_profiles as pp
@@ -946,11 +951,35 @@ class ChatCompletionsProvider(BaseTranslationProvider):
             if self.is_openai_hosted
             else {"max_tokens": max_tokens}
         )
-        return self.client.chat.completions.create(
-            model=self.text_model,
-            messages=messages,
-            **limit_kwargs,
-        )
+        sink = streaming.current()
+        if sink is None:
+            return self.client.chat.completions.create(
+                model=self.text_model,
+                messages=messages,
+                **limit_kwargs,
+            )
+        sink.begin_call()
+        stream = self.client.chat.completions.create(
+            model=self.text_model, messages=messages, stream=True, **limit_kwargs)
+        if getattr(stream, "choices", None) is not None:
+            # An OpenAI-compatible server that ignores `stream` answers with a
+            # whole completion: still an answer, delivered as one piece.
+            sink.feed(stream.choices[0].message.content or "")
+            return stream
+        pieces: list[str] = []
+        try:
+            for chunk in stream:
+                sink.check()  # closing the stream (finally) is the cancel
+                for choice in getattr(chunk, "choices", None) or []:
+                    piece = getattr(getattr(choice, "delta", None), "content", None)
+                    if piece:
+                        pieces.append(piece)
+                        sink.feed(piece)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+        return _Completion(choices=[_Choice(message=_Message(content="".join(pieces)))])
 
     def transcribe_audio(self, *, audio_file: BytesIO) -> str:
         self._require_openai_hosted("Voice transcription")
@@ -1118,14 +1147,23 @@ class LocalFirstProvider(BaseTranslationProvider):
         return self.label
 
     def create_chat_completion(self, *, messages: list[dict[str, str]], max_tokens: int) -> Any:
+        sink = streaming.current()
         try:
             completion = self.local.create_chat_completion(messages=messages, max_tokens=max_tokens)
             if (completion.choices[0].message.content or "").strip():
                 _note_engine(self.label)
                 return completion
             reason = "empty reply"
+        except StreamCancelled:
+            raise
         except Exception as error:  # a flaky local model must never break the work
+            if sink is not None and sink.started:
+                # Local text is already on screen; continuing with hosted
+                # would splice two answers together.
+                raise
             reason = f"{type(error).__name__}: {error}"
+        if sink is not None:
+            sink.reset()
         if self.hosted is None:
             raise RuntimeError(f"Local model {self.text_model} failed ({reason}) and no hosted "
                                "provider is configured to fall back to.")
@@ -2253,7 +2291,11 @@ class TranslationBackend:
             self._cache_put(cache_key, result, profile.describe())
             return result, profile.describe()
 
+        # The same local provider the router (LocalFirstProvider) runs on.
+        # The hosted side stays translate_text, deliberately: it carries the
+        # hardened prompt and the cache the live box shares with documents.
         provider = self._live_local_provider()
+        sink = streaming.current()
         if provider is not None:
             try:
                 masked, protected = _mask_protected_spans(text)
@@ -2267,8 +2309,14 @@ class TranslationBackend:
                     self._cache_put(cache_key, result, f"local:{provider.text_model}")
                     return result, f"local:{provider.text_model}"
                 logging.info("[Backend] live-local returned empty; falling back to hosted")
+            except StreamCancelled:
+                raise
             except Exception as error:
+                if sink is not None and sink.started:
+                    raise  # local text is on screen; hosted would splice a second answer in
                 logging.info("[Backend] live-local failed (%s); falling back to hosted", error)
+            if sink is not None:
+                sink.reset()
 
         fallback = self.translate_text(text, target_language)
         # translate_text may itself have been served from cache; only claim a
@@ -2353,25 +2401,6 @@ class TranslationBackend:
             # Never silently hand back the unrefined text — surface the failure.
             logging.error("[Backend] refine translation error: %s", e, exc_info=True)
             raise
-
-    def stream_translate_text(
-        self,
-        text: str,
-        target_language: str,
-        *,
-        chunk_size: int = 80,
-    ) -> tuple[str, list[str]]:
-        """Return deterministic partials and canonical final text for streaming UI updates."""
-        final_translation = self.translate_text(text, target_language)
-        if not final_translation:
-            return "", [""]
-        step = max(1, chunk_size)
-        partials = [
-            final_translation[:index]
-            for index in range(step, len(final_translation), step)
-        ]
-        partials.append(final_translation)
-        return final_translation, partials
 
     def _translate_blocks_together(self, blocks: list[dict[str, Any]], target_language: str) -> None:
         """Fill each block's translated_text in one context-carrying call.

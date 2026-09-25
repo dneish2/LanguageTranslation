@@ -10,6 +10,7 @@ import uuid
 from dataclasses import asdict, replace as dataclass_replace
 from io import BytesIO
 from pathlib import Path
+import threading
 from threading import Lock, Thread
 from typing import Any, Callable
 from urllib.parse import quote
@@ -42,6 +43,7 @@ from passage import engine_ledger
 from passage import local_voice
 from passage import policy
 from passage import traces
+from passage import streaming
 from passage import contribute
 from passage import usage
 from passage import provider_profiles
@@ -472,10 +474,18 @@ class TranslationUI(VoicePageMixin):
 <script>
 (() => {
     const scope = 'workspace_text';
+    // A pause this long after a finished word (a space or punctuation, or
+    // any character in a script written without spaces) starts a request.
+    // Inside a word the pause must be longer: "The meet" is not a sentence
+    // anyone wants translated, and each of those requests was a paid call
+    // on the hosted engine (passage/live_bench.py measured 13 per sentence).
     const DEBOUNCE_MS = 350;
+    const MID_WORD_MS = 900;
     const stateLabels = { READY: 'Ready', TRANSLATING: 'Translating…', UPDATED: 'Updated', ERROR: 'Error' };
     let debounceTimer = null;
     let activeRequestToken = 0;
+    let inflight = null;          // AbortController of the request on screen
+    let lastRequested = null;     // text of the last request that was not abandoned
     const byId = (id) => document.getElementById(id);
     const sourceEl = () => byId(`${scope}_source`);
     const sourceLangEl = () => byId(`${scope}_source_lang`);
@@ -486,6 +496,26 @@ class TranslationUI(VoicePageMixin):
         const node = statusEl();
         if (node) node.textContent = text;
     }
+    function endsAWord(value) {
+        if (!value) return true;
+        const last = value[value.length - 1];
+        return /[\\s.,;:!?¡¿…)\\]"'»”’]/.test(last) || last.codePointAt(0) >= 0x2E80;
+    }
+    // The new answer is written over the old one, and the old one's tail is
+    // kept (dimmed) until it is overtaken, so the box never shrinks to two
+    // words and grows back on every pause.
+    function paintPartial(output, partial, previous) {
+        output.textContent = '';
+        output.appendChild(document.createTextNode(partial));
+        const tail = previous.length > partial.length ? previous.slice(partial.length) : '';
+        if (tail) {
+            const dim = document.createElement('span');
+            dim.className = 'p-muted-text';
+            dim.style.opacity = '0.45';
+            dim.textContent = tail;
+            output.appendChild(dim);
+        }
+    }
     async function requestTranslation() {
         const source = sourceEl();
         const target = targetEl();
@@ -494,6 +524,9 @@ class TranslationUI(VoicePageMixin):
         const text = (source.value || '').trim();
         const language = (target.value || 'Spanish').trim();
         if (!text) {
+            if (inflight) inflight.abort();
+            inflight = null;
+            lastRequested = null;
             output.textContent = '';
             setStatus(stateLabels.READY);
             return;
@@ -503,29 +536,70 @@ class TranslationUI(VoicePageMixin):
             setStatus('From and To are the same language — swap ⇄ or pick a different target.');
             return;
         }
+        const key = `${language}\\u0000${text}`;
+        if (key === lastRequested) return;   // a trailing space changes nothing
+        // Superseded: stop the old request instead of letting it finish
+        // unseen. The server cancels the model call when this connection
+        // drops, so the abandoned answer stops generating (and billing).
+        if (inflight) inflight.abort();
+        const controller = new AbortController();
+        inflight = controller;
+        lastRequested = key;
         const token = ++activeRequestToken;
+        const previous = output.textContent || '';
         setStatus(stateLabels.TRANSLATING);
         try {
             const fd = new FormData();
             fd.append('text', text);
             fd.append('language', language || 'Spanish');
-            const resp = await fetch('/api/text_translate', { method: 'POST', body: fd, headers: { 'X-Passage-Token': window.PASSAGE_TOKEN || '' } });
-            const data = await resp.json();
+            const resp = await fetch('/api/text_translate_live', {
+                method: 'POST', body: fd, signal: controller.signal,
+                headers: { 'X-Passage-Token': window.PASSAGE_TOKEN || '' },
+            });
+            if (!resp.ok || !(resp.headers.get('Content-Type') || '').includes('text/event-stream')) {
+                const data = await resp.json().catch(() => ({}));
+                throw new Error(data?.error || 'Translation failed.');
+            }
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let complete = null;
+            while (complete === null) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const events = buffer.split('\\n\\n');
+                buffer = events.pop() || '';
+                for (const evt of events) {
+                    const lines = evt.split('\\n');
+                    const type = (lines.find(l => l.startsWith('event: ')) || '').slice(7).trim();
+                    const dataLine = lines.find(l => l.startsWith('data: '));
+                    const payload = dataLine ? JSON.parse(dataLine.slice(6)) : {};
+                    if (token !== activeRequestToken) return;
+                    if (type === 'partial') paintPartial(output, payload.translated_text || '', previous);
+                    else if (type === 'complete') complete = payload;
+                    else if (type === 'error') throw new Error(payload.error || 'Translation failed.');
+                }
+            }
             if (token !== activeRequestToken) return;
-            if (!resp.ok) throw new Error(data?.error || 'Translation failed.');
-            output.textContent = data.translated_text || '';
+            if (complete === null) throw new Error('The translation stream ended early.');
+            output.textContent = complete.translated_text || '';
             // Name the model that answered. Local vs hosted changes both cost
             // and latency, so it is state the user should be able to see.
-            const engine = data.engine ? ` · ${data.engine}` : '';
+            const engine = complete.engine ? ` · ${complete.engine}` : '';
             setStatus(`${stateLabels.UPDATED}${engine}`);
         } catch (err) {
-            if (token !== activeRequestToken) return;
+            if (err?.name === 'AbortError' || token !== activeRequestToken) return;
+            lastRequested = null;  // a failed text may be retried as-is
             setStatus(`${stateLabels.ERROR}: ${err?.message || 'unknown error'}`);
+        } finally {
+            if (inflight === controller) inflight = null;
         }
     }
     function scheduleDebouncedTranslation() {
         if (debounceTimer) window.clearTimeout(debounceTimer);
-        debounceTimer = window.setTimeout(requestTranslation, DEBOUNCE_MS);
+        const value = sourceEl()?.value || '';
+        debounceTimer = window.setTimeout(requestTranslation, endsAWord(value) ? DEBOUNCE_MS : MID_WORD_MS);
     }
     // Delegated bindings: the workspace DOM is torn down and rebuilt on every
     // language swap / mode change, so listeners must live on `document`.
@@ -2937,6 +3011,83 @@ class TranslationUI(VoicePageMixin):
                 headers={"X-Correlation-Id": correlation_id},
             )
 
+    async def api_text_translate_live(
+        self,
+        request: Request,
+        text: str = Form(...),
+        language: str = Form(...)
+    ):
+        """The live text box: /api/text_translate's routing and receipt,
+        streamed as the model writes it.
+
+        Same events as /api/text_translate_stream (start, partial, complete,
+        error). `complete` carries the full receipt /api/text_translate
+        returns (engine, privacy, metered, ran_on, left_machine), booked
+        against what actually served the request.
+        """
+        correlation_id = str(uuid.uuid4())
+        denied = self._check_api_access(request, correlation_id)
+        if denied:
+            return denied
+        cleaned_text = (text or "").strip()
+        if not cleaned_text:
+            return JSONResponse({"error": "Transcript text is required."}, status_code=400,
+                                headers={"X-Correlation-Id": correlation_id})
+        if len(cleaned_text) > MAX_TEXT_CHARS:
+            return JSONResponse(
+                {"error": f"Text is too long ({len(cleaned_text)} characters). The limit is {MAX_TEXT_CHARS} — split it or upload it as a document."},
+                status_code=413, headers={"X-Correlation-Id": correlation_id})
+        if not language or language.lower() in ('undefined', 'null', ''):
+            language = 'es'
+        profile = self.active_profile
+        scope = self.session_cache_scope
+        recorder = self._engine_recorder()
+        started = time.perf_counter()
+
+        async def events():
+            try:
+                async for kind, value in self._run_streamed(
+                        request, scope,
+                        lambda: self.backend.translate_live(cleaned_text, language, profile),
+                        recorder=recorder, surface=policy.Surface.LIVE_TEXT,
+                        chars=len(cleaned_text)):
+                    if kind == "partial":
+                        yield f"event: partial\ndata: {json.dumps({'translated_text': value})}\n\n"
+                        continue
+                    (translated, engine), provenance = value
+                    from_cache = provenance.from_cache and bool(cleaned_text)
+                    run = recorder(
+                        surface=policy.Surface.LIVE_TEXT,
+                        engine="cache" if from_cache else engine,
+                        origin=engine if from_cache else None,
+                        latency_ms=int((time.perf_counter() - started) * 1000),
+                        chars=len(cleaned_text))
+                    if run is None:  # bookkeeping failed; the response still must not lie
+                        run = policy.classify_run("cache" if from_cache else engine, profile)
+                        if from_cache:
+                            run = dataclass_replace(run, engine=engine)
+                    self._record_chat_thread(cleaned_text, translated, language,
+                                             surface=policy.Surface.LIVE_TEXT)
+                    yield "event: complete\ndata: " + json.dumps({
+                        "original_text": cleaned_text,
+                        "translated_text": translated,
+                        "target_language": language,
+                        "engine": engine,
+                        "privacy": run.privacy,
+                        "metered": run.metered,
+                        "ran_on": run.ran.value,
+                        "left_machine": run.left_machine,
+                    }) + "\n\n"
+            except streaming.StreamCancelled:
+                return
+            except Exception as e:
+                _log_event("ui.text_translate_failed", correlation_id=correlation_id, error=str(e))
+                yield f"event: error\ndata: {json.dumps({'error': f'Translation failed: {e}'})}\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Correlation-Id": correlation_id})
+
     async def api_text_translate_stream(
         self,
         request: Request,
@@ -3011,25 +3162,24 @@ class TranslationUI(VoicePageMixin):
         async def event_generator():
             yield f"event: start\ndata: {json.dumps({'target_language': language, 'original_text': cleaned_text, 'engine': engine})}\n\n"
             try:
-                with self.backend.cache_scope(scope), \
-                        self.backend.capture_provenance() as provenance:
-                    final_text, partials = await asyncio.to_thread(
-                        self._stream_translate_text_on_profile,
-                        cleaned_text,
-                        language,
-                        profile,
-                    )
-                for partial in partials[:-1]:
-                    yield f"event: partial\ndata: {json.dumps({'translated_text': partial})}\n\n"
-                from_cache = provenance.from_cache and bool(cleaned_text)
-                recorder(
-                    surface=policy.Surface.LIVE_TEXT,
-                    engine="cache" if from_cache else engine,
-                    origin=engine if from_cache else None,
-                    latency_ms=int((time.perf_counter() - started) * 1000),
-                    chars=len(cleaned_text))
-                self._record_chat_thread(cleaned_text, final_text, language)
-                yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True, 'engine': engine})}\n\n"
+                async for kind, value in self._run_streamed(
+                        request, scope, lambda: self._translate_text_on_profile(
+                            cleaned_text, language, profile)):
+                    if kind == "partial":
+                        yield f"event: partial\ndata: {json.dumps({'translated_text': value})}\n\n"
+                        continue
+                    final_text, provenance = value
+                    from_cache = provenance.from_cache and bool(cleaned_text)
+                    recorder(
+                        surface=policy.Surface.LIVE_TEXT,
+                        engine="cache" if from_cache else engine,
+                        origin=engine if from_cache else None,
+                        latency_ms=int((time.perf_counter() - started) * 1000),
+                        chars=len(cleaned_text))
+                    self._record_chat_thread(cleaned_text, final_text, language)
+                    yield f"event: complete\ndata: {json.dumps({'translated_text': final_text, 'canonical': True, 'engine': engine})}\n\n"
+            except streaming.StreamCancelled:
+                return
             except Exception as e:
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
@@ -3070,9 +3220,81 @@ class TranslationUI(VoicePageMixin):
         with self.backend.using_profile(profile):
             return self.backend.translate_text(text, language)
 
-    def _stream_translate_text_on_profile(self, text: str, language: str, profile):
-        with self.backend.using_profile(profile):
-            return self.backend.stream_translate_text(text, language)
+    async def _run_streamed(self, request: Request, scope, work, recorder=None,
+                            surface=None, chars: int = 0):
+        """Run `work` on a worker thread with a stream sink installed, and
+        yield ("partial", text so far) then ("done", (result, provenance)).
+
+        The model's own stream reaches the page: this replaced a helper that
+        waited for the whole answer and then sliced it into 80-character
+        "partials", so nothing arrived any sooner than without streaming.
+
+        When the client goes away (a newer keystroke aborted this request,
+        or the tab closed), `cancel` is set. The provider closes the model's
+        response at its next piece, which stops generation and, on a metered
+        API, stops the output tokens being billed. A cancelled call that
+        reached a model is still booked with `recorder`: its input was sent
+        and paid for, and a receipt that forgets it would under-report.
+        """
+        loop = asyncio.get_running_loop()
+        updates: asyncio.Queue = asyncio.Queue()
+        cancel = threading.Event()
+        sink = streaming.StreamSink(
+            lambda text: loop.call_soon_threadsafe(updates.put_nowait, text), cancel)
+        holder: dict = {}
+        started = time.perf_counter()
+
+        def run():
+            with self.backend.cache_scope(scope), \
+                    self.backend.capture_provenance() as provenance, \
+                    streaming.streaming(sink):
+                holder["provenance"] = provenance
+                return work()
+
+        task = asyncio.ensure_future(asyncio.to_thread(run))
+        is_disconnected = getattr(request, "is_disconnected", None)
+        finished = False
+        try:
+            shown = None
+            while not task.done():
+                # Wake on new text OR on the work finishing. Waiting on the
+                # queue alone held every final answer back by up to the
+                # poll interval (measured: +64 ms median on local).
+                getter = asyncio.ensure_future(updates.get())
+                done, _ = await asyncio.wait({getter, task}, timeout=0.15,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if getter not in done:
+                    getter.cancel()
+                    # Starlette only notices a vanished client when it next
+                    # writes, and nothing is written while the model thinks.
+                    if not done and is_disconnected is not None and await is_disconnected():
+                        return
+                    continue
+                text = getter.result()
+                while not updates.empty():  # send only the newest text
+                    text = updates.get_nowait()
+                if text != shown:
+                    shown = text
+                    yield "partial", text
+            result = await task
+            finished = True
+            yield "done", (result, holder.get("provenance"))
+        finally:
+            if not finished:
+                cancel.set()
+
+                def book_abandoned(done_task):
+                    provenance = holder.get("provenance")
+                    if recorder is None or provenance is None or not provenance.engine_runs:
+                        return
+                    try:
+                        recorder(surface=surface, engine=provenance.most_exposed or "unknown",
+                                 latency_ms=int((time.perf_counter() - started) * 1000),
+                                 chars=chars, delivered=False)
+                    except Exception as error:
+                        logging.info("[UI] cancelled run not booked (%s)", error)
+
+                task.add_done_callback(book_abandoned)
 
     def _translate_image_as_json(self, payload: bytes, filename: str, language: str) -> dict:
         """`translate_image_text_blocks`, in a shape JSONResponse can send.
@@ -3321,6 +3543,7 @@ def start_ui() -> None:
     api_service = new_page_ui()
     app.add_api_route("/api/voice_translate", api_service.api_voice_translate, methods=["POST"])
     app.add_api_route("/api/text_translate", api_service.api_text_translate, methods=["POST"])
+    app.add_api_route("/api/text_translate_live", api_service.api_text_translate_live, methods=["POST"])
     app.add_api_route(
         "/api/text_translate_stream", api_service.api_text_translate_stream, methods=["POST"],
     )

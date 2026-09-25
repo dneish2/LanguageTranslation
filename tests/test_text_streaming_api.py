@@ -38,47 +38,5 @@ def test_stream_endpoint_fallbacks_to_non_streaming(monkeypatch):
     assert payload["translated_text"] == "es:short"
 
 
-def test_stream_endpoint_emits_start_and_complete(monkeypatch):
-    ui_app = _build_ui()
-    monkeypatch.setenv("LIVE_TEXT_STREAMING", "true")
-    monkeypatch.setattr(
-        ui_app.backend,
-        "stream_translate_text",
-        lambda text, language: ("hola mundo", ["hola", "hola mundo"]),
-    )
-
-    resp = asyncio.run(ui_app.api_text_translate_stream(_app_request(ui_app), text="hello world", language="es"))
-
-    async def _collect_events():
-        chunks = []
-        async for part in resp.body_iterator:
-            chunks.append(part.decode() if isinstance(part, bytes) else part)
-        return "".join(chunks)
-
-    body = asyncio.run(_collect_events())
-    assert "event: start" in body
-    assert "event: partial" in body
-    assert "event: complete" in body
-    assert '"canonical": true' in body
-
-
-def test_stream_endpoint_emits_error_event(monkeypatch):
-    ui_app = _build_ui()
-    monkeypatch.setenv("LIVE_TEXT_STREAMING", "true")
-
-    def _raise(*_args, **_kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(ui_app.backend, "stream_translate_text", _raise)
-
-    resp = asyncio.run(ui_app.api_text_translate_stream(_app_request(ui_app), text="hello world", language="es"))
-
-    async def _collect_events():
-        chunks = []
-        async for part in resp.body_iterator:
-            chunks.append(part.decode() if isinstance(part, bytes) else part)
-        return "".join(chunks)
-
-    body = asyncio.run(_collect_events())
-    assert "event: error" in body
-    assert "boom" in body
+# The streaming cases live in test_live_streaming.py, against the model's
+# real stream rather than a pre-sliced answer.

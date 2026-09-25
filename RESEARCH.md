@@ -391,6 +391,62 @@ shows no debris.
 **Concurrency:** with the switch interval forced to 1 µs, the shared translation cache raised
 "dictionary changed size during iteration" in 3 of 3 runs without a lock, and 0 of 3 with one.
 
+## 4d. Live typing: real streaming, cancellation, fewer calls (R2, 2026-09-24)
+
+Measured with `python -m passage.live_bench`: a real Chromium typing into the real page, five
+sentences, one per run, seeds 1000 to 1004, the same seeds before and after. The typist is a
+keystroke model (log-normal inter-key interval, median 180 ms, longer gaps between words, occasional
+thinking pauses and mid-word hesitations). The hosted engine is a fake OpenAI-compatible server shaped
+like gpt-5.4-nano here (450 ms to first token, ~70 tokens/s), which counts every call, token and
+abandoned token. There is no OpenAI key on this machine, so no real hosted call was made. The local
+engine is the real Ollama translategemma:4b. Raw rows are in `data/live_bench.jsonl`.
+
+| Hosted (fake gpt-5.4-nano) | model calls per sentence | prompt words sent | time to first text | last key to final text |
+|---|---|---|---|---|
+| before | 14 (16, 14, 13, 13, 16) | 1,279 | 558 ms | 982 ms |
+| after | **8** (8, 9, 5, 7, 8) | **744** | 529 ms | 975 ms |
+| 700 ms pause, not shipped | 3 (3, 3, 3, 4, 5) | 287 | 490 ms | 1,324 ms |
+
+Medians over 5 runs, per-run values in brackets. Every run made fewer calls after the change.
+
+| Local (translategemma:4b) | requests per sentence | time to first text | last key to final text |
+|---|---|---|---|
+| before | 14 | 104 ms | 471 ms (451, 485, 479, 444, 471) |
+| after | 8 | 74 ms | 492 ms (484, 456, 682, 530, 492) |
+
+**What changed the call count was not streaming.** A request used to fire on every 350 ms pause,
+including pauses inside a word ("The meet"), and each of those was a paid call on the hosted engine.
+Now a pause inside a word must last 900 ms before it triggers, and repeating the same text (a
+trailing space) sends nothing. The roadmap hypothesis was 8 to ≤3 calls. The real baseline was 14,
+and the shipped rule reaches 8. Reaching 3 needs a 700 ms pause even after a finished word, which
+costs about 350 ms on every final answer. That trade is David's to make; the constant is
+`DEBOUNCE_MS` in `_inject_workspace_text_live_translation_js`.
+
+**Streaming barely moves time to first text here**, because live answers are short: a 10-word
+translation at 70 tokens/s is ~140 ms of output after a 450 ms first token. Streaming pays on long
+text and on the voice page's transcript, not on a sentence being typed. The old "streaming" endpoint
+did not stream at all: it waited for the whole answer and then sliced it into 80-character pieces.
+
+**Cancellation works but rarely fires under this typist.** A request is aborted only when a newer one
+replaces it, and with requests now gated to word boundaries, the older answer is almost always
+finished by then (0 abandoned tokens in every run). It matters when the model is slow or the text
+long, and a cancelled call that reached a model is still booked, as not delivered.
+
+**Local final latency is flat to slightly worse:** 3 of 5 runs slower, median +21 ms, one run at
+682 ms. My first version held every final answer back by up to 150 ms (+64 ms median), because the
+server waited on the text queue and not on the work finishing. Fixed before these numbers were taken.
+
+**The bench caught a bug the unit tests could not:** the first "after" run made zero requests in 5 of
+5 runs. The new script sat in a non-raw Python string, so `'\n\n'` reached the browser as a real
+newline inside a JavaScript string: a syntax error, no Python error, 635 green tests. A test now runs
+`node --check` on the script as served.
+
+**Unchanged, and worth knowing:** on Cloud the live box's hosted path uses the hardened document
+prompt (~90 prompt words for a 10-word sentence). The one-line live prompt is used only for local and
+chosen endpoints. Switching hosted to the short prompt would cut input tokens roughly 5x, but a
+general model answering "How are you?" instead of translating it is the failure that prompt exists
+for. That needs a real hosted measurement before it changes.
+
 ## 5. Prompt for the next session
 
 Paste this to continue. It assumes nothing beyond the repo.
