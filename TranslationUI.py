@@ -32,6 +32,7 @@ from TranslationBackend import (
     TranslationRunState,
     SUPPORTED_DOCUMENT_EXTENSIONS,
     current_cache_scope,
+    describe_location,
     ollama_suits_translation,
     probe_local_llm,
 )
@@ -306,10 +307,6 @@ class TranslationUI(VoicePageMixin):
         self.uploaded_file_name: str | None = None
         self.uploaded_file_extension: str | None = None
         self.current_target_language: str | None = None
-        self.overlay_show_original = False
-        self.overlay_font_size = 24
-        self.overlay_font_family = "DejaVuSans.ttf"
-        self.overlay_preview_visible = True
         self.current_correlation_id: str | None = None
         self.cancel_button = None
         self.translate_button = None
@@ -1269,9 +1266,19 @@ class TranslationUI(VoicePageMixin):
         self.refresh_upload_ui()
 
     def _describe_segment_for_editor(self, index: int, seg_info: dict) -> str:
+        """Title a reviewer can find in their own document.
+
+        segment_map's ``location`` is a machine id (``docx:paragraph:0``), which
+        this used to print verbatim; ``describe_location`` renders it as
+        "Paragraph 1". The paragraph and slide numbers it produces count
+        positions in the FILE, not entries in this list, so they can skip where
+        the document has empty paragraphs or picture-only shapes — the leading
+        ``index`` is the list position. PDF blocks carry no location at all, so
+        they are still described from their page.
+        """
         location = seg_info.get("location")
         if location:
-            return f"{index}. {location}"
+            return f"{index}. {describe_location(location)}"
 
         seg_type = seg_info.get("type", "segment").replace("_", " ")
         if seg_type == "pdf block":
@@ -2064,21 +2071,13 @@ class TranslationUI(VoicePageMixin):
                 # stated, not silently dropped.
                 self._render_fidelity_notes()
 
-                if self.uploaded_file_extension in {"png", "jpg", "jpeg", "webp"}:
-                    ui.separator().classes("my-3")
-                    ui.label("Image overlay controls").classes("p-display text-lg")
-                    with ui.row().classes("items-center gap-2 flex-wrap"):
-                        ui.number("Font size", value=self.overlay_font_size, min=8, max=64, step=1, on_change=lambda e: setattr(self, "overlay_font_size", int(e.value))).classes("w-32")
-                        ui.input("Font family", value=self.overlay_font_family, on_change=lambda e: setattr(self, "overlay_font_family", e.value)).classes("w-48")
-                        ui.switch("Show original overlay", value=self.overlay_show_original, on_change=lambda e: setattr(self, "overlay_show_original", bool(e.value)))
-                        ui.switch("Preview visible", value=self.overlay_preview_visible, on_change=lambda e: setattr(self, "overlay_preview_visible", bool(e.value)) or self.show_result())
-                        ui.button("Refresh overlay", on_click=self.refresh_image_overlay).classes(theme.BTN_SECONDARY_SM)
-                    if self.overlay_preview_visible and self.document_run_state.output_stream is not None:
-                        import base64
-                        output_stream = self.document_run_state.output_stream
-                        output_stream.seek(0)
-                        encoded = base64.b64encode(output_stream.read()).decode("ascii")
-                        ui.html(f'<img alt="overlay preview" style="max-width:100%;border:1px solid #ddd;border-radius:8px" src="data:image/png;base64,{encoded}"/>')
+                # No image-overlay controls here. show_result() is the DOCUMENT
+                # surface, and the document uploader only accepts what
+                # SUPPORTED_DOCUMENT_EXTENSIONS allows, so the font-size and
+                # font-family inputs that used to sit here were image controls
+                # behind a test no document could ever pass. Photographs render
+                # through show_mobile_image_result(), which composes its overlay
+                # in the backend and has never needed them.
 
                 # ── DOWNLOAD & NAV ───────────────────────────────
                 ui.separator().classes("my-4")
@@ -2094,21 +2093,6 @@ class TranslationUI(VoicePageMixin):
                 ui.label(f"{self.current_count} segments translated").classes(theme.DATA)
                 if self.current_tokens > 0:
                     ui.label(f"{self.current_tokens:,} tokens").classes(theme.DATA)
-
-    def refresh_image_overlay(self):
-        try:
-            self.backend.process_image(
-                BytesIO(self.uploaded_file.getvalue()),
-                self.current_target_language,
-                show_original=self.overlay_show_original,
-                font_size=self.overlay_font_size,
-                font_family=self.overlay_font_family,
-                run_state=self.document_run_state,
-            )
-            self.show_result()
-        except Exception as ex:
-            logging.error(f"[UI] refresh_image_overlay failed: {ex}", exc_info=True)
-            ui.notify(f"Overlay refresh failed: {ex}", type="negative")
 
     def download_file(self):
         try:
@@ -2291,7 +2275,11 @@ class TranslationUI(VoicePageMixin):
             return
         grouped: dict[str, list[str]] = {}
         for note in notes:
-            grouped.setdefault(note["message"], []).append(note["location"])
+            # Same ids, same fix as the segment titles: this list sits inches
+            # below them, so a raw "docx:paragraph:4" here undoes it.
+            grouped.setdefault(note["message"], []).append(
+                describe_location(note["location"])
+            )
         ui.separator().classes("my-3")
         with ui.expansion(
             f"Formatting notes ({len(notes)})", icon="report_problem"

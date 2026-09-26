@@ -627,6 +627,61 @@ SUPPORTED_DOCUMENT_EXTENSIONS = frozenset({"docx", "pptx", "pdf"})
 SUPPORTED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp"})
 
 
+#: The segment "location" ids this module writes into ``segment_map`` and into
+#: every fidelity note: ``docx:paragraph:3``, ``docx:table:0:row:1:col:2:para:0``,
+#: ``pptx:slide:0:shape:2``, ``image:region:4``. They are stable keys — traces,
+#: tests and the notes all match on them — and were never meant to be read by a
+#: person, but two surfaces rendered them raw (the segment-review titles and the
+#: formatting notes). ``describe_location`` is the one place that grammar is
+#: turned into English, and it lives next to the code that writes it so the two
+#: cannot drift apart unnoticed.
+#:
+#: Indices in the ids are zero-based and the labels are one-based, because the
+#: label names a position in the user's document rather than an array slot. A
+#: shape this does not recognise is returned unchanged: an ugly true label beats
+#: a friendly wrong one.
+_LOCATION_LABELS: tuple[tuple[re.Pattern, Callable[[tuple[int, ...]], str]], ...] = (
+    (
+        re.compile(r"^docx:paragraph:(\d+)$"),
+        lambda n: f"Paragraph {n[0]}",
+    ),
+    (
+        # A cell can hold several paragraphs; the first one needs no qualifier,
+        # a later one does or two rows of the review read identically.
+        re.compile(r"^docx:table:(\d+):row:(\d+):col:(\d+):para:(\d+)$"),
+        lambda n: (
+            f"Table {n[0]}, row {n[1]}, cell {n[2]}"
+            + (f", paragraph {n[3]}" if n[3] > 1 else "")
+        ),
+    ),
+    (
+        re.compile(r"^pptx:slide:(\d+):shape:(\d+)$"),
+        lambda n: f"Slide {n[0]}, text box {n[1]}",
+    ),
+    (
+        re.compile(r"^image:region:(\d+)$"),
+        lambda n: f"Image region {n[0]}",
+    ),
+)
+
+
+def describe_location(location: str) -> str:
+    """Turn a segment location id into a label a person can act on.
+
+    ``docx:paragraph:0`` -> ``Paragraph 1``;
+    ``docx:table:0:row:1:col:2:para:0`` -> ``Table 1, row 2, cell 3``;
+    ``pptx:slide:0:shape:2`` -> ``Slide 1, text box 3``.
+    Unknown shapes (and the empty string) come back exactly as given.
+    """
+    if not location:
+        return ""
+    for pattern, render in _LOCATION_LABELS:
+        match = pattern.match(location)
+        if match:
+            return render(tuple(int(g) + 1 for g in match.groups()))
+    return location
+
+
 #: Per-request provider override (see TranslationBackend._require_provider).
 #: ContextVar, not an attribute: the backend is shared by every client.
 _active_provider: ContextVar[Any] = ContextVar("passage_active_provider", default=None)
