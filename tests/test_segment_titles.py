@@ -11,6 +11,7 @@ it walks the segment map a real DOCX produces, so a fifth location grammar added
 to TranslationBackend with no label fails here instead of shipping an id.
 """
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -252,6 +253,32 @@ def test_a_segment_with_no_location_or_page_still_gets_a_title(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     ui_app = TranslationUI()
     assert ui_app._describe_segment_for_editor(7, {"type": "table_cell"}) == "7. Table Cell"
+
+
+# ──────────────────────────── the progress ring ──────────────────────────────
+
+def test_progress_percent_is_a_whole_number(monkeypatch):
+    """ui.circular_progress(show_value=True) prints what it is handed, and two
+    of eleven segments put "18.18181818181818183" inside the ring."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    backend = TranslationBackend()
+    seen = []
+    for current in range(0, 12):
+        backend.update_progress(
+            current, 11, time.time(),
+            progress_callback=lambda value, _text: seen.append(value),
+        )
+    assert seen == [0, 9, 18, 27, 36, 45, 55, 64, 73, 82, 91, 100]
+    assert all(isinstance(v, int) for v in seen)
+
+
+def test_progress_does_not_divide_by_zero_on_an_empty_document(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    seen = []
+    TranslationBackend().update_progress(
+        0, 0, time.time(), progress_callback=lambda value, _text: seen.append(value)
+    )
+    assert seen == [0]
 
 
 # ──────────────────────────── the formatting notes ───────────────────────────

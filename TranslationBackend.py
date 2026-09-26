@@ -3616,7 +3616,10 @@ class TranslationBackend:
         elapsed = time.time() - start_time
         avg = elapsed / current if current else 0
         remaining = total - current
-        progress_value = (current / total) * 100 if total else 0
+        # Whole percent: this value is rendered by ui.circular_progress with
+        # show_value=True, which prints whatever it is given. Two of eleven
+        # segments put "18.18181818181818183" in the middle of the ring.
+        progress_value = round((current / total) * 100) if total else 0
         label_text = f"Processing {current}/{total} (≈ {int(avg * remaining)}s remaining)"
         if progress_ui is not None:
             progress_ui.set_value(progress_value)
