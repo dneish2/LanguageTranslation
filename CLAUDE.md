@@ -6,6 +6,28 @@
 the workspace root `CLAUDE.md` is finplatform's, and does not apply to this repo. uv venv at
 `.venv`, Python 3.12 locally; CI runs 3.11, so check both before claiming a suite is green.
 
+Three rules the suite now depends on, each of which cost a red build to learn:
+
+- **Assert on the state production code publishes, never on an intermediate signal that
+  happens to appear first.** The German voice test waited for a recorded download URL and then
+  asked whether the voice was installed — but `ensure_voice` fetches the `.onnx.json` before the
+  weights, and `de_DE-thorsten-medium.onnx.json` *contains* `de_DE-thorsten-medium.onnx`, so the
+  wait was satisfied by step 1 of 4. It lost that race twice in CI (ubuntu, then macOS) and read
+  as a broken app. A recorded URL is a probe; `voice_installed()` is a postcondition. Waiting
+  longer is not the fix.
+- **No test renders a NiceGUI page without owning its client.** The first client-less render in a
+  process latches a global pseudo-client in `nicegui/context.py` and leaves a slot on
+  `Slot.stacks` forever, so every later client-less render rides on it. The suite was green only
+  because `tests/test_api_security.py` sorts first: in reverse order it was 647 passed + 9 errors,
+  and 2 of 3 random orders failed. Use `PageBuild` from `tests/conftest.py`. The reverse-order job
+  in `suite.yml` is what keeps this honest — if it goes red, a new global latch has appeared.
+- **Background work a test triggers gets joined, not slept on.** `local_voice.wait_for_prefetches()`
+  exists for this. `ensure_voice` reads `VOICE_DIR` when it reaches the lock, so a fetch thread
+  outliving its test writes a 12-byte placeholder into the real `models/piper/` — a voice
+  `installed_voices()` then reports as present and `synthesize()` fails on. `tests/conftest.py`
+  joins them while the patches are still in place; a fixed sleep is a guess about a race, not an
+  end to it.
+
 Tests here assert **which path ran**, never that a call returned 200. Fake endpoints count their
 own calls and stamp their identity into the bytes they return, so a test fails if another engine
 served the request *and* fails if nothing ran at all. A test that would still pass when the local

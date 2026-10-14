@@ -7,25 +7,13 @@ on:
     branches: [main]
 
 jobs:
+  # The gate, called rather than copied. This job used to be a second,
+  # hand-maintained ubuntu test job — the same tests ci.yml was already
+  # running on every push, minus the banner that says what the runner
+  # resolved. Two copies of "how the suite runs" is one copy too many when one
+  # of them decides whether code reaches production.
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest
-
-      - name: Run tests
-        run: python -m pytest tests/ -q
+    uses: ./.github/workflows/suite.yml
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

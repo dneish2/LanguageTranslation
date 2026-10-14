@@ -12,9 +12,11 @@
 # The point is NOT a green tick. A green tick on a machine with no Ollama and
 # no voice models is exactly the false comfort PORTABILITY_PLAN.md §2.2 warns
 # about: every local path falls back to hosted and the app looks perfect. So
-# the first step of every job PRINTS what the runner actually resolved — OS,
-# arch, Python, node, font resolution, capability probes — and copies it into
-# the job summary. The log is the deliverable; the tick is a side effect.
+# the suite prints what the runner actually resolved — OS, arch, Python, node,
+# font resolution, capability probes — into the job summary before running a
+# test. The log is the deliverable; the tick is a side effect.
+#
+# The matrix and that banner now live in suite.yml, which this workflow calls.
 #
 # UNVERIFIED UNTIL A REAL RUN SAYS OTHERWISE
 # ------------------------------------------
@@ -34,8 +36,10 @@
 # yet — no GitHub Actions run of this file exists as of the commit that adds
 # it — so that tier is still UNVERIFIED too. It never gates a PR.
 #
-# deploy.yml is untouched and still owns the ubuntu test + Cloud Run deploy
-# gate for main; this workflow adds breadth, it does not replace that gate.
+# deploy.yml still owns the Cloud Run deploy gate for main, but it no longer
+# carries its own copy of the tests: both workflows now call suite.yml, so the
+# gate and this breadth matrix cannot drift apart, and a push runs the ubuntu
+# suite once instead of twice.
 
 name: CI
 
@@ -107,91 +111,12 @@ jobs:
           git merge --abort 2>/dev/null || true
           exit 1
 
+  # The suite itself lives in suite.yml and is called, not copied: deploy.yml
+  # needs the identical definition as its gate, and two hand-maintained copies
+  # of "how the suite runs" is how the deploy gate ended up as the copy without
+  # the evidence banner.
   suite:
-    name: tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false          # one OS failing must not hide the other two
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
-
-      # ── EVIDENCE, not a tick ────────────────────────────────────────────
-      # Prints before the tests so the answer survives a failing suite.
-      - name: What this runner resolved
-        shell: bash
-        run: |
-          echo "node: $(node --version 2>/dev/null || echo 'ABSENT — the voice-page JS tests will SKIP')"
-          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
-          import os, platform, sys, sysconfig, tempfile
-
-          bar = "=" * 68
-          # The arm64 question, made unmissable. PORTABILITY_PLAN.md §3 claims
-          # macos-14+ runners are arm64; this line is the only thing that can
-          # turn that claim into a fact for this repo.
-          print(bar)
-          print(f"  platform.machine() = {platform.machine()!r}")
-          print(f"  platform.system()  = {platform.system()!r}")
-          print(f"  platform.release() = {platform.release()!r}")
-          print(f"  is arm64?          = {platform.machine().lower() in ('arm64', 'aarch64')}")
-          print(bar)
-
-          print(f"python            : {sys.version.split()[0]} ({platform.python_implementation()})")
-          print(f"platform.platform : {platform.platform()}")
-          print(f"os.name / sep     : {os.name} / {os.sep!r}")
-          print(f"filesystem enc    : {sys.getfilesystemencoding()}")
-          print(f"stdout enc        : {sys.stdout.encoding}")
-          print(f"tempdir           : {tempfile.gettempdir()}")
-          print(f"platform tag      : {sysconfig.get_platform()}")
-
-          # App-specific probes: what the code ACTUALLY reads, per §2.6 — no
-          # generic "has GPU" guessing, no nvidia-smi on a Mac.
-          sys.path.insert(0, os.getcwd())
-
-          try:
-              import image_compositor
-              report = image_compositor.probe_font(24)
-              print(f"font resolved     : {report['resolved']!r} (kind={report['kind']})")
-              print(f"font FELL BACK    : {report['fallback']}"
-                    + ("   <-- overlay glyphs will be missing here" if report['fallback'] else ""))
-              print(f"font candidates   : {len(report['tried'])} tried")
-          except Exception as error:                       # noqa: BLE001
-              print(f"font probe FAILED : {type(error).__name__}: {error}")
-
-          try:
-              from passage import local_voice
-              state = local_voice.status()
-              print(f"local voice mode  : {state['mode']} (enabled={state['enabled']})")
-              print(f"  stt engine      : {state['stt_engine']}  ready={state['stt_ready']}")
-              print(f"  voices on disk  : {list(state['voices'])}")
-          except Exception as error:                       # noqa: BLE001
-              print(f"local voice probe : {type(error).__name__}: {error}")
-
-          # Expected ABSENT on every runner. Printed so the reason the local
-          # LLM tier is unverified is visible in the log rather than assumed.
-          try:
-              import urllib.request
-              with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1):
-                  print("ollama            : REACHABLE (unexpected on a runner)")
-          except Exception as error:                       # noqa: BLE001
-              print(f"ollama            : unreachable ({type(error).__name__}) "
-                    "-> local LLM inference stays UNVERIFIED here, by design")
-          PY
-
-      - name: Run the suite
-        run: python -m pytest tests/ -q
+    uses: ./.github/workflows/suite.yml
 
   # ── Nightly: REAL local speech on Apple Silicon ─────────────────────────
   # Not on PRs. It downloads model weights and is slow, and a flaky network

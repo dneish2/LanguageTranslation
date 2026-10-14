@@ -52,7 +52,10 @@ def _no_test_may_download_whisper_weights(monkeypatch):
     # hold faster-whisper-base), instead of behaving differently by accident.
     monkeypatch.setattr(local_voice, "whisper_installed", lambda: False)
     yield
-    time.sleep(0.1)   # give any daemon fetch thread the chance to be caught
+    # Join the fetch threads rather than sleeping long enough to probably catch
+    # them: a 0.1s guess that holds on this machine says nothing about a loaded
+    # runner, where a downloader slower than the sleep reads as "never called".
+    assert local_voice.wait_for_prefetches(timeout=10.0) == []
     assert loads == [], "a voice test reached the Whisper downloader"
 
 
@@ -217,7 +220,9 @@ def test_a_failing_prefetch_never_raises_into_the_ui(monkeypatch, tmp_path):
 
     local_voice.prefetch_voice("Spanish")   # must not raise
     assert done.wait(timeout=5)
-    time.sleep(0.1)
+    # `done` fires INSIDE _fetch_url, so the thread still has its error handling
+    # and cleanup to run. Join it instead of sleeping past it.
+    assert local_voice.wait_for_prefetches(timeout=10.0) == []
     assert local_voice.voice_installed("Spanish") is False
     # …and calling the helper directly is equally non-raising.
     assert local_voice.ensure_voice("Spanish") is None
@@ -391,7 +396,7 @@ def test_a_stale_stem_does_not_cause_a_permanent_redownload_loop(monkeypatch, tm
     # And nothing re-downloads: not the helper, not the background pre-fetch.
     assert local_voice.ensure_voice("Spanish") == voice_dir / f"{GOOD}.onnx"
     local_voice.prefetch_voice("Spanish")
-    time.sleep(0.2)
+    assert local_voice.wait_for_prefetches(timeout=10.0) == []
     assert len(downloads) == first_round
 
 

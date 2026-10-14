@@ -1,0 +1,180 @@
+# The test suite, defined ONCE and called by everything that needs it.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The same 650-odd tests used to be written out twice: `deploy.yml` had its own
+# ubuntu test job and `ci.yml` had an ubuntu leg in its matrix. Every push ran
+# both. That is not expensive (this repo is public, so standard-runner minutes
+# are free and unmetered) but it is two places for "how the suite runs" to
+# drift apart, and the deploy gate was the copy with no evidence banner. Now
+# both workflows `uses:` this one.
+#
+# WHAT THE MATRIX IS FOR
+# ----------------------
+# Not a green tick. A green tick on a machine with no Ollama and no voice models
+# is exactly the false comfort PORTABILITY_PLAN.md §2.2 warns about: every local
+# path falls back to hosted and the app looks perfect. So the first step PRINTS
+# what the runner actually resolved — OS, arch, Python, node, font resolution,
+# capability probes — and copies it into the job summary. The log is the
+# deliverable; the tick is a side effect.
+#
+# The two flakes this repo has ever had in CI landed on DIFFERENT runners
+# (ubuntu-latest 2026-10-12, macos-14 2026-09-24) and were the same test both
+# times. Breadth is what made them legible as one bug rather than two mysteries.
+
+name: suite
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # A brand-new runner image failing must not block a merge — see `stable`
+    # below. The matrix itself must not stop either: one OS failing is
+    # information about that OS, not a reason to discard the other four.
+    continue-on-error: ${{ matrix.stable == false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Parity with the leg that gates production, first.
+          - os: ubuntu-latest      # 24.04
+            stable: true
+          - os: windows-latest     # 2025 / VS2026
+            stable: true
+          # The recorded arm64 baseline. PORTABILITY.md's measurements were
+          # taken here, so it stays pinned rather than following `-latest`.
+          - os: macos-14
+            stable: true
+          # NEWEST IMAGES, deliberately non-blocking until they have been green
+          # for a week — this repo's standing rule is that a tier stays
+          # UNVERIFIED until a real run says otherwise, and that applies to the
+          # runner images as much as to the hardware. Promote by setting
+          # `stable: true`; do not promote on the strength of one run.
+          - os: ubuntu-26.04
+            stable: false
+          - os: macos-15
+            stable: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # ── EVIDENCE, not a tick ────────────────────────────────────────────
+      # Prints before the tests so the answer survives a failing suite.
+      - name: What this runner resolved
+        shell: bash
+        run: |
+          echo "node: $(node --version 2>/dev/null || echo 'ABSENT — the voice-page JS tests will SKIP')"
+          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, platform, sys, sysconfig, tempfile
+
+          bar = "=" * 68
+          # PORTABILITY_PLAN.md §3 claims macos-14+ runners are arm64; this line
+          # is what turns that claim into a fact for this repo, per image.
+          print(bar)
+          print(f"  platform.machine() = {platform.machine()!r}")
+          print(f"  platform.system()  = {platform.system()!r}")
+          print(f"  platform.release() = {platform.release()!r}")
+          print(f"  is arm64?          = {platform.machine().lower() in ('arm64', 'aarch64')}")
+          print(bar)
+
+          print(f"python            : {sys.version.split()[0]} ({platform.python_implementation()})")
+          print(f"platform.platform : {platform.platform()}")
+          print(f"os.name / sep     : {os.name} / {os.sep!r}")
+          print(f"filesystem enc    : {sys.getfilesystemencoding()}")
+          print(f"stdout enc        : {sys.stdout.encoding}")
+          print(f"tempdir           : {tempfile.gettempdir()}")
+          print(f"platform tag      : {sysconfig.get_platform()}")
+
+          # App-specific probes: what the code ACTUALLY reads, per §2.6 — no
+          # generic "has GPU" guessing, no nvidia-smi on a Mac.
+          sys.path.insert(0, os.getcwd())
+
+          try:
+              import image_compositor
+              report = image_compositor.probe_font(24)
+              print(f"font resolved     : {report['resolved']!r} (kind={report['kind']})")
+              print(f"font FELL BACK    : {report['fallback']}"
+                    + ("   <-- overlay glyphs will be missing here" if report['fallback'] else ""))
+              print(f"font candidates   : {len(report['tried'])} tried")
+          except Exception as error:                       # noqa: BLE001
+              print(f"font probe FAILED : {type(error).__name__}: {error}")
+
+          try:
+              from passage import local_voice
+              state = local_voice.status()
+              print(f"local voice mode  : {state['mode']} (enabled={state['enabled']})")
+              print(f"  stt engine      : {state['stt_engine']}  ready={state['stt_ready']}")
+              print(f"  voices on disk  : {list(state['voices'])}")
+          except Exception as error:                       # noqa: BLE001
+              print(f"local voice probe : {type(error).__name__}: {error}")
+
+          # Expected ABSENT on every runner. Printed so the reason the local
+          # LLM tier is unverified is visible in the log rather than assumed.
+          try:
+              import urllib.request
+              with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1):
+                  print("ollama            : REACHABLE (unexpected on a runner)")
+          except Exception as error:                       # noqa: BLE001
+              print(f"ollama            : unreachable ({type(error).__name__}) "
+                    "-> local LLM inference stays UNVERIFIED here, by design")
+          PY
+
+      - name: Run the suite
+        run: python -m pytest tests/ -q
+
+  # ── Does the suite still pass when the files run in a different order? ───
+  #
+  # It did not. On the commit before this job existed: 656 passed in
+  # alphabetical order, 647 passed + 9 errors in reverse, and 2 of 3 random
+  # orders failed. The cause was a process-global latch in nicegui — the first
+  # client-less page render in a process sets `core.script_mode` and leaves a
+  # slot on `Slot.stacks` forever, so every later client-less render rides on
+  # it. The suite was green because `tests/test_api_security.py` happens to sort
+  # first. One new filename was enough to break nine tests with an error message
+  # that blamed a background task.
+  #
+  # `tests/conftest.py` now clears those globals per test. This job is what
+  # keeps that true: it fails the moment a new global latch appears, or a nicegui
+  # upgrade moves the private `Slot.stacks` the fixture reaches into.
+  #
+  # Reverse rather than shuffled ON PURPOSE. A gate that fails only on seed
+  # 4823 is a gate nobody trusts and everybody re-runs. Reverse is a fixed,
+  # reproducible order that exercises the same hazard — the shuffle belongs in
+  # the nightly, where a surprise is useful and a red X is not a merge blocker.
+  order:
+    name: suite passes in reverse file order
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run the suite with the files reversed
+        shell: bash
+        run: |
+          python -m pytest $(ls tests/test_*.py | sort -r | tr '\n' ' ') -q
