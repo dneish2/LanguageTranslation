@@ -44,7 +44,14 @@
 name: CI
 
 on:
+  # `branches: [main]` rather than every push. An unfiltered `push:` alongside
+  # `pull_request:` fires BOTH for every push to a branch with a PR open, so a
+  # PR ran the whole suite twice over — plus a third time from deploy.yml's
+  # gate. Three identical runs is not three times the evidence; it is three
+  # times the places to look and one more chance for an unrelated flake to
+  # colour the PR red. A branch with no PR open is covered the moment one is.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
   schedule:

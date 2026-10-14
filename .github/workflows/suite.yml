@@ -26,6 +26,22 @@ name: suite
 
 on:
   workflow_call:
+    inputs:
+      matrix:
+        description: >-
+          Which runners to test on, as a JSON list of {os, stable} objects.
+          The default is the full breadth matrix. The deploy gate overrides it
+          with ubuntu alone: that gate decides whether code reaches Cloud Run,
+          which runs on ubuntu, and making a deployment wait on a macOS runner's
+          queue buys nothing. Breadth is CI's job, on the same commit.
+        required: false
+        type: string
+        default: >-
+          [{"os": "ubuntu-latest", "stable": true},
+           {"os": "windows-latest", "stable": true},
+           {"os": "macos-14", "stable": true},
+           {"os": "ubuntu-26.04", "stable": false},
+           {"os": "macos-15", "stable": false}]
 
 permissions:
   contents: read
@@ -41,25 +57,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Parity with the leg that gates production, first.
-          - os: ubuntu-latest      # 24.04
-            stable: true
-          - os: windows-latest     # 2025 / VS2026
-            stable: true
-          # The recorded arm64 baseline. PORTABILITY.md's measurements were
-          # taken here, so it stays pinned rather than following `-latest`.
-          - os: macos-14
-            stable: true
-          # NEWEST IMAGES, deliberately non-blocking until they have been green
-          # for a week — this repo's standing rule is that a tier stays
-          # UNVERIFIED until a real run says otherwise, and that applies to the
-          # runner images as much as to the hardware. Promote by setting
-          # `stable: true`; do not promote on the strength of one run.
-          - os: ubuntu-26.04
-            stable: false
-          - os: macos-15
-            stable: false
+        # The legs come from the `matrix` input above, whose default is:
+        #   ubuntu-latest (24.04)  parity with the leg that gates production
+        #   windows-latest         2025 / VS2026
+        #   macos-14               the recorded arm64 baseline — pinned, not
+        #                          `-latest`, because PORTABILITY.md's
+        #                          measurements were taken on this image
+        #   ubuntu-26.04  }        NEWEST IMAGES, stable:false so they cannot
+        #   macos-15      }        block a merge until they have been green for
+        #                          a week. This repo's standing rule is that a
+        #                          tier stays UNVERIFIED until a real run says
+        #                          otherwise, and that applies to runner images
+        #                          as much as to hardware. Both were green on
+        #                          their first run (PR #50); promote by setting
+        #                          stable:true, not on the strength of one run.
+        include: ${{ fromJSON(inputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 

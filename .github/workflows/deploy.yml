@@ -1,9 +1,11 @@
 name: Deploy to Cloud Run
 
 on:
+  # Push to main only. The `pull_request` trigger was here to pre-validate a PR,
+  # but ci.yml already runs the identical suite on every PR — this workflow's
+  # job is the gate in front of the Cloud Run deploy, which only ever happens on
+  # a push to main.
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
 
 jobs:
@@ -14,6 +16,12 @@ jobs:
   # of them decides whether code reaches production.
   test:
     uses: ./.github/workflows/suite.yml
+    with:
+      # Ubuntu alone, not the breadth matrix. This gate decides whether code
+      # reaches Cloud Run, which runs on ubuntu; making a deployment wait on a
+      # macOS runner's queue buys nothing it does not already have, because
+      # ci.yml runs the full matrix on the very same commit.
+      matrix: '[{"os": "ubuntu-latest", "stable": true}]'
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
