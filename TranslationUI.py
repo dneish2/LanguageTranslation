@@ -461,6 +461,130 @@ class TranslationUI(VoicePageMixin):
             warning=theme.PALETTE["warn"],
             info=theme.PALETTE["muted"],
         )
+        # Lives here because every page build calls _inject_theme and nothing
+        # else is called by all four of them -- that is what makes this "the
+        # shell". A connection drop is not a property of one route.
+        self._inject_mobile_resilience_js()
+        self._inject_capture_target_js()
+
+    def _inject_mobile_resilience_js(self) -> None:
+        """Survive a dropped connection the way a phone actually drops one.
+
+        Two separate problems, measured on 2026-10-15 against the running app:
+
+        1. The typed source text is LOST when the socket comes back. The
+           reconnect_timeout in start_ui() is half of that fix (the server now
+           waits 30 s instead of 3 before deleting the client); this is the
+           other half, for drops longer than any timeout. The draft is mirrored
+           to localStorage on every change and restored on load.
+
+        2. For the first ~6 s of a drop there is NO feedback at all. NiceGUI
+           does ship a "Connection lost" popup -- an earlier version of this
+           note said it did not, which was wrong -- but it is wired to
+           aria-hidden at ~4 s and CSS-delayed 2000 ms on top, so it appears at
+           about 6 s. Until then every tap is a silent no-op that reads as a
+           missed tap. socket.io knows within ~1 s, so this marks the body
+           immediately and lets the stylesheet show it.
+
+        Deliberately does NOT draw a second banner: NiceGUI's is correct and
+        translated, and two banners saying the same thing is worse than one.
+        """
+        ui.add_body_html("""
+<script>
+(() => {
+    const DRAFT_KEY = 'passage.draft.v1';
+    const SOURCE_ID = 'workspace_text_source';
+    const source = () => document.getElementById(SOURCE_ID);
+
+    // localStorage throws in a private window and in some embedded web views;
+    // a translator that crashes because it could not save a draft is worse
+    // than one that forgets the draft.
+    const store = {
+        get() { try { return localStorage.getItem(DRAFT_KEY); } catch (e) { return null; } },
+        set(v) { try { localStorage.setItem(DRAFT_KEY, v); } catch (e) {} },
+        clear() { try { localStorage.removeItem(DRAFT_KEY); } catch (e) {} },
+    };
+
+    // Quasar binds the textarea with v-model, so assigning .value alone leaves
+    // the Vue model -- and therefore the SERVER -- still holding the old empty
+    // string. The input event is what makes the restore real rather than
+    // cosmetic.
+    function restore() {
+        const el = source();
+        if (!el) return;
+        const saved = store.get();
+        if (!saved || el.value) return;
+        el.value = saved;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        document.body.setAttribute('data-draft-restored', '1');
+    }
+
+    document.addEventListener('input', (event) => {
+        if (!event.target || event.target.id !== SOURCE_ID) return;
+        const value = event.target.value || '';
+        if (value) { store.set(value); } else { store.clear(); }
+    }, true);
+
+    // The server is authoritative once it answers: a restored draft that has
+    // been translated is no longer a draft worth keeping.
+    function markLive(live) {
+        document.body.setAttribute('data-connection', live ? 'live' : 'lost');
+    }
+
+    function wireSocket() {
+        if (!window.socket) return false;
+        window.socket.on('disconnect', () => markLive(false));
+        window.socket.on('connect', () => { markLive(true); restore(); });
+        markLive(window.socket.connected !== false);
+        return true;
+    }
+
+    // window.socket is created by nicegui.js after this script parses.
+    let tries = 0;
+    const waitForSocket = setInterval(() => {
+        if (wireSocket() || ++tries > 100) clearInterval(waitForSocket);
+    }, 100);
+
+    window.addEventListener('offline', () => markLive(false));
+    window.addEventListener('online', () => restore());
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', restore);
+    } else {
+        restore();
+    }
+})();
+</script>
+""")
+
+    def _inject_capture_target_js(self) -> None:
+        """Make the whole capture card open the picker, not just Quasar's button.
+
+        Measured 2026-10-15: `elementFromPoint` at the centre of the dashed
+        card resolved to `div.q-uploader__list`, which does nothing. The only
+        working target was the 32x32 add button — 73% of Apple's 44pt floor and
+        67% of Material's 48dp — on the one screen a phone exists for.
+
+        CSS cannot do this part: the file input is Quasar's own and the dashed
+        area is a sibling, so there is no selector that makes one trigger the
+        other. Delegated on `document` so a mode switch, which rebuilds the
+        uploader, needs no re-injection.
+        """
+        ui.add_body_html("""
+<script>
+(() => {
+    document.addEventListener('click', (event) => {
+        const card = event.target.closest && event.target.closest('.p-capture');
+        if (!card) return;
+        // Quasar's own controls already work; re-dispatching into the input
+        // from here would open the picker twice.
+        if (event.target.closest('button, a, input, .q-btn')) return;
+        const input = card.querySelector('input[type=file]');
+        if (input) { event.preventDefault(); input.click(); }
+    });
+})();
+</script>
+""")
 
     def _inject_workspace_text_live_translation_js(self) -> None:
         # Injected ONCE per page build (main_page). Bindings are delegated on
@@ -1446,13 +1570,17 @@ class TranslationUI(VoicePageMixin):
             # file, and choosing e.g. a CSV export produced a green "Selected"
             # toast and "Ready to translate" before failing on Translate with
             # "Unsupported file extension: csv". Say no at selection time.
+            # p-capture: the whole card is the tap target, not only Quasar's
+            # 32x32 add button. The label moves out of Quasar's header and into
+            # p-capture's own copy (static/passage.css) so it can differ by
+            # input device — "drop" is not a verb a phone has.
             ui.upload(
-                label="Click or drop DOCX, PPTX, or PDF",
+                label="",
                 multiple=False,
                 auto_upload=True,
                 on_upload=self.handle_mobile_upload,
             ).props(f"accept={','.join('.' + e for e in sorted(SUPPORTED_DOCUMENT_EXTENSIONS))}")\
-             .classes("w-full")
+             .classes("w-full p-capture p-capture-doc")
             if self.uploaded_file_name:
                 ui.label(f"Selected file: {self.uploaded_file_name}").classes("text-sm p-muted-text")
             return
@@ -1460,11 +1588,12 @@ class TranslationUI(VoicePageMixin):
         # One affordance: the file input's accept/capture props let phones
         # offer the camera directly, so no separate fallback uploader.
         ui.upload(
-            label="Click or drop an image (PNG, JPG, WEBP)",
+            label="",
             multiple=False,
             auto_upload=True,
             on_upload=self.handle_mobile_image_upload,
-        ).props('accept=".png,.jpg,.jpeg,.webp" capture=environment').classes("w-full")
+        ).props('accept=".png,.jpg,.jpeg,.webp" capture=environment')\
+         .classes("w-full p-capture p-capture-image")
         if self.image_upload_name:
             ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm p-muted-text")
 
@@ -3504,6 +3633,50 @@ class TranslationUI(VoicePageMixin):
                 ui.timer(0.1, gather_browser, once=True)
 
 
+#: Seconds the server waits for a browser to come back before deleting the
+#: client and every UI element it holds.
+RECONNECT_TIMEOUT_SECONDS = 30.0
+
+
+def reconnect_timeout() -> float:
+    """How long a dropped browser has to return before its session is discarded.
+
+    NiceGUI's default is 3.0 s. That is a desktop number. A phone goes offline
+    in a lift, a tunnel, a lock screen, or whenever its owner switches apps to
+    copy something, and comes back to a workspace that has been deleted out
+    from under it. Measured on this app on 2026-10-15: at the default, 10 s
+    offline loses the typed source text; at 30 it survives.
+
+    DECISIONS.md §7 closed the five-minute Cloud Run door for exactly this
+    reason -- the WebSocket IS the request -- and left this three-second one
+    open, which is the one a phone actually walks through.
+
+    30 and not more: the server holds the client's elements in memory for the
+    whole window, so this trades memory for forgiveness and the prod container
+    is small. The env var exists so a deploy can retune it without a release.
+    """
+    raw = os.getenv("PASSAGE_RECONNECT_TIMEOUT")
+    if raw is None:
+        return RECONNECT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.warning(
+            "PASSAGE_RECONNECT_TIMEOUT=%r is not a number; using %s s.",
+            raw, RECONNECT_TIMEOUT_SECONDS,
+        )
+        return RECONNECT_TIMEOUT_SECONDS
+    # A zero or negative window would delete the client on the first missed
+    # heartbeat, which is worse than nicegui's default rather than better.
+    if value <= 0:
+        logging.warning(
+            "PASSAGE_RECONNECT_TIMEOUT=%r is not positive; using %s s.",
+            raw, RECONNECT_TIMEOUT_SECONDS,
+        )
+        return RECONNECT_TIMEOUT_SECONDS
+    return value
+
+
 def start_ui() -> None:
     """App bootstrap: one shared backend/api_guard for the whole process
     (translation cache, job store — already job-id-keyed, safe to share),
@@ -3563,6 +3736,7 @@ def start_ui() -> None:
         favicon=str(Path(__file__).resolve().parent / "static" / "favicon.svg"),
         reload=False,
         storage_secret=_STORAGE_SECRET,
+        reconnect_timeout=reconnect_timeout(),
     )
 
 

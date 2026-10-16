@@ -245,3 +245,125 @@ h1, h2, h3, .p-display {
 @media (prefers-reduced-motion: reduce) {
   .p-btn, .p-banner { transition: none; }
 }
+
+/* ── Mobile pass 1 ───────────────────────────────────────────────────
+   Measured 2026-10-15 against the running app on WebKit and Chromium at
+   five device sizes. Each rule below closes one measurement, named. */
+
+/* iOS Safari zooms the whole page when a focused input is under 16px, and
+   all three inputs on / were 14. The zoom is not reversible by the page, so
+   the user is left scrolled sideways inside a layout that never overflowed.
+   16px is a floor, not a size: anything larger is free to stay larger. */
+.q-field__native,
+.q-field__input,
+input.q-field__native,
+textarea.q-field__native {
+  font-size: max(16px, 1rem);
+}
+
+/* The capture card. The dashed area was not a tap target at all --
+   elementFromPoint at its centre resolved to .q-uploader__list -- and the
+   only control that opened the camera was 32x32. The click delegation lives
+   in _inject_capture_target_js; this is the part that makes the card LOOK
+   like the target it now is. */
+.p-capture {
+  border: 1px dashed var(--p-rule);
+  background: var(--p-panel);
+  box-shadow: none;
+  cursor: pointer;
+}
+.p-capture .q-uploader__header {
+  background: transparent !important;
+  color: var(--p-ink) !important;
+  min-height: 0;
+  padding: 0.75rem 0.75rem 0;
+}
+/* Quasar's header row holds the add button; centring it turns the card into
+   one obvious affordance rather than a label with a control beside it. */
+.p-capture .q-uploader__header-content {
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0;
+}
+/* The byte counter read "0.0B / 0.00%" before any file existed: a progress
+   report for something that had not started. */
+.p-capture .q-uploader__subtitle { display: none; }
+.p-capture.q-uploader--uploading .q-uploader__subtitle { display: block; }
+
+/* The add button carries the copy now, so it is sized as the primary action
+   on the screen: 48px clears Material's floor and Apple's 44pt both. The
+   black square it used to be is not in this palette. */
+.p-capture .q-uploader__header .q-btn {
+  min-height: 48px;
+  min-width: 48px;
+  padding: 0 1rem;
+  background: var(--p-accent) !important;
+  color: var(--p-accent-ink) !important;
+  border-radius: var(--p-radius);
+  font-family: var(--p-data);
+}
+/* Quasar's add glyph is a ligature in the Material Icons face, so the icon
+   is swapped by changing the ligature text rather than by shipping an asset.
+   "add_box" says a list is being appended to; this screen takes one photo. */
+.p-capture .q-uploader__header .q-btn .q-icon { font-size: 1.35rem; }
+.p-capture-image .q-uploader__header .q-btn .q-icon { font-size: 0; }
+.p-capture-image .q-uploader__header .q-btn .q-icon::before {
+  content: "photo_camera";
+  font-size: 1.35rem;
+}
+.p-capture-doc .q-uploader__header .q-btn .q-icon { font-size: 0; }
+.p-capture-doc .q-uploader__header .q-btn .q-icon::before {
+  content: "description";
+  font-size: 1.35rem;
+}
+/* The label, restored in CSS so it can differ by input device. A phone has
+   no pointer to click with and nothing to drop. */
+.p-capture .q-uploader__header .q-btn::after {
+  content: var(--p-capture-copy, "Choose a file");
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  margin-left: 0.5rem;
+}
+.p-capture-image { --p-capture-copy: "Choose an image"; }
+.p-capture-doc { --p-capture-copy: "Choose a document"; }
+@media (hover: none) and (pointer: coarse) {
+  .p-capture-image { --p-capture-copy: "Take a photo"; }
+  .p-capture-doc { --p-capture-copy: "Choose a document"; }
+}
+.p-capture .q-uploader__list {
+  background: transparent;
+  min-height: 72px;
+  padding: 0.5rem 0.75rem 0.75rem;
+  color: var(--p-muted);
+}
+/* The hint under the button, which says what a drop zone is for only where
+   dropping is possible. */
+.p-capture .q-uploader__list::before {
+  content: "";
+  display: block;
+  font-family: var(--p-data);
+  font-size: 0.7rem;
+  color: var(--p-muted);
+  text-align: center;
+}
+@media (hover: hover) and (pointer: fine) {
+  .p-capture .q-uploader__list::before { content: "or drop one here"; }
+}
+.p-capture.q-uploader--uploading .q-uploader__list::before { content: ""; }
+
+/* Connection state. NiceGUI ships its own "Connection lost" popup and it is
+   kept -- but it is wired at ~4s and CSS-delayed 2000ms on top, so it lands
+   at about 6s. socket.io knows in about one. For those seconds every tap was
+   a silent no-op that reads as a missed tap, so the primary action says it is
+   not listening as soon as the socket does. */
+body[data-connection="lost"] .p-btn-primary,
+body[data-connection="lost"] .p-capture {
+  opacity: 0.45;
+  pointer-events: none;
+  filter: grayscale(0.4);
+}
+@media (prefers-reduced-motion: reduce) {
+  body[data-connection="lost"] .p-btn-primary,
+  body[data-connection="lost"] .p-capture { filter: none; }
+}
