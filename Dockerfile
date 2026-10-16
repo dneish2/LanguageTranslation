@@ -11,9 +11,13 @@ RUN apt-get update \
 # Set the working directory
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies from the LOCK, not from requirements.txt. Unpinned, this
+# line installed whatever PyPI published the morning of the build, so the image
+# that passed CI and the image that shipped could differ by zero commits.
+# requirements.txt is copied too, only because the lock's header names it as the
+# file to edit; nothing installs from it.
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Bake the tokenizer file in, so no instance downloads it while serving a
 # document (TranslationBackend._token_encoding).

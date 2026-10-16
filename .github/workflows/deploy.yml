@@ -1,31 +1,27 @@
 name: Deploy to Cloud Run
 
 on:
+  # Push to main only. The `pull_request` trigger was here to pre-validate a PR,
+  # but ci.yml already runs the identical suite on every PR — this workflow's
+  # job is the gate in front of the Cloud Run deploy, which only ever happens on
+  # a push to main.
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
 
 jobs:
+  # The gate, called rather than copied. This job used to be a second,
+  # hand-maintained ubuntu test job — the same tests ci.yml was already
+  # running on every push, minus the banner that says what the runner
+  # resolved. Two copies of "how the suite runs" is one copy too many when one
+  # of them decides whether code reaches production.
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest
-
-      - name: Run tests
-        run: python -m pytest tests/ -q
+    uses: ./.github/workflows/suite.yml
+    with:
+      # Ubuntu alone, not the breadth matrix. This gate decides whether code
+      # reaches Cloud Run, which runs on ubuntu; making a deployment wait on a
+      # macOS runner's queue buys nothing it does not already have, because
+      # ci.yml runs the full matrix on the very same commit.
+      matrix: '[{"os": "ubuntu-latest", "stable": true}]'
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

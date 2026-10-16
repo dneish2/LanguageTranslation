@@ -80,9 +80,12 @@ def test_backend_image_ocr_translation_success(monkeypatch):
     assert result["confidence_metadata"]["block_count"] == 1
 
 
-def test_backend_image_ocr_unsupported_format_error():
-    import os
-    os.environ["OPENAI_API_KEY"] = "test-key"
+def test_backend_image_ocr_unsupported_format_error(monkeypatch):
+    # monkeypatch, not os.environ: a raw assignment here has no restore, so it
+    # left a configured provider in the environment for every test that ran
+    # afterwards — making their result depend on collection order. Every other
+    # call site in the suite already does it this way.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     ui_app = TranslationUI()
     backend = ui_app.backend
 
@@ -104,10 +107,9 @@ async def _call_api_image_translate(ui_app):
     return await ui_app.api_image_translate(request, upload, "Spanish")
 
 
-def test_api_image_translate_error_path_for_unsupported_format():
+def test_api_image_translate_error_path_for_unsupported_format(monkeypatch):
     import asyncio
-    import os
-    os.environ["OPENAI_API_KEY"] = "test-key"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     ui_app = TranslationUI()
     response = asyncio.run(_call_api_image_translate(ui_app))

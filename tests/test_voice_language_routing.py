@@ -27,31 +27,27 @@ if str(ROOT) not in sys.path:
 
 import TranslationUI as ui_module
 from TranslationUI import TranslationUI
+from conftest import PageBuild
 from passage import engine_ledger, local_voice, policy
 
 
 # ───────────────────────────── harness ─────────────────────────────────── #
 
-class _PageBuild:
-    """One registered page builder, rendered into its OWN nicegui client.
-
-    The client is explicit rather than ambient on purpose. Without it nicegui
-    silently falls back to a process-wide "script mode" pseudo-client, and that
-    fallback only happens while `Client.instances` is empty — so these tests
-    passed alone and failed as soon as any other test file had constructed a
-    Client first. A page test whose result depends on which other files ran is
-    not evidence about the page.
-    """
-
-    def __init__(self, func):
-        self.func = func
-        self.client = None
-
-    def __call__(self):
-        from nicegui.client import Client
-        self.client = Client(lambda: None, request=None)
-        with self.client:
-            return self.func()
+# One registered page builder, rendered into its OWN nicegui client.
+#
+# The client is explicit rather than ambient on purpose. Without it nicegui
+# silently falls back to a process-wide "script mode" pseudo-client, and that
+# fallback only happens while `Client.instances` is empty — so these tests
+# passed alone and failed as soon as any other test file had constructed a
+# Client first. A page test whose result depends on which other files ran is
+# not evidence about the page.
+#
+# That reasoning turned out to apply to the whole suite, not just this file:
+# `test_surface_coverage.py` was riding on the same fallback, and the suite was
+# green only because `test_api_security.py` sorts first and latches it. So the
+# class moved to conftest, where it is the one way to render a page, and the
+# latch itself is now cleared between tests by `_isolate_nicegui`, so nothing
+# in the suite rides on that fallback any more.
 
 
 class _Pages:
@@ -60,8 +56,8 @@ class _Pages:
     def __init__(self, routes: dict, built: list):
         self.routes, self.built = routes, built
 
-    def __getitem__(self, path: str) -> _PageBuild:
-        return _PageBuild(self.routes[path])
+    def __getitem__(self, path: str) -> PageBuild:
+        return PageBuild(self.routes[path])
 
     @property
     def current(self) -> TranslationUI:
@@ -108,17 +104,6 @@ def _record_prefetch(monkeypatch) -> list:
     monkeypatch.setattr(ui_module.local_voice, "prefetch_voice",
                         lambda language: asked.append(language))
     return asked
-
-
-def _rendered_texts(build: "_PageBuild") -> list[str]:
-    """Every label text a page produced, via its own client element registry."""
-    build()
-    texts = []
-    for element in build.client.elements.values():
-        text = getattr(element, "text", None)
-        if isinstance(text, str) and text:
-            texts.append(text)
-    return texts
 
 
 def _fake_voice_stack(monkeypatch, tmp_path, *, installed=("en_US-lessac-medium",)):
@@ -236,8 +221,23 @@ def test_a_page_load_targeting_german_actually_reaches_the_download(monkeypatch,
     pages["/"]()
     pages.current.target_language_input.value = "German"
 
+    # Wait for the POSTCONDITION, not for a URL to be recorded. `urls` is a
+    # probe: `_fetch_url` appends before it writes, `ensure_voice` fetches the
+    # .onnx.json BEFORE the weights, and the voice is not installed until two
+    # later os.replace calls have run. So "a de_DE url appeared" is satisfied by
+    # step 1 of 4 — and `de_DE-thorsten-medium.onnx.json` contains the substring
+    # `de_DE-thorsten-medium.onnx`, so even the stricter-looking assertion below
+    # is satisfied by the config fetch alone. Waiting on that and then asking
+    # `voice_installed` raced the download thread and lost it twice in CI
+    # (ubuntu 2026-10-12, macos-14 2026-09-24), which reads as a broken app
+    # rather than a test that asked one step too early.
+    #
+    # `voice_installed` is the state production code publishes, so it is what
+    # this waits on. The deadline still fails the test — by timing out — if the
+    # fetch path ever becomes unreachable again, which is the defect this file
+    # exists for. Same pattern as test_piper_fetch.py.
     deadline = time.time() + 10
-    while time.time() < deadline and not any("de_DE" in url for url in urls):
+    while time.time() < deadline and not local_voice.voice_installed("German"):
         time.sleep(0.05)
 
     assert any("de_DE-thorsten-medium.onnx" in url for url in urls), urls
@@ -256,7 +256,12 @@ def test_english_default_page_load_does_not_download_a_bundled_voice(monkeypatch
 
     pages = _page_builders(monkeypatch)
     pages["/"]()
-    time.sleep(0.2)
+    # Proving a NEGATIVE with a sleep is only as good as the sleep: 0.2s that
+    # happens to be long enough on this machine says nothing about a loaded CI
+    # runner, where a fetch thread merely slower than the sleep reads as "no
+    # fetch". Wait for whatever was actually started to finish instead, then
+    # assert nothing fetched.
+    assert local_voice.wait_for_prefetches(timeout=10.0) == []
 
     assert urls == []
 
@@ -279,7 +284,7 @@ def test_engines_page_does_not_claim_local_playback_for_uninstalled_voices(
     monkeypatch.setattr(local_voice, "stt_available", lambda: True)
     engines = _page_builders(monkeypatch)["/engines"]
 
-    texts = _rendered_texts(engines)
+    texts = engines.texts()
     voice_lines = [t for t in texts if "machine" in t and "ecording" in t]
 
     assert voice_lines, texts
@@ -306,7 +311,7 @@ def test_engines_voice_block_is_rendered_from_voice_state(monkeypatch, tmp_path)
     monkeypatch.setattr(engine_ledger, "voice_state", lambda *a, **k: sentinel)
     engines = _page_builders(monkeypatch)["/engines"]
 
-    texts = _rendered_texts(engines)
+    texts = engines.texts()
 
     assert "PRIVACY-FROM-VOICE-STATE" in texts
     assert "DETAIL-FROM-VOICE-STATE" in texts

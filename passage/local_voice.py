@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import time
 import wave
 from functools import lru_cache
 from pathlib import Path
@@ -571,6 +572,62 @@ DOWNLOAD_TIMEOUT = float(os.getenv("PASSAGE_PIPER_DOWNLOAD_TIMEOUT", "60"))
 #: because publication is an atomic rename either way.
 _download_locks: dict = {}
 
+#: Every pre-fetch thread this process has started and not yet reaped.
+#:
+#: Fire-and-forget is the right shape for a render path, but "nobody is waiting"
+#: is not the same as "nobody may wait". A caller that is about to take the
+#: directory away needs to know when these are done: `ensure_voice` reads
+#: VOICE_DIR when it reaches the lock, so a thread still running after the
+#: directory moves writes its download into the NEW one. That is a test-suite
+#: hazard today (a monkeypatched VOICE_DIR restored while a fetch is in flight,
+#: which lands a truncated voice in the real models dir) and a shutdown hazard
+#: in general. `passage.contribute` solves the same problem for its upload queue
+#: with an atexit drain; this is the voice side of it.
+_prefetch_threads: set = set()
+_prefetch_registry_lock = None
+
+
+def _register_prefetch(thread) -> None:
+    """Track a started pre-fetch thread so `wait_for_prefetches` can find it."""
+    global _prefetch_registry_lock
+    import threading
+    if _prefetch_registry_lock is None:
+        _prefetch_registry_lock = threading.Lock()
+    with _prefetch_registry_lock:
+        _prefetch_threads.add(thread)
+
+
+def wait_for_prefetches(timeout: float = 10.0) -> list:
+    """Join every outstanding pre-fetch thread. Returns the ones still alive.
+
+    Never raises and never cancels: a download that overruns `timeout` is left
+    running and reported, because the alternative — killing it mid-stream — is
+    what the `.part` temporaries and the config-before-weights rename order
+    exist to make unnecessary.
+
+    The return value is the honest part. An empty list means the background work
+    really is finished; a non-empty one names the threads that are not, so a
+    caller can say so rather than assume quiescence.
+    """
+    import threading
+    if _prefetch_registry_lock is None:
+        return [t for t in list(_prefetch_threads) if t.is_alive()]
+    with _prefetch_registry_lock:
+        pending = list(_prefetch_threads)
+    deadline = time.monotonic() + timeout
+    for thread in pending:
+        if thread is threading.current_thread():
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(remaining)
+    with _prefetch_registry_lock:
+        for thread in pending:
+            if not thread.is_alive():
+                _prefetch_threads.discard(thread)
+        return [t for t in list(_prefetch_threads) if t.is_alive()]
+
 
 def voice_installed(language: str | None) -> bool:
     """Is a COMPLETE voice on disk for this language?
@@ -661,13 +718,19 @@ def ensure_voice(language: str | None, *, timeout: float | None = None) -> Path 
             return None
 
 
-def prefetch_voice(language: str | None) -> None:
+def prefetch_voice(language: str | None):
     """Kick off a voice download in the background. Fire-and-forget.
 
     Same shape as `TranslationBackend.prewarm_live`: off the render path, in a
     daemon thread, failures swallowed and logged, never awaited by the UI. If
     it finishes in time the next translation speaks locally; if it does not,
     that translation goes hosted and says so. Nothing blocks on this.
+
+    Returns the thread it started, or None when it decided not to fetch. The UI
+    callers ignore it — this stays fire-and-forget at every call site in
+    `TranslationUI` — but returning it means the work is addressable by a caller
+    that needs to know when the directory it writes to may be taken away. See
+    `wait_for_prefetches`.
     """
     # Downloads follow the same switch synthesis does — `enabled()`, the
     # tri-state above — so we can never fetch for a feature that is off. That
@@ -678,15 +741,15 @@ def prefetch_voice(language: str | None) -> None:
     # on page render. That quietly turned DECISIONS.md §2 from "on when the
     # models are present" into "download them to make them present".
     if not enabled():
-        return
+        return None
     # Recognition is language-independent, so it is fetched from the same hook
     # rather than waiting for a language the user may never pick. Its own guards
     # make this a no-op whenever the weights are already there.
     prefetch_whisper()
     if voice_installed(language):
-        return
+        return None
     if VOICE_PREFIXES.get(_lang_key(language)) is None:
-        return
+        return None
 
     def fetch() -> None:
         try:
@@ -695,7 +758,13 @@ def prefetch_voice(language: str | None) -> None:
             logging.info("[LocalVoice] background prefetch skipped (%s)", error)
 
     import threading
-    threading.Thread(target=fetch, daemon=True).start()
+    thread = threading.Thread(target=fetch, daemon=True)
+    # Registered BEFORE start: a thread that finishes between start() and the
+    # registration would otherwise be invisible to a waiter that is already
+    # counting on seeing it.
+    _register_prefetch(thread)
+    thread.start()
+    return thread
 
 
 #: Single-flight guard for the recogniser download, so a burst of page loads
@@ -705,7 +774,7 @@ _whisper_prefetch_lock = None
 _whisper_prefetch_started = False
 
 
-def prefetch_whisper() -> None:
+def prefetch_whisper():
     """Pull the Whisper weights in the background. Fire-and-forget.
 
     The asymmetry this closes: the 63MB Piper download was deliberately moved
@@ -727,14 +796,14 @@ def prefetch_whisper() -> None:
     # a machine where local voice is already a real capability; forced-on
     # (PASSAGE_LOCAL_VOICE=1) is the explicit opt-in that bootstraps it.
     if not enabled() or not whisper_installed() or whisper_weights_present():
-        return
+        return None
 
     import threading
     if _whisper_prefetch_lock is None:
         _whisper_prefetch_lock = threading.Lock()
     with _whisper_prefetch_lock:
         if _whisper_prefetch_started:
-            return
+            return None
         _whisper_prefetch_started = True
 
     def fetch() -> None:
@@ -745,4 +814,7 @@ def prefetch_whisper() -> None:
         except Exception as error:
             logging.info("[LocalVoice] whisper prefetch skipped (%s)", error)
 
-    threading.Thread(target=fetch, daemon=True).start()
+    thread = threading.Thread(target=fetch, daemon=True)
+    _register_prefetch(thread)
+    thread.start()
+    return thread
