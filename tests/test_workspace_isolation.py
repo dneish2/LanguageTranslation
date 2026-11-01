@@ -299,7 +299,6 @@ def _make_session(monkeypatch, backend, storage, *, scope: str, profile=None) ->
 def _type_text(session: Session, text: str, language: str = "Spanish") -> None:
     session.ui.mobile_mode = True
     session.ui.input_mode = "Text"
-    session.ui.mobile_input_mode = "Text"
     session.ui.text_source_input = _Input(text)
     session.ui.target_language_input = _Input(language)
     session.ui.source_language_input = _Input("English")
@@ -455,7 +454,6 @@ def test_byo_image_run_is_booked_to_the_endpoint_that_read_the_photo(
                             scope="browser:aaaa-1111", profile=profile)
     session.ui.mobile_mode = True
     session.ui.input_mode = "Image/Camera"
-    session.ui.mobile_input_mode = "Image/Camera"
     session.ui.image_upload_bytes = _photo()
     session.ui.image_upload_name = "menu.png"
     session.ui.target_language_input = _Input("Spanish")
@@ -490,7 +488,6 @@ def test_hosted_image_run_is_still_booked_as_hosted(
     session = _make_session(monkeypatch, backend, storage, scope="browser:dddd-4444")
     session.ui.mobile_mode = True
     session.ui.input_mode = "Image/Camera"
-    session.ui.mobile_input_mode = "Image/Camera"
     session.ui.image_upload_bytes = _photo()
     session.ui.image_upload_name = "menu.png"
     session.ui.target_language_input = _Input("Spanish")

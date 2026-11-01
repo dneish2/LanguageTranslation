@@ -151,15 +151,13 @@ MEASURE = """
 def test_no_page_scrolls_sideways(app_url, browsers, name, engine, width, height, route):
     """The layout held at every width the review tried, with one exception:
     /diagnostics printed an unwrapped 1916px code block that overflowed even a
-    1440px desktop. Pass 2 wraps it; until then this records the fact."""
+    1440px desktop. Pass 2 wraps it, so every route is held to the same rule."""
     context = _page(browsers, engine, width, height)
     try:
         page = context.new_page()
         page.goto(app_url + route, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(1500)
         measured = page.evaluate(MEASURE)
-        if route == "/diagnostics":
-            pytest.xfail("known: the diagnostics code block does not wrap (Pass 2)")
         assert measured["overflowPx"] <= 0, (
             f"{name}{route} scrolls {measured['overflowPx']}px sideways"
         )

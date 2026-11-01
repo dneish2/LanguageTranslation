@@ -269,6 +269,26 @@ class _SnapshotBackend:
         return self._snapshot["chosen_model"]
 
 
+WORKSPACE_MODE_ALIASES: dict[str, str] = {
+    "text": "Text",
+    "document": "Document", "doc": "Document", "docs": "Document", "file": "Document",
+    "image/camera": "Image/Camera", "image": "Image/Camera", "camera": "Image/Camera",
+    "photo": "Image/Camera", "picture": "Image/Camera",
+}
+
+
+def resolve_workspace_mode(raw: str | None) -> str | None:
+    """Map a ?mode= value to a workspace mode, or None when it isn't one.
+
+    `?mode=Image` used to render Text without a word, because the code only
+    accepted the internal "Image/Camera". Case and surrounding space are
+    ignored.
+    """
+    if not raw:
+        return None
+    return WORKSPACE_MODE_ALIASES.get(raw.strip().lower())
+
+
 def collect_diagnostics(snapshot: dict[str, Any]) -> dict[str, Any]:
     """diagnostics.collect() driven by an already-taken probe, with the
     probe's age stamped into the local_llm section so a reader can never
@@ -351,7 +371,6 @@ class TranslationUI(VoicePageMixin):
         # DOM id prefix for the Text-mode workspace elements; must match the
         # hardcoded `scope` in _inject_workspace_text_live_translation_js.
         self.text_status_scope = "workspace_text"
-        self.mobile_input_mode = "Text"
         self.source_language_input = None
         self.target_language_input = None
         self.text_source_input = None
@@ -784,9 +803,19 @@ class TranslationUI(VoicePageMixin):
         # A fresh instance per page load (see start_ui) has no memory of what
         # mode was active on /voice — carry it across the navigation via
         # ?mode= instead of self, which no longer survives the page change.
-        if mode in {"Text", "Document", "Image/Camera"}:
-            self.input_mode = mode
-            self.mobile_input_mode = mode
+        # The value a person would type (?mode=image, ?mode=camera) works as
+        # well as the internal one; a value we don't know is said out loud
+        # rather than silently rendering Text.
+        if mode:
+            resolved = resolve_workspace_mode(mode)
+            if resolved is not None:
+                self.input_mode = resolved
+            else:
+                try:
+                    ui.notify(f'"{mode}" isn\'t a mode here, so this opened {self.input_mode}. '
+                              "Try text, document or image.", type="warning")
+                except Exception:  # no client context (unit tests): nobody to tell
+                    pass
         # Pin this browser's cache partition HERE, while a request context (and
         # therefore the browser cookie) still exists. Every workspace button
         # runs in an event handler, where that lookup would otherwise fall
@@ -1350,7 +1379,6 @@ class TranslationUI(VoicePageMixin):
 
     def set_workspace_mode(self, mode: str) -> None:
         self.input_mode = mode
-        self.mobile_input_mode = mode
         self._render_mode_tabs()
         self.refresh_upload_ui()
 
@@ -1475,7 +1503,6 @@ class TranslationUI(VoicePageMixin):
         """Reload a text translation into the workspace."""
         self.current_target_language = thread.get("language") or self.current_target_language
         self.input_mode = "Text"
-        self.mobile_input_mode = "Text"
         self._render_mode_tabs()
         self.refresh_upload_ui()
         if self.text_source_input is not None:
@@ -1596,11 +1623,6 @@ class TranslationUI(VoicePageMixin):
          .classes("w-full p-capture p-capture-image")
         if self.image_upload_name:
             ui.label(f"Selected image: {self.image_upload_name}").classes("text-sm p-muted-text")
-
-    def set_mobile_input_mode(self, mode):
-        self.mobile_input_mode = mode
-        self.input_mode = mode
-        self.refresh_upload_ui()
 
     async def handle_mobile_upload(self, event):
         # NiceGUI 3.x: the payload lives on event.file (FileUpload) and reads async.
@@ -3589,9 +3611,11 @@ class TranslationUI(VoicePageMixin):
                     "name. Copy the block and paste it back with any report."
                 ).classes("text-sm p-muted-text")
 
+                # p-diagnostics wraps the code block: unwrapped it was 1916px
+                # wide and scrolled sideways on a phone and a 1440px desktop.
                 text_area = ui.markdown(
                     f"```\n{diagnostics.format_text(report)}\n```"
-                ).classes("w-full text-xs")
+                ).classes("w-full text-xs p-diagnostics")
 
                 state: dict[str, Any] = {"report": report}
 
