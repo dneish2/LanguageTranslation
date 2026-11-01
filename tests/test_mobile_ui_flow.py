@@ -57,7 +57,6 @@ def test_mobile_upload_happy_path_invokes_translation():
     """Unified workflow: Document mode + language should kick off translation."""
     ui_app = _build_mobile_ui()
     ui_app.input_mode = "Document"
-    ui_app.mobile_input_mode = "Document"
     ui_app.target_language_input = DummyInput("Spanish")
     ui_app.uploaded_file = BytesIO(b"doc")
 
@@ -76,7 +75,6 @@ def test_mobile_upload_error_path_requires_file():
     """Unified workflow: document mode still requires an uploaded file."""
     ui_app = _build_mobile_ui()
     ui_app.input_mode = "Document"
-    ui_app.mobile_input_mode = "Document"
     ui_app.target_language_input = DummyInput("French")
     ui_app.uploaded_file = None
 
@@ -152,7 +150,6 @@ def test_text_mode_rejects_identical_source_and_target_language():
 def test_document_mode_rejects_identical_source_and_target_language():
     ui_app = _build_mobile_ui()
     ui_app.input_mode = "Document"
-    ui_app.mobile_input_mode = "Document"
     ui_app.source_language_input = DummyInput("French")
     ui_app.target_language_input = DummyInput("French")
     ui_app.uploaded_file = BytesIO(b"doc")
@@ -465,15 +462,18 @@ def test_mobile_image_translation_success_updates_progress_and_renders_result():
     assert rendered == ["French"]
 
 
-def test_mode_switch_syncs_mobile_and_unified_mode():
+def test_mode_switch_sets_the_one_mode_field():
+    """mobile_input_mode was left over from the retired /mobile page and is
+    gone; input_mode is the only mode the UI tracks."""
     ui_app = _build_mobile_ui()
     refresh_calls = {"count": 0}
     ui_app.refresh_upload_ui = lambda: refresh_calls.__setitem__("count", refresh_calls["count"] + 1)
+    ui_app._render_mode_tabs = lambda: None
 
-    ui_app.set_mobile_input_mode("Image/Camera")
+    ui_app.set_workspace_mode("Image/Camera")
 
-    assert ui_app.mobile_input_mode == "Image/Camera"
     assert ui_app.input_mode == "Image/Camera"
+    assert not hasattr(ui_app, "mobile_input_mode")
     assert refresh_calls["count"] == 1
 
 

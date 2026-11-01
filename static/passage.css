@@ -367,3 +367,12 @@ body[data-connection="lost"] .p-capture {
   body[data-connection="lost"] .p-btn-primary,
   body[data-connection="lost"] .p-capture { filter: none; }
 }
+
+/* /diagnostics prints a long plain-text report in a code block. Wrap it so the
+   page never scrolls sideways (it was 1916px wide, wider than a desktop). */
+.p-diagnostics pre,
+.p-diagnostics code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
